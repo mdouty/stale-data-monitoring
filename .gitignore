@@ -1,0 +1,24 @@
+.DS_Store
+outputs/
+*.csv
+*.tsv
+
+# Local dependencies and tooling state
+node_modules/
+.env
+.env.*
+!.env.example
+.clasprc.json
+
+# Credentials and local secrets
+*.pem
+*.key
+credentials.json
+service-account*.json
+
+# Editor and temporary files
+.idea/
+.vscode/
+*.swp
+*.tmp
+*~

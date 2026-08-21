@@ -1,0 +1,398 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <?!= include('Styles'); ?>
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">Enterprise Data Governance</div>
+        <h1 id="appName">Stale Data Monitoring</h1>
+      </div>
+      <div class="top-actions">
+        <button id="userGuideButton" class="button subtle" onclick="openUserGuide_(true)">How it works</button>
+        <button id="landscapeTab" class="button subtle" onclick="showAppPage('LANDSCAPE')">Dashboard</button>
+        <button id="teamTab" class="button subtle" onclick="showAppPage('TEAM')">My Team</button>
+        <button id="adminTab" class="button subtle hidden" onclick="showAppPage('ADMIN')">Admin</button>
+        <span id="userBadge" class="badge neutral">Loading…</span>
+      </div>
+    </header>
+
+    <nav class="environment-nav" aria-label="Application environment">
+      <div class="environment-tabs" role="tablist">
+        <button id="environmentTabDEV" class="environment-tab" role="tab" onclick="switchEnvironment('DEV')">DEV <span>Test dataset</span></button>
+        <button id="environmentTabPRD" class="environment-tab" role="tab" onclick="switchEnvironment('PRD')">PRD <span>Full dataset</span></button>
+      </div>
+      <div id="environmentDescription" class="environment-description">Loading environment…</div>
+    </nav>
+
+    <main>
+      <section id="statusBanner" class="status-banner hidden" role="alert" aria-live="assertive"></section>
+
+      <div id="landscapePage">
+
+      <section class="hero">
+        <div>
+          <div class="eyebrow">Deprecation landscape</div>
+          <h2>What needs attention now</h2>
+          <p>Reviewed Snowflake candidates move from owner notification to platform quarantine and verified purge.</p>
+        </div>
+        <div class="snapshot">Snapshot <span id="snapshotAt">Not imported</span></div>
+      </section>
+
+      <section id="metrics" class="metrics"></section>
+
+      <section class="grid two-col">
+        <article class="panel">
+          <div class="panel-heading"><h3>Lifecycle landscape</h3><span>All assets by state</span></div>
+          <div id="stateBreakdown" class="bar-list"></div>
+        </article>
+        <article class="panel">
+          <div class="panel-heading"><h3>Asset status landscape</h3><span>Current operational condition</span></div>
+          <div id="assetStatusBreakdown" class="bar-list"></div>
+        </article>
+      </section>
+
+      <section class="panel asset-panel">
+        <div class="panel-heading asset-heading">
+          <div><h3 id="queueTitle">Stale assets</h3><span id="assetCount">0 candidates</span></div>
+          <div class="filters">
+            <input id="search" type="search" placeholder="Search any asset data" oninput="debouncedLoad()">
+            <div id="assetStatusFilter" class="multi-select asset-status-filter"></div>
+            <div id="environmentFilter" class="multi-select"></div>
+            <div id="stewardshipFilter" class="multi-select"></div>
+            <div id="domainFilter" class="multi-select"></div>
+          </div>
+        </div>
+        <div id="bulkActionBar" class="bulk-action-bar hidden" aria-live="polite">
+          <strong><span id="bulkSelectedCount">0</span> selected</strong>
+          <div class="bulk-action-buttons">
+            <button id="bulkConfirmButton" class="button confirm-deprecation" data-bulk-action onclick="runBulkTransition('CONFIRM_DEPRECATION')">CONFIRM DEPRECATION</button>
+            <button id="bulkContestButton" class="button request-exception" data-bulk-action onclick="requestBulkExceptions()">CONTEST</button>
+            <button id="bulkSelfPurgeButton" class="button dismiss" data-bulk-action onclick="requestBulkSelfPurge_()">SELF PURGE</button>
+            <button id="bulkRestoreButton" class="button subtle" data-bulk-action onclick="requestBulkRestore_()">RESTORE</button>
+            <button id="bulkDismissButton" class="button dismiss" data-bulk-action onclick="runBulkTransition('DISMISS')">DISMISS</button>
+            <button id="bulkExportButton" class="button subtle" data-bulk-action onclick="exportSelectedAssets_()">EXPORT CSV</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th class="select-column"><input id="selectAllAssets" type="checkbox" aria-label="Select all visible assets" onchange="toggleSelectAll(this.checked)"></th><th class="object-column">Object</th><th>Domain / subject</th><th>Activity</th><th>Stewardship</th><th>Asset status</th><th>Lifecycle</th></tr></thead>
+            <tbody id="assetRows"><tr><td colspan="7" class="empty">Loading assets…</td></tr></tbody>
+          </table>
+        </div>
+        <div class="pagination"><button class="button subtle" onclick="changePage(-1)">Previous</button><span id="pageLabel">Page 1</span><button class="button subtle" onclick="changePage(1)">Next</button></div>
+      </section>
+      </div>
+
+      <section id="teamPage" class="hidden">
+        <div class="hero team-hero">
+          <div><div class="eyebrow">Record access</div><h2>My Team</h2><p>Team members can access records assigned to any person on the same team.</p></div>
+        </div>
+        <div id="myTeamContent" class="team-page-content"><div class="section-loading"><div class="loading-spinner" aria-hidden="true"></div><span>Loading your team…</span></div></div>
+      </section>
+
+      <section id="adminPage" class="hidden">
+        <div class="admin-header">
+          <div><div class="eyebrow">Administration</div><h2>Admin</h2><p>Run operational workflows and manage application settings.</p></div>
+          <nav class="admin-section-tabs" role="tablist" aria-label="Admin sections">
+            <button id="adminSectionTabOperations" class="admin-section-tab active" role="tab" aria-selected="true" onclick="showAdminSection('OPERATIONS')">Operations</button>
+            <button id="adminSectionTabTeams" class="admin-section-tab" role="tab" aria-selected="false" onclick="showAdminSection('TEAMS')">Teams</button>
+            <button id="adminSectionTabSettings" class="admin-section-tab" role="tab" aria-selected="false" onclick="showAdminSection('SETTINGS')">Settings</button>
+          </nav>
+        </div>
+
+        <div id="adminOperationsSection" class="admin-section" role="tabpanel" aria-labelledby="adminSectionTabOperations">
+          <section class="panel admin-import-panel">
+            <div class="panel-heading">
+              <div><h3>Data intake</h3><span>Import a reviewed Snowflake CSV and advance lifecycle operations.</span></div>
+              <div class="top-actions">
+                <button id="runAutomationButton" class="button subtle hidden" onclick="runAutomationNow()">Run lifecycle automation</button>
+                <button id="importButton" class="button primary hidden" onclick="startImport()">Import &amp; Refresh Data</button>
+              </div>
+            </div>
+            <div id="adminImportSummary" class="admin-import-summary"></div>
+          </section>
+
+          <section class="panel admin-handoffs">
+            <div class="panel-heading">
+              <div><h3>Assets ready for platform handoff</h3><span>Only READY requests are shown. Exporting records the handoff without changing lifecycle state.</span></div>
+            </div>
+            <div id="adminHandoffGroups" class="admin-handoff-groups"><div class="section-loading"><div class="loading-spinner" aria-hidden="true"></div><span>Loading assets ready for handoff…</span></div></div>
+          </section>
+        </div>
+
+        <div id="adminTeamsSection" class="admin-section hidden" role="tabpanel" aria-labelledby="adminSectionTabTeams">
+          <section class="panel">
+            <div class="panel-heading"><div><h3>Team access administration</h3><span>Review and manage the teams that extend record access across their members.</span></div></div>
+            <form class="team-create-form" onsubmit="createAdminTeam_(event)">
+              <label>Team name<input id="adminNewTeamName" type="text" minlength="2" maxlength="80" required placeholder="Data Governance Operations"></label>
+              <label>Team owner<input id="adminNewTeamOwner" type="email" pattern=".+@salesforce\.com" required placeholder="owner@salesforce.com"></label>
+              <button class="button primary" type="submit">Create team</button>
+            </form>
+          </section>
+          <div id="adminTeamsList" class="admin-teams-list"><div class="section-loading"><div class="loading-spinner" aria-hidden="true"></div><span>Loading teams…</span></div></div>
+        </div>
+
+        <div id="adminPanel" class="admin-section hidden" role="tabpanel" aria-labelledby="adminSectionTabSettings">
+          <section class="panel">
+            <div class="panel-heading"><div><h3>Configurations and controls</h3><span>Environment-specific lifecycle policy and delivery safeguards.</span></div></div>
+            <div class="settings-grid admin-config-grid">
+              <label>Stale threshold (days)<input id="staleThresholdDays" type="number" min="1" max="3650"></label>
+              <label>Contest window (days)<input id="contestWindowDays" type="number" min="1" max="365"></label>
+              <label>Quarantine period (days)<input id="quarantineDays" type="number" min="1" max="3650"></label>
+              <label>Purge notice (days)<input id="purgeNoticeDays" type="number" min="0" max="365"></label>
+              <label>Locked Slack recipient<input id="recipientLock" type="email" placeholder="name@company.com"></label>
+              <label>Allowed Slack recipients<input id="allowedRecipients" type="text" placeholder="email1@company.com, email2@company.com"></label>
+              <label>Exception application URL<input id="exceptionAppUrl" type="url" placeholder="https://…"></label>
+              <label>Exception database spreadsheet ID or URL<input id="exceptionDatabaseSpreadsheetId" type="text" placeholder="Google Sheet ID or URL"></label>
+              <label>Exception database sheet name<input id="exceptionDatabaseSheetName" type="text" placeholder="Exception Log"></label>
+            </div>
+            <div class="settings-actions settings-control-row">
+              <label class="check"><input id="importEnabled" type="checkbox"> Enable reviewed imports</label>
+              <label class="check"><input id="includeViews" type="checkbox"> Include views</label>
+              <label class="check"><input id="slackEnabled" type="checkbox"> Enable Slack delivery</label>
+              <label class="check"><input id="purgeActionsEnabled" type="checkbox"> Enable purge dispatch safety gate</label>
+              <button class="button primary" onclick="saveAdminConfiguration()">Save configurations</button>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-heading"><div><h3>Platform handoff controls</h3><span>Enable a route only when the platform team is ready to receive requests.</span></div></div>
+            <div id="handoffControls" class="handoff-control-grid"><div class="section-loading"><div class="loading-spinner" aria-hidden="true"></div><span>Loading platform handoff controls…</span></div></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-heading"><div><h3>Integration settings</h3><span>Secrets are stored in Apps Script properties and never returned to the browser.</span></div></div>
+            <div class="settings-grid">
+              <label>Slack workflow webhook<input id="slackWorkflowWebhook" type="password" placeholder="Leave blank to keep current secret"></label>
+              <label>Snowflake action endpoint<input id="snowflakeEndpoint" type="password" placeholder="Leave blank to keep current secret"></label>
+              <label>Data 360 action endpoint<input id="data360Endpoint" type="password" placeholder="Leave blank to keep current secret"></label>
+            </div>
+            <div class="settings-actions">
+              <button class="button primary" onclick="saveSettings()">Save integration secrets</button>
+            </div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-heading"><div><h3>Administrators</h3><span>Admins can import data, manage controls, and enable platform handoffs.</span></div></div>
+            <form class="admin-add-form" onsubmit="addAdmin(event)">
+              <label for="newAdminEmail">Add an administrator by email</label>
+              <div><input id="newAdminEmail" type="email" autocomplete="email" placeholder="name@company.com" required><button class="button primary" type="submit">Add admin</button></div>
+            </form>
+            <div id="adminList" class="admin-list"><div class="empty compact">Loading administrators…</div></div>
+          </section>
+
+          <section class="panel">
+            <div class="panel-heading"><div><h3>Operational readiness</h3><span>Current integration and safety-gate status.</span></div></div>
+            <div id="integrationStatus" class="integration-list"></div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <form id="intakeUploadForm" class="hidden" onsubmit="return false;">
+      <input id="intakeFile" name="intakeFile" type="file" accept=".csv,text/csv" onchange="handleIntakeFile()">
+    </form>
+
+    <section id="intakeReviewPage" class="intake-review-page hidden" aria-hidden="true">
+      <header class="intake-review-header">
+        <div>
+          <div class="eyebrow">EDG intake review</div>
+          <h2>Review data refresh</h2>
+          <p id="intakeReviewSubtitle">Validate the calculated changes before updating the lifecycle dataset.</p>
+        </div>
+        <button class="button subtle" onclick="cancelIntakeReview()">Cancel review</button>
+      </header>
+      <div class="intake-review-body">
+        <section id="intakeReviewMetrics" class="review-metrics"></section>
+        <nav id="intakeReviewSteps" class="review-steps" aria-label="Intake review progress"></nav>
+        <section id="intakeReviewWorkspace" class="review-workspace panel">
+          <div class="review-workspace-heading">
+            <div>
+              <div id="intakeReviewStepLabel" class="eyebrow">Step 1 of 4</div>
+              <h3 id="intakeReviewStepTitle">Newly stale</h3>
+              <p id="intakeReviewStepDescription"></p>
+            </div>
+            <span id="intakeReviewVisibleCount" class="badge gray">0 records</span>
+          </div>
+          <div id="intakeReviewFilters" class="review-filters">
+            <input id="intakeReviewSearch" type="search" placeholder="Search object, change, or recipient" oninput="filterIntakeReview()">
+            <select id="intakeReviewCategoryFilter" onchange="filterIntakeReview()"><option value="">All review types</option></select>
+            <select id="intakeReviewDomainFilter" onchange="filterIntakeReview()"><option value="">All domains</option></select>
+            <select id="intakeReviewTypeFilter" onchange="filterIntakeReview()"><option value="">All asset types</option></select>
+          </div>
+          <div id="intakeReviewBulkBar" class="bulk-action-bar review-bulk-bar hidden" aria-live="polite">
+            <strong><span id="intakeReviewSelectedCount">0</span> selected</strong>
+            <div class="bulk-action-buttons">
+              <button class="button dismiss" onclick="dismissSelectedIntakeRecords()">Dismiss selected</button>
+              <button class="button subtle" onclick="restoreSelectedIntakeRecords()">Restore selected</button>
+              <button class="button subtle" onclick="clearIntakeReviewSelection()">Clear selection</button>
+            </div>
+          </div>
+          <div id="intakeReviewTableWrap" class="review-table-wrap">
+            <table>
+              <thead><tr><th class="select-column"><input id="selectAllIntakeRecords" type="checkbox" aria-label="Select all visible review records" onchange="toggleAllIntakeReviewRecords(this.checked)"></th><th>Object</th><th>Review type</th><th>Change</th><th>Message / recipient</th><th>Domain</th><th></th></tr></thead>
+              <tbody id="intakeReviewRows"></tbody>
+            </table>
+          </div>
+          <div id="intakeReviewSampleNote" class="review-more hidden"></div>
+        </section>
+        <section id="intakeReviewPublish" class="review-impact panel hidden">
+          <div class="panel-heading"><div><h3>Ready to publish</h3><span>Confirm the resulting lifecycle changes</span></div></div>
+          <div id="intakeReviewImpact" class="review-impact-copy"></div>
+        </section>
+      </div>
+      <footer class="intake-review-footer">
+        <button class="button subtle" onclick="cancelIntakeReview()">Cancel</button>
+        <span class="review-footer-spacer"></span>
+        <button id="intakeReviewBackButton" class="button subtle" onclick="changeIntakeReviewStep(-1)">Back</button>
+        <button id="intakeReviewNextButton" class="button primary" onclick="changeIntakeReviewStep(1)">Next category</button>
+        <button id="confirmIntakeButton" class="button confirm-deprecation hidden" onclick="confirmIntakeReview()">Confirm &amp; Publish</button>
+      </footer>
+    </section>
+
+    <div id="drawerBackdrop" class="backdrop hidden" onclick="closeDrawer()"></div>
+    <aside id="detailDrawer" class="drawer" aria-hidden="true">
+      <button class="close" onclick="closeDrawer()" aria-label="Close">×</button>
+      <div id="detailContent"></div>
+    </aside>
+    <div id="userGuideModal" class="confirmation-backdrop hidden" role="presentation">
+      <section class="user-guide-dialog" role="dialog" aria-modal="true" aria-labelledby="userGuideTitle" aria-describedby="userGuideIntro" tabindex="-1">
+        <div class="user-guide-heading">
+          <div><div class="eyebrow">Application guide</div><h2 id="userGuideTitle">How Stale Data Monitoring works</h2><p id="userGuideIntro">Review records you steward, make the appropriate lifecycle decision, and track assets safely through quarantine and verified purge.</p></div>
+          <button class="close user-guide-close" type="button" onclick="closeUserGuide_()" aria-label="Close application guide">×</button>
+        </div>
+        <div class="user-guide-policy">
+          <div><strong>Stale Asset Archival &amp; Purge Standard</strong><span>Effective August 1, 2026 · V2MOM 2.14 Trust &amp; Governance</span></div>
+          <p>An asset becomes <strong>Stale</strong> after 180 continuous days without evidence of access, modification, refresh, processing, or scheduled-job activity. Review it and respond before the deadline shown in the application and your notification.</p>
+          <a href="https://docs.google.com/document/d/1ma48XATF2CV-8miBoxTndfiJzH9TZQlFqZqnsuBrdNA/edit" target="_blank" rel="noopener">Read the governing standard ↗</a>
+        </div>
+        <div class="user-guide-purpose" aria-label="Why stale-data review matters">
+          <div><strong>Reduce risk</strong><span>Remove old, unmonitored data that lacks active accountability.</span></div>
+          <div><strong>Support compliance</strong><span>Reduce retention, privacy, and unnecessary storage exposure.</span></div>
+          <div><strong>Confirm ownership</strong><span>Keep an asset only when someone confirms an active business need.</span></div>
+        </div>
+        <div class="user-guide-grid">
+          <article class="user-guide-section">
+            <span class="user-guide-number">1</span>
+            <div><h3>Review your assigned stale assets</h3><p>You are here because your Salesforce email, or an active teammate’s email, is associated with an asset’s ownership or governance roles.</p><ul><li>Use Dashboard search and multi-select filters to narrow the table.</li><li>Open a row to review inactivity, ownership, deadlines, lifecycle history, notifications, and handoffs.</li><li>Select one or more rows to expose bulk actions and CSV export.</li></ul></div>
+          </article>
+          <article class="user-guide-section">
+            <span class="user-guide-number">2</span>
+            <div><h3>Use My Team to share access</h3><p>Create a team and add trusted colleagues using their <strong>@salesforce.com</strong> email addresses. Every active member can access records assigned to every other member and can manage team membership.</p><ul><li>A person can belong to one active team.</li><li>Removing a member immediately removes shared access but preserves their direct access.</li><li>Administrators can review, manage, deactivate, and reactivate every team.</li></ul></div>
+          </article>
+          <article class="user-guide-section user-guide-actions">
+            <span class="user-guide-number">3</span>
+            <div><h3>Choose the appropriate action</h3><dl><dt>Confirm Deprecation</dt><dd>Confirm the asset is no longer required. It enters the platform quarantine-handoff process.</dd><dt>Contest</dt><dd>Keep the asset for a valid business need. Complete the exception application first, then submit an approved, <strong>ACTIVE</strong> exception ID here.</dd><dt>Self Purge</dt><dd>Commit to deleting the asset yourself in Snowflake. Notifications, reminders, and partner handoffs stop while a later complete import verifies its absence.</dd><dt>Restore</dt><dd>Request access restoration while an asset is quarantined and still recoverable.</dd><dt>Export CSV</dt><dd>Download all available details for the selected records.</dd><dt>Dismiss</dt><dd>Administrator only. Remove an asset from the workflow with an audited decision.</dd></dl><p class="user-guide-done">Once you complete the appropriate action, your owner response is complete unless a later notification requires attention.</p></div>
+          </article>
+          <article class="user-guide-section">
+            <span class="user-guide-number">4</span>
+            <div><h3>Follow the lifecycle outcome</h3><div class="user-guide-lifecycle" aria-label="Asset lifecycle"><span>Detected</span><b>→</b><span>Notified</span><b>→</b><span>Contested or Accepted</span><b>→</b><span>Quarantined</span><b>→</b><span>Purge Eligible</span><b>→</b><span>Purged</span></div><ul><li><strong>Quarantined</strong> means access is restricted, but the asset remains recoverable during the configured quarantine period.</li><li>A final purge notice is sent 30 days before eligibility.</li><li><strong>Purged</strong> means permanent deletion has been verified; restoration is no longer available.</li><li>Asset status is the operational condition; lifecycle status drives reminders, notifications, and handoffs.</li></ul></div>
+          </article>
+          <article class="user-guide-section user-guide-resources">
+            <span class="user-guide-number">5</span>
+            <div><h3>Get guidance and support</h3><p>Use these resources when you need policy, exception, or live support.</p><div class="user-guide-links"><a href="https://salesforce.enterprise.slack.com/docs/T01G0063H29/F0BPF8BDJTG" target="_blank" rel="noopener">Owner instructions Canvas ↗</a><a href="https://salesforce.enterprise.slack.com/docs/T01G0063H29/F0BJH1ZJ70E" target="_blank" rel="noopener">Exception process SOP ↗</a><a href="https://salesforce.enterprise.slack.com/archives/C065MLQ2HLL" target="_blank" rel="noopener">Data governance Slack channel ↗</a></div><p>Office Hours and live-guidance announcements are shared in the data governance channel.</p></div>
+          </article>
+        </div>
+        <div class="user-guide-footer">
+          <label class="user-guide-preference"><input id="userGuideDontShow" type="checkbox"> <span>Do not show this again when I open the application</span></label>
+          <button class="button primary" type="button" onclick="closeUserGuide_()">Start using the application</button>
+        </div>
+      </section>
+    </div>
+    <div id="confirmationModal" class="confirmation-backdrop hidden" role="presentation" onclick="confirmationBackdropClicked(event)">
+      <section id="confirmationDialog" class="confirmation-dialog" role="dialog" aria-modal="true" aria-labelledby="confirmationTitle" aria-describedby="confirmationMessage">
+        <div id="confirmationIcon" class="confirmation-icon">!</div>
+        <div class="confirmation-copy">
+          <div class="eyebrow">Confirm action</div>
+          <h2 id="confirmationTitle">Are you sure?</h2>
+          <p id="confirmationMessage"></p>
+          <p id="confirmationDetail" class="confirmation-detail hidden"></p>
+          <div id="confirmationReview" class="confirmation-review hidden"></div>
+        </div>
+        <div class="confirmation-actions">
+          <button id="confirmationCancel" class="button subtle" onclick="closeConfirmation()">Cancel</button>
+          <button id="confirmationSubmit" class="button primary" onclick="submitConfirmation()">Confirm</button>
+        </div>
+      </section>
+    </div>
+    <div id="adminStatusModal" class="confirmation-backdrop hidden" role="presentation" onclick="adminStatusBackdropClicked_(event)">
+      <section class="confirmation-dialog admin-status-dialog" role="dialog" aria-modal="true" aria-labelledby="adminStatusTitle">
+        <div class="confirmation-icon">!</div>
+        <div class="confirmation-copy">
+          <div class="eyebrow">Administrator action</div>
+          <h2 id="adminStatusTitle">Change lifecycle status</h2>
+          <p id="adminStatusDescription"></p>
+          <div class="exception-fields">
+            <label>New lifecycle status <span class="optional">All lifecycle statuses are available to administrators</span><select id="adminStatusTarget"></select></label>
+            <p id="adminStatusImpact" class="admin-status-impact">Choose a status to preview its downstream effect.</p>
+            <label>Comment <span class="optional">Required · Added to lifecycle history and the audit log</span><textarea id="adminStatusComment" rows="4" maxlength="2000" placeholder="Explain why this status is being changed."></textarea></label>
+          </div>
+          <div id="adminStatusError" class="exception-flow-error hidden" role="alert" aria-live="assertive"></div>
+        </div>
+        <div class="confirmation-actions">
+          <button class="button subtle" onclick="closeAdminStatusFlow_()">Cancel</button>
+          <button id="adminStatusSubmit" class="button primary" onclick="submitAdminStatusFlow_()">Update status</button>
+        </div>
+      </section>
+    </div>
+    <div id="exceptionFlowModal" class="confirmation-backdrop hidden" role="presentation" onclick="exceptionFlowBackdropClicked(event)">
+      <section class="confirmation-dialog exception-flow-dialog" role="dialog" aria-modal="true" aria-labelledby="exceptionFlowTitle">
+        <div id="exceptionFlowIcon" class="confirmation-icon orange">!</div>
+        <div class="confirmation-copy exception-flow-copy">
+          <div class="eyebrow">Exception process</div>
+          <h2 id="exceptionFlowTitle">Contest stale designation</h2>
+          <p id="exceptionFlowDescription"></p>
+          <div class="exception-instructions">
+            <strong>Before you can contest</strong>
+            <ol>
+              <li>Open the <a id="exceptionRequestInlineLink" href="#" target="_blank" rel="noopener">exception request form</a> and complete its four steps: requestor, exception details, risk assessment, and review.</li>
+              <li>Submit the request and copy the generated ID in the format <strong>EDG-EXC-YYYY-NNN</strong>.</li>
+              <li>Wait for the exception to be approved and reach <strong>ACTIVE</strong> status in the exception database.</li>
+              <li>Return here and enter that ID. The application validates the ID and ACTIVE status before recording the contest.</li>
+              <li>Exception details are reconciled automatically; no second submission is required here.</li>
+            </ol>
+          </div>
+          <div id="contestFields" class="exception-fields">
+            <label>Active exception ID <span class="optional">Required · Must exist with ACTIVE status</span><input id="contestExceptionId" type="text" placeholder="EDG-EXC-2026-009" pattern="EDG-EXC-[0-9]{4}-[0-9]{3,}" autocomplete="off" required oninput="updateExceptionRecordLink()"></label>
+          </div>
+          <div id="exemptFields" class="exception-fields hidden">
+            <label>Approved exception ID <span class="optional">Required · Example: <strong>EDG-EXC-2026-009</strong></span><input id="approvedExceptionId" type="text" placeholder="EDG-EXC-2026-009" pattern="EDG-EXC-[0-9]{4}-[0-9]{3,}" autocomplete="off" required oninput="updateExceptionRecordLink()"></label>
+            <label>Exception expiration date <span class="optional">Recommended for expiration monitoring</span><input id="approvedExceptionExpires" type="date"></label>
+            <label>Exception record URL <span class="optional">Populated from the approved exception ID</span><input id="approvedExceptionUrl" type="url" placeholder="https://…" readonly></label>
+          </div>
+          <div id="exceptionFlowError" class="exception-flow-error hidden" role="alert" aria-live="assertive"></div>
+          <div class="exception-link-row">
+            <a id="exceptionRecordLink" class="button subtle hidden" href="#" target="_blank" rel="noopener">Open exception record</a>
+          </div>
+        </div>
+        <div class="confirmation-actions">
+          <button class="button subtle" onclick="closeExceptionFlow()">Cancel</button>
+          <button id="exceptionFlowSubmit" class="button request-exception" onclick="submitExceptionFlow()">Contest</button>
+        </div>
+      </section>
+    </div>
+    <div id="workflowLoadingOverlay" class="workflow-loading-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="workflowLoadingTitle" aria-describedby="workflowLoadingMessage">
+      <div class="workflow-loading-card" role="status" aria-live="polite">
+        <div class="loading-spinner" aria-hidden="true"></div>
+        <h2 id="workflowLoadingTitle">Processing request</h2>
+        <p id="workflowLoadingMessage">Updating the lifecycle record and sending the Slack notification…</p>
+        <div id="workflowLoadingProgress" class="workflow-loading-progress hidden" role="progressbar" aria-label="Import progress" aria-valuemin="0" aria-valuemax="100" aria-valuetext="Uploading and analyzing data">
+          <span id="workflowLoadingProgressFill"></span>
+        </div>
+        <div id="workflowLoadingProgressSummary" class="workflow-loading-progress-summary hidden">
+          <strong id="workflowLoadingPercent">Working…</strong>
+          <span id="workflowLoadingStage"></span>
+        </div>
+        <div id="workflowLoadingDetails" class="workflow-loading-details hidden"></div>
+        <small>Please keep this window open.</small>
+      </div>
+    </div>
+    <div id="toast" class="toast hidden"></div>
+    <script>window.__APP_DEEP_LINK__ = <?!= deepLinkConfig ?>;</script>
+    <?!= include('Client'); ?>
+  </body>
+</html>
