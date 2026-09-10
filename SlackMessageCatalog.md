@@ -2,13 +2,13 @@
 
 This catalog defines the stable `messageType` values sent by the Apps Script application to the Slack workflow webhook. Slack Workflow Builder should branch directly on `messageType` and construct all message content from the raw payload variables.
 
-The wording follows the signed-off lifecycle: initial notification at T+2, contestation through T+9, restriction at T+16, quarantine at T+23, a 30-day purge notice at T+173, and verified purge at T+203. Orphaned assets and sandbox data use their separate PRD timelines. Exception reminders follow the EDG Exception Management App SOP.
+The wording follows the signed-off lifecycle with the updated immediate stale-asset notification policy: initial notification at T0, contestation through T+9, restriction at T+16, quarantine at T+23, a 30-day purge notice at T+173, and verified purge at T+203. Orphaned assets and sandbox data use their separate PRD timelines. Exception reminders follow the EDG Exception Management App SOP.
 
 ## Workflow branches
 
 | `messageType` | Recipient audience | Trigger | Intent |
 | --- | --- | --- | --- |
-| `STALE_ASSET_NOTICE` | Asset owner and stewards | T+2 after EDG validation | Initial action-required stale designation |
+| `STALE_ASSET_NOTICE` | Asset owner and stewards | Immediately after EDG validation | Initial action-required stale designation |
 | `CONTESTATION_REMINDER` | Asset owner and stewards | Before T+9 | Warn that the contest window is closing |
 | `OWNER_ESCALATION` | Leadership, DPMT, BDST, DPML | 7 days with no response | Escalate unresolved ownership/action |
 | `CONTESTATION_RECEIVED` | Requester and EDG | On contestation | Confirm receipt and pause automation for review |
@@ -110,8 +110,8 @@ Every webhook request includes workflow-safe scalar variables. Eligible notifica
 {
   "messageType": "STALE_ASSET_NOTICE",
   "primaryRecipient": "owner@example.com",
-  "assetCount": 137,
-  "assetSummary": "• DATABASE.SCHEMA.OBJECT — 372 days inactive · respond by Aug 15, 2026\n• +136 additional assets — open the application to review",
+  "assetCount": "137",
+  "assetSummary": "• DATABASE.SCHEMA.OBJECT — 372 days inactive · respond by Aug 15, 2026\n…up to 10 assets…\n\n*Note:* This notification contains 137 assets. <https://...|Open the application> to view the full asset list.",
   "objectFqn": "DATABASE.SCHEMA.OBJECT",
   "platform": "SNOWFLAKE",
   "environment": "PROD",
@@ -130,7 +130,7 @@ Every webhook request includes workflow-safe scalar variables. Eligible notifica
 }
 ```
 
-The URL fields and per-asset links inside `assetSummary` use Slack's labeled-link syntax so messages show compact actions instead of full URLs while retaining the complete destination in the link itself.
+All webhook values are sent as strings. `edgContact` comes from the environment-specific `EDG_CONTACT` configuration and must be a Slack channel ID such as `C065MLQ2HLL`; it is separate from the email-valued `EDG_OPERATIONS_RECIPIENT`. `primaryRecipient` must be a complete email address. Import campaigns stage all eligible drafts before delivery and send one consolidated message per recipient and `messageType`, even when asset processing spans multiple execution chunks. Consolidated notifications list at most 10 assets; when the group is larger, `assetSummary` reports the full asset count and ends with a note linking to the application for the complete list.
 
 Message content is not constructed by Apps Script. Slack delivery remains disabled until `SLACK_NOTIFICATIONS_ENABLED` is true and a secure workflow webhook is configured.
 
@@ -138,10 +138,9 @@ Message content is not constructed by Apps Script. Slack delivery remains disabl
 
 The resolver chooses the first usable value in the applicable chain:
 
-- Standard owner notices: `RECORD_OWNER` → `TECHNICAL_STEWARD` → `BUSINESS_STEWARD` → `SCHEMA_OWNER` → `DATABASE_OWNER`.
-- Owner escalation: `EMP_L6` → `EMP_L5` → configured DPML → DPM team → BDS team → standard owner chain.
+- Standard owner notices and owner escalation: `TECHNICAL_STEWARD` → `BUSINESS_STEWARD` → `SNOWFLAKE_TABLE_OWNER` → `SCHEMA_OWNER` → `DATABASE_OWNER` → configured EDG operations.
 - Contestation and restoration confirmations: actor who performed the transition → standard owner chain.
-- Orphan notices: configured DPMT → asset DPM team → configured BDST → asset BDS team → configured DPML → configured EDG operations → L6 → L5.
+- Orphan notices use the same owner hierarchy so newly enriched schema owners are contacted before the EDG operations fallback.
 - Sandbox notices: configured sandbox owner → standard owner chain.
 - Purge/SLA failures: configured EDG or platform operations recipient → standard owner chain.
 

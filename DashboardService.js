@@ -14,7 +14,7 @@ function getDashboard(request) {
   const environmentFilters = dashboardFilterValues_(query.environments || query.environment);
   const stewardFilters = dashboardFilterValues_(query.stewards || query.stewardship);
   const domainFilters = dashboardFilterValues_(query.domains || query.domain);
-  const typeFilter = cleanText_(query.assetType).toUpperCase();
+  const typeFilters = dashboardFilterValues_(query.assetTypes || query.assetType);
   const page = Math.max(1, Number(query.page || 1));
   const pageSize = Math.min(200, Math.max(10, Number(query.pageSize || 50)));
   const matching = [];
@@ -79,7 +79,7 @@ function getDashboard(request) {
     if (environmentFilters.length && environmentFilters.indexOf(environment) === -1) return;
     if (stewardFilters.length && stewardFilters.indexOf(technicalSteward.toUpperCase()) === -1 && stewardFilters.indexOf(businessSteward.toUpperCase()) === -1) return;
     if (domainFilters.length && domainFilters.indexOf(domain.toUpperCase()) === -1) return;
-    if (typeFilter && assetType !== typeFilter) return;
+    if (typeFilters.length && typeFilters.indexOf(assetType) === -1) return;
     if (search) {
       const haystack = Object.keys(asset).map(function (key) { return cleanText_(asset[key]); }).join(' ').toLowerCase();
       if (haystack.indexOf(search) === -1) return;
@@ -88,14 +88,16 @@ function getDashboard(request) {
   });
 
   matching.sort(function (left, right) {
-    const leftDays = parseNumber_(left.DAYS_SINCE_ANY_ACTIVITY);
-    const rightDays = parseNumber_(right.DAYS_SINCE_ANY_ACTIVITY);
+    const leftDays = assetReadInactivityDays_(left);
+    const rightDays = assetReadInactivityDays_(right);
     if (rightDays !== leftDays) return Number(rightDays === null ? -1 : rightDays) - Number(leftDays === null ? -1 : leftDays);
     return cleanText_(left.OBJECT_FQN).localeCompare(cleanText_(right.OBJECT_FQN));
   });
   const jobs = readObjects_(APP.sheets.jobs);
   const latestJob = jobs.length ? jobs[jobs.length - 1] : null;
   const offset = (page - 1) * pageSize;
+  const pageAssets = matching.slice(offset, offset + pageSize);
+  const notificationDates = dashboardNotificationDates_(pageAssets.map(function (asset) { return asset.ASSET_ID; }));
   const profile = getEnvironmentProfile_();
   return {
     snapshotAt: snapshotAt,
@@ -125,8 +127,8 @@ function getDashboard(request) {
       assetStatuses: [APP.assetStatus.stale, APP.assetStatus.active, APP.assetStatus.quarantined, APP.assetStatus.purged],
       lifecycleStatuses: dashboardLifecycleStatuses_()
     },
-    assets: matching.slice(offset, offset + pageSize).map(function (asset) {
-      const item = dashboardAsset_(asset);
+    assets: pageAssets.map(function (asset) {
+      const item = dashboardAsset_(asset, notificationDates[asset.ASSET_ID] || '');
       item.permissions = {
         canRespond: !profile.readOnly && canAccessAssetWithEmails_(asset, accessEmails),
         canAdmin: !profile.readOnly && role === 'ADMIN',
@@ -189,9 +191,11 @@ function dashboardLifecycleStatuses_() {
   });
 }
 
-function dashboardAsset_(asset) {
+function dashboardAsset_(asset, notificationDate) {
   const size = parseNumber_(asset.SIZE_GB);
-  const inactive = parseNumber_(asset.DAYS_SINCE_ANY_ACTIVITY);
+  const inactive = assetReadInactivityDays_(asset);
+  const operationalInactive = parseNumber_(asset.DAYS_SINCE_OPERATIONAL_ACTIVITY);
+  const rowCount = parseNumber_(asset.ROW_COUNT);
   return {
     assetId: asset.ASSET_ID,
     objectFqn: asset.OBJECT_FQN,
@@ -199,13 +203,24 @@ function dashboardAsset_(asset) {
     environment: asset.ENVIRONMENT,
     assetType: asset.ASSET_TYPE,
     sizeGb: size,
+    rowCount: rowCount,
+    lastRead: asset.LAST_READ || '',
+    objectCreatedDate: asset.OBJECT_CREATED_DATE || '',
+    sourceActivityStatus: asset.SOURCE_ACTIVITY_STATUS || '',
+    notificationDate: notificationDate || '',
     daysInactive: inactive,
+    daysSinceOperationalActivity: operationalInactive,
     evaluationStatus: asset.EVALUATION_STATUS,
     assetStatus: deriveAssetStatus_(asset),
     lifecycleState: canonicalLifecycleState_(asset.LIFECYCLE_STATE),
     ownershipStatus: asset.OWNERSHIP_STATUS,
     ownershipSource: asset.OWNERSHIP_SOURCE,
-    snowflakeOwner: asset.SNOWFLAKE_TABLE_OWNER || asset.DATABASE_OWNER,
+    snowflakeOwner: asset.SNOWFLAKE_TABLE_OWNER,
+    schemaOwner: asset.SCHEMA_OWNER,
+    schemaOwnerName: asset.SCHEMA_OWNER_NAME,
+    schemaOwnerUsername: asset.SCHEMA_OWNER_USERNAME,
+    schemaOwnerAssignmentStatus: asset.SCHEMA_OWNER_ASSIGNMENT_STATUS,
+    databaseOwner: asset.DATABASE_OWNER,
     snowflakeDataStatus: asset.SNOWFLAKE_DATA_STATUS || APP.lifecycle.active,
     technicalSteward: asset.TECHNICAL_STEWARD,
     businessSteward: asset.BUSINESS_STEWARD,
@@ -218,6 +233,21 @@ function dashboardAsset_(asset) {
     contestDeadline: asset.CONTEST_DEADLINE,
     purgeEligibleDate: asset.PURGE_ELIGIBLE_DATE
   };
+}
+
+function dashboardNotificationDates_(assetIds) {
+  if (!assetIds.length) return {};
+  const dates = {};
+  readObjectsByKeys_(APP.sheets.cases, 'ASSET_ID', assetIds).forEach(function (caseRecord) {
+    const assetId = cleanText_(caseRecord.ASSET_ID);
+    const notifiedAt = caseRecord.NOTIFIED_AT;
+    if (!assetId || !notifiedAt) return;
+    const current = dates[assetId];
+    const candidateTime = new Date(notifiedAt).getTime();
+    const currentTime = current ? new Date(current).getTime() : NaN;
+    if (!current || (!isNaN(candidateTime) && (isNaN(currentTime) || candidateTime > currentTime))) dates[assetId] = notifiedAt;
+  });
+  return dates;
 }
 
 function emptyDashboard_() {

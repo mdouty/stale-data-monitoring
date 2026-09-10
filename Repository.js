@@ -93,19 +93,51 @@ function readObjectsByKeys_(sheetName, keyHeader, keyValues) {
   keyColumn.forEach(function (row, index) {
     if (keys[cleanText_(row[0])]) rowNumbers.push(index + 2);
   });
-  const groups = [];
-  rowNumbers.forEach(function (rowNumber) {
-    const current = groups.length ? groups[groups.length - 1] : null;
-    if (current && rowNumber === current.end + 1) current.end = rowNumber;
-    else groups.push({ start: rowNumber, end: rowNumber });
-  });
+  const groups = groupSheetRowsForBulkIo_(rowNumbers);
   const objects = [];
   groups.forEach(function (group) {
-    sheet.getRange(group.start, 1, group.end - group.start + 1, lastColumn).getDisplayValues().forEach(function (row) {
-      objects.push(rowToObject_(headers, row));
+    const rowCount = Math.min(group.end, lastRow) - group.start + 1;
+    sheet.getRange(group.start, 1, rowCount, lastColumn).getDisplayValues().forEach(function (row, index) {
+      const rowNumber = group.start + index;
+      if (group.selectedRows[rowNumber]) objects.push(rowToObject_(headers, row));
     });
   });
   return objects;
+}
+
+function repositoryBulkWindowSize_() {
+  const configured = typeof configNumber_ === 'function' ? configNumber_('SHEET_BULK_IO_WINDOW_ROWS', 500) : 500;
+  return Math.max(100, Math.min(1000, Number(configured || 500)));
+}
+
+function groupSheetRowsForBulkIo_(rowNumbers) {
+  const rows = (rowNumbers || []).slice().sort(function (left, right) { return left - right; });
+  if (!rows.length) return [];
+  const contiguous = [];
+  rows.forEach(function (rowNumber) {
+    const current = contiguous.length ? contiguous[contiguous.length - 1] : null;
+    if (current && rowNumber === current.end + 1) {
+      current.end = rowNumber;
+      current.selectedRows[rowNumber] = true;
+    } else {
+      const selectedRows = {};
+      selectedRows[rowNumber] = true;
+      contiguous.push({ start: rowNumber, end: rowNumber, selectedRows: selectedRows });
+    }
+  });
+  if (contiguous.length <= 25) return contiguous;
+
+  const windowSize = repositoryBulkWindowSize_();
+  const windows = {};
+  rows.forEach(function (rowNumber) {
+    const start = 2 + Math.floor((rowNumber - 2) / windowSize) * windowSize;
+    const key = String(start);
+    if (!windows[key]) windows[key] = { start: start, end: start + windowSize - 1, selectedRows: {} };
+    windows[key].selectedRows[rowNumber] = true;
+  });
+  return Object.keys(windows).map(function (key) { return windows[key]; }).sort(function (left, right) {
+    return left.start - right.start;
+  });
 }
 
 function indexObjectsBy_(objects, keyHeader) {
@@ -139,18 +171,20 @@ function updateObjectsByKey_(sheetName, keyHeader, objects) {
     else additions.push(objectToRow_(headers, value));
   });
   updates.sort(function (left, right) { return left.rowNumber - right.rowNumber; });
-  const groups = [];
-  updates.forEach(function (update) {
-    const current = groups.length ? groups[groups.length - 1] : null;
-    if (current && update.rowNumber === current.end + 1) {
-      current.end = update.rowNumber;
-      current.rows.push(update.row);
-    } else {
-      groups.push({ start: update.rowNumber, end: update.rowNumber, rows: [update.row] });
-    }
-  });
+  const updatesByRow = updates.reduce(function (index, update) {
+    index[update.rowNumber] = update.row;
+    return index;
+  }, {});
+  const groups = groupSheetRowsForBulkIo_(updates.map(function (update) { return update.rowNumber; }));
   groups.forEach(function (group) {
-    sheet.getRange(group.start, 1, group.rows.length, headers.length).setValues(group.rows);
+    const rowCount = Math.min(group.end, sheet.getLastRow()) - group.start + 1;
+    const range = sheet.getRange(group.start, 1, rowCount, headers.length);
+    const rows = range.getDisplayValues();
+    Object.keys(group.selectedRows).forEach(function (rowNumberText) {
+      const rowNumber = Number(rowNumberText);
+      if (updatesByRow[rowNumber]) rows[rowNumber - group.start] = updatesByRow[rowNumber];
+    });
+    range.setValues(rows);
   });
   if (additions.length) appendRawRows_(sheetName, additions);
   return values.length;
@@ -165,13 +199,42 @@ function ensureSheetCapacity_(sheet, requiredRows, requiredColumns) {
   }
 }
 
+/**
+ * Google Sheets enforces a workbook-wide 10 million cell limit. Keep only a
+ * modest empty-row buffer on operational sheets so iterative appends cannot be
+ * blocked by historical grid capacity that contains no data.
+ */
+function reclaimOperationalGridCapacity_() {
+  const targets = [
+    APP.sheets.assetsCurrent, APP.sheets.assetsStaging, APP.sheets.assetsIndex,
+    APP.sheets.snapshots, APP.sheets.cases, APP.sheets.events,
+    APP.sheets.notifications, APP.sheets.platformActions, APP.sheets.jobs,
+    APP.sheets.dashboardSummary
+  ];
+  const results = [];
+  targets.forEach(function (sheetName) {
+    const sheet = getSheet_(sheetName);
+    const usedRows = Math.max(1, sheet.getLastRow());
+    const targetRows = Math.max(1000, usedRows + 1000);
+    const maxRows = sheet.getMaxRows();
+    if (maxRows > targetRows) sheet.deleteRows(targetRows + 1, maxRows - targetRows);
+    results.push({ sheet: sheet.getName(), rows: sheet.getMaxRows(), usedRows: usedRows });
+  });
+  return results;
+}
+
 function appendObjectRows_(sheetName, headers, objects) {
   if (!objects || !objects.length) return 0;
   const sheet = getSheet_(sheetName);
+  const sheetWidth = sheet.getLastColumn();
+  const sheetHeaders = sheetWidth
+    ? sheet.getRange(1, 1, 1, sheetWidth).getDisplayValues()[0].map(cleanText_)
+    : [];
+  const writeHeaders = sheetHeaders.some(Boolean) ? sheetHeaders : headers;
   const startRow = Math.max(2, sheet.getLastRow() + 1);
-  ensureSheetCapacity_(sheet, startRow + objects.length - 1, headers.length);
-  const rows = objects.map(function (value) { return objectToRow_(headers, value); });
-  sheet.getRange(startRow, 1, rows.length, headers.length).setValues(rows);
+  ensureSheetCapacity_(sheet, startRow + objects.length - 1, writeHeaders.length);
+  const rows = objects.map(function (value) { return objectToRow_(writeHeaders, value); });
+  sheet.getRange(startRow, 1, rows.length, writeHeaders.length).setValues(rows);
   return rows.length;
 }
 

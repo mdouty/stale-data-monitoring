@@ -1,17 +1,23 @@
-// DEV uses isolated foundation sheets; PRD remains view-only until explicitly enabled.
+// DEV uses isolated foundation sheets; PRD remains view-only until explicitly enabled in Config.
 let FOUNDATION_SPREADSHEET_;
 let ACTIVE_ENVIRONMENT_;
+let RAW_CONFIG_RUNTIME_CACHE_;
+let MERGED_CONFIG_RUNTIME_CACHE_ = {};
 
 const APP = Object.freeze({
-  version: '0.48.0',
   foundationSpreadsheetId: '16e0gKQtjrnMSLOZk5gG88olvMuUV7yLEctWAjOV975o',
   sourceSpreadsheetId: '1n8OlosBHiC5CBNIcivzl6-nS1N1IpcH6KcWxnjhemOk',
   sourceSheetName: 'Filtered Extract copy',
+  schemaOwnerSpreadsheetId: '1EtIMswTPcNQtUYVSb_8Lwoh2muU3U7hJc4g5uqVI_ks',
+  schemaOwnerSheetName: 'Schema Master List',
   sourceColumnCount: 27,
   defaultImportChunkSize: 2500,
+  defaultSafeImportBatchSize: 500,
+  defaultImportExecutionBudgetMs: 210000,
   defaultInlineImportMaxRows: 100,
   importStateProperty: 'SNOWFLAKE_IMPORT_STATE',
   intakeReviewProperty: 'SNOWFLAKE_INTAKE_REVIEW',
+  importNotificationCampaignProperty: 'IMPORT_NOTIFICATION_CAMPAIGN',
   activeEnvironmentProperty: 'ACTIVE_APP_ENVIRONMENT',
   userGuideDismissedProperty: 'USER_GUIDE_DISMISSED',
   defaultEnvironment: 'DEV',
@@ -29,6 +35,7 @@ const APP = Object.freeze({
     assetsStaging: 'Assets_Staging',
     assetsIndex: 'Assets_UI_Index',
     intakeUpload: 'Intake_Upload',
+    intakeReviewCache: 'Intake_Review_Cache',
     snapshots: 'Evaluation_Snapshots',
     cases: 'Lifecycle_Cases',
     events: 'Lifecycle_Events',
@@ -68,24 +75,25 @@ const APP = Object.freeze({
 
 const ASSET_HEADERS = Object.freeze([
   'ASSET_ID', 'PLATFORM', 'ENVIRONMENT', 'DATABASE_NAME', 'SCHEMA_NAME',
-  'OBJECT_NAME', 'OBJECT_FQN', 'ASSET_TYPE', 'SIZE_GB', 'DAYS_SINCE_LAST_DDL',
-  'DAYS_SINCE_ANY_ACTIVITY', 'ESTIMATED_LAST_ACTIVITY_DATE',
+  'OBJECT_NAME', 'OBJECT_FQN', 'SNOWFLAKE_TABLE_ID', 'ASSET_TYPE', 'SIZE_GB', 'DAYS_SINCE_LAST_DDL',
+  'DAYS_SINCE_READ', 'DAYS_SINCE_ANY_ACTIVITY', 'DAYS_SINCE_OPERATIONAL_ACTIVITY', 'ESTIMATED_LAST_ACTIVITY_DATE',
   'SOURCE_ACTIVITY_STATUS', 'POLICY_RULE', 'EVALUATION_STATUS',
   'STALE_THRESHOLD_DAYS', 'OWNERSHIP_STATUS', 'DATABASE_OWNER',
-  'SCHEMA_OWNER', 'RECORD_OWNER', 'TECHNICAL_STEWARD', 'BUSINESS_STEWARD',
+  'SCHEMA_OWNER', 'SCHEMA_OWNER_NAME', 'SCHEMA_OWNER_USERNAME', 'SCHEMA_OWNER_ASSIGNMENT_STATUS',
+  'RECORD_OWNER', 'TECHNICAL_STEWARD', 'BUSINESS_STEWARD',
   'BDS_TEAM', 'DPM_TEAM', 'EMP_L5', 'EMP_L6', 'LIFECYCLE_STATE',
   'STALE_DESIGNATION_DATE', 'CONTEST_DEADLINE', 'QUARANTINE_START_DATE',
   'QUARANTINE_EXPIRY_DATE', 'PURGE_ELIGIBLE_DATE', 'EXCEPTION_ID',
   'EXCEPTION_STATUS', 'SOURCE_ROW', 'SNAPSHOT_AT',
   'SNOWFLAKE_TABLE_OWNER', 'OWNERSHIP_SOURCE', 'DOMAIN', 'SUB_DOMAIN',
-  'ROW_COUNT', 'BYTES', 'LAST_READ', 'LAST_WRITE', 'LAST_LOAD', 'LAST_ALTERED',
-  'LAST_ACTIVITY_TS', 'IS_STALE_90', 'IS_STALE_180', 'IS_STALE_365',
+  'ROW_COUNT', 'BYTES', 'OBJECT_CREATED_DATE', 'LAST_READ', 'LAST_WRITE', 'LAST_LOAD', 'LAST_ALTERED',
+  'LAST_ACTIVITY_TS', 'IS_STALE_180',
   'SOURCE_SNAPSHOT_AT', 'CONTACT_COVERAGE_STATUS', 'SNOWFLAKE_DATA_STATUS',
   'ASSET_STATUS', 'CONTEST_REFERENCE'
 ]);
 
 const CASE_HEADERS = Object.freeze([
-  'CASE_ID', 'ASSET_ID', 'PLATFORM', 'STATE', 'T0', 'NOTIFIED_AT',
+  'CASE_ID', 'ASSET_ID', 'PLATFORM', 'STATE', 'T0', 'NOTICE_DUE_AT', 'NOTIFIED_AT',
   'CONTEST_DEADLINE', 'RESTRICT_AT', 'QUARANTINE_START_DATE',
   'PURGE_NOTICE_AT', 'PURGE_ELIGIBLE_DATE', 'EXCEPTION_ID',
   'EXCEPTION_STATUS', 'OWNER_STATUS', 'LAST_TRANSITION_AT',
@@ -123,7 +131,11 @@ function normalizeEnvironment_(environment) {
 function getActiveEnvironment_() {
   if (ACTIVE_ENVIRONMENT_) return ACTIVE_ENVIRONMENT_;
   const stored = PropertiesService.getUserProperties().getProperty(APP.activeEnvironmentProperty);
-  ACTIVE_ENVIRONMENT_ = normalizeEnvironment_(stored || APP.defaultEnvironment);
+  const selected = normalizeEnvironment_(stored || APP.defaultEnvironment);
+  ACTIVE_ENVIRONMENT_ = selected === 'DEV' && !isAdminEmail_() ? 'PRD' : selected;
+  if (ACTIVE_ENVIRONMENT_ !== selected) {
+    PropertiesService.getUserProperties().setProperty(APP.activeEnvironmentProperty, ACTIVE_ENVIRONMENT_);
+  }
   return ACTIVE_ENVIRONMENT_;
 }
 
@@ -135,14 +147,19 @@ function setExecutionEnvironment_(environment, persistForUser) {
 }
 
 function setActiveEnvironment(environment) {
-  setExecutionEnvironment_(environment, true);
+  const selected = normalizeEnvironment_(environment);
+  setExecutionEnvironment_(selected === 'DEV' && !isAdminEmail_() ? 'PRD' : selected, true);
   return getClientConfig();
 }
 
 function getRawConfig_() {
+  if (RAW_CONFIG_RUNTIME_CACHE_) return RAW_CONFIG_RUNTIME_CACHE_;
   const cache = CacheService.getScriptCache();
   const cached = cache.get('APP_CONFIG');
-  if (cached) return JSON.parse(cached);
+  if (cached) {
+    RAW_CONFIG_RUNTIME_CACHE_ = JSON.parse(cached);
+    return RAW_CONFIG_RUNTIME_CACHE_;
+  }
 
   const sheet = getSheet_(APP.sheets.config);
   const lastRow = sheet.getLastRow();
@@ -152,21 +169,26 @@ function getRawConfig_() {
     if (row[0]) config[row[0]] = row[1];
   });
   cache.put('APP_CONFIG', JSON.stringify(config), 300);
-  return config;
+  RAW_CONFIG_RUNTIME_CACHE_ = config;
+  return RAW_CONFIG_RUNTIME_CACHE_;
 }
 
 function getConfig_() {
-  const raw = getRawConfig_();
   const environment = getActiveEnvironment_();
+  if (MERGED_CONFIG_RUNTIME_CACHE_[environment]) return MERGED_CONFIG_RUNTIME_CACHE_[environment];
+  const raw = getRawConfig_();
   const prefix = environment + '_';
   const merged = Object.assign({}, raw);
   Object.keys(raw).forEach(function (key) {
     if (key.indexOf(prefix) === 0) merged[key.substring(prefix.length)] = raw[key];
   });
-  return merged;
+  MERGED_CONFIG_RUNTIME_CACHE_[environment] = merged;
+  return MERGED_CONFIG_RUNTIME_CACHE_[environment];
 }
 
 function invalidateConfigCache_() {
+  RAW_CONFIG_RUNTIME_CACHE_ = undefined;
+  MERGED_CONFIG_RUNTIME_CACHE_ = {};
   CacheService.getScriptCache().remove('APP_CONFIG');
 }
 
@@ -201,20 +223,30 @@ function getEnvironmentProfile_() {
     key: environment,
     label: APP.environments[environment].label,
     isProduction: isProduction,
-    readOnly: isProduction,
+    readOnly: configBoolean_('READ_ONLY', isProduction),
     importEnabled: configBoolean_('IMPORT_ENABLED', environment === 'DEV'),
     sourceSpreadsheetId: cleanText_(config.SOURCE_SPREADSHEET_ID || APP.sourceSpreadsheetId),
     sourceSheetName: cleanText_(config.SOURCE_SHEET_NAME || APP.sourceSheetName),
     recipientLock: recipientLock,
     recipientAllowlist: recipientAllowlist,
-    description: isProduction ? 'Full production dataset · view only' : 'Reviewed Snowflake intake · isolated lifecycle, data-driven Slack routing, and non-dispatching partner queues'
+    description: isProduction
+      ? (configBoolean_('READ_ONLY', true) ? 'Production dataset · view only' : 'Production dataset · controlled imports and lifecycle operations enabled')
+      : 'Reviewed Snowflake intake · isolated lifecycle, data-driven Slack routing, and non-dispatching partner queues'
   };
 }
 
 function assertEnvironmentWritable_() {
   const profile = getEnvironmentProfile_();
-  if (profile.readOnly) throw new Error('PRD is view-only. Switch to DEV to import data, change lifecycle state, create notifications, or queue actions.');
+  if (profile.readOnly) throw new Error(profile.label + ' is view-only. Enable writes for this environment before importing data, changing lifecycle state, creating notifications, or queueing actions.');
   return profile;
+}
+
+function environmentReadOnly_(environment) {
+  const selected = normalizeEnvironment_(environment);
+  const raw = getRawConfig_();
+  const scoped = raw[selected + '_READ_ONLY'];
+  if (scoped === undefined || scoped === '') return selected === 'PRD';
+  return String(scoped).toUpperCase() === 'TRUE';
 }
 
 function nowIso_() {
@@ -314,23 +346,28 @@ function assertAdmin_() {
 }
 
 function getClientConfig(environment) {
-  if (environment) setExecutionEnvironment_(environment, true);
-  const config = getConfig_();
   const email = getCurrentUserEmail_();
+  const isAdmin = isAdminEmail_(email);
+  if (environment) {
+    const selected = normalizeEnvironment_(environment);
+    setExecutionEnvironment_(selected === 'DEV' && !isAdmin ? 'PRD' : selected, true);
+  } else if (getActiveEnvironment_() === 'DEV' && !isAdmin) {
+    setExecutionEnvironment_('PRD', true);
+  }
+  const config = getConfig_();
   const environmentProfile = getEnvironmentProfile_();
   return {
     appName: config.APP_NAME || 'EDG Stale Data Monitoring',
-    appVersion: config.APP_VERSION || APP.version,
     user: {
       email: email,
       role: getUserRole_(email) || 'VIEWER',
-      isAdmin: isAdminEmail_(email),
+      isAdmin: isAdmin,
       userGuideDismissed: PropertiesService.getUserProperties().getProperty(APP.userGuideDismissedProperty) === 'TRUE'
     },
     environment: environmentProfile,
-    environments: ['DEV', 'PRD'].map(function (key) {
+    environments: (isAdmin ? ['DEV', 'PRD'] : ['PRD']).map(function (key) {
       const item = APP.environments[key];
-      return { key: key, label: item.label, readOnly: key === 'PRD' };
+      return { key: key, label: item.label, readOnly: environmentReadOnly_(key) };
     }),
     exceptionAppUrl: config.EXCEPTION_APP_URL || '',
     policyVersion: config.CURRENT_POLICY_VERSION || '',
@@ -339,6 +376,8 @@ function getClientConfig(environment) {
       sandboxThresholdDays: configNumber_('SANDBOX_THRESHOLD_DAYS', 30),
       includeViews: configBoolean_('INCLUDE_VIEWS', true),
       contestWindowDays: configNumber_('CONTEST_WINDOW_DAYS', 9),
+      initialNotificationDelayDays: 0,
+      contestReminderLeadDays: configNumber_('CONTEST_REMINDER_LEAD_DAYS', 2),
       quarantineDays: configNumber_('QUARANTINE_DAYS', 181),
       purgeNoticeDays: configNumber_('PURGE_NOTICE_DAYS', 30)
     },

@@ -352,13 +352,79 @@ function applyPlatformOutcome_(actionRecord) {
   }
 }
 
-function runLifecycleAutomation() {
+function runLifecycleAutomation(environment) {
+  // Time-based triggers have no browser-selected environment. Keep no-argument
+  // trigger executions in DEV; explicit/manual calls pass their environment.
+  if (environment) setExecutionEnvironment_(environment, false);
+  else setExecutionEnvironment_('DEV', false);
   const profile = assertEnvironmentWritable_();
   const cases = readObjects_(APP.sheets.cases);
+  const sentNotifications = {};
+  readObjects_(APP.sheets.notifications).forEach(function (record) {
+    if (cleanText_(record.STATUS).toUpperCase() !== 'SENT') return;
+    sentNotifications[cleanText_(record.CASE_ID) + '|' + cleanText_(record.TYPE).toUpperCase()] = true;
+  });
   const now = new Date();
+  const reminderLeadDays = configNumber_('CONTEST_REMINDER_LEAD_DAYS', 2);
+  const initialNoticeAssetIds = [];
+  const reminderAssetIds = [];
+  const escalationAssetIds = [];
   const purgeNoticeAssetIds = [];
   let newlyPurgeEligible = 0;
   let autoAccepted = 0;
+
+  cases.forEach(function (caseRecord) {
+    const lifecycleState = canonicalLifecycleState_(caseRecord.STATE);
+    const notificationWasSent = function (messageType) {
+      return Boolean(sentNotifications[cleanText_(caseRecord.CASE_ID) + '|' + messageType]);
+    };
+    const noticeDueAt = caseRecord.T0 || caseRecord.NOTICE_DUE_AT;
+    if (lifecycleState === APP.lifecycle.detected && noticeDueAt &&
+        new Date(noticeDueAt) <= now && !notificationWasSent('STALE_ASSET_NOTICE')) {
+      initialNoticeAssetIds.push(caseRecord.ASSET_ID);
+      return;
+    }
+    if (lifecycleState === APP.lifecycle.notified && caseRecord.CONTEST_DEADLINE) {
+      const deadline = new Date(caseRecord.CONTEST_DEADLINE);
+      const reminderAt = new Date(deadline.getTime());
+      reminderAt.setUTCDate(reminderAt.getUTCDate() - reminderLeadDays);
+      if (deadline <= now && !notificationWasSent('OWNER_ESCALATION')) {
+        escalationAssetIds.push(caseRecord.ASSET_ID);
+      } else if (reminderAt <= now && deadline > now && !notificationWasSent('CONTESTATION_REMINDER')) {
+        reminderAssetIds.push(caseRecord.ASSET_ID);
+      }
+    }
+  });
+
+  let initialDelivery = { assetCount: 0, groupCount: 0 };
+  let reminderDelivery = { assetCount: 0, groupCount: 0 };
+  let escalationDelivery = { assetCount: 0, groupCount: 0 };
+  const deliveryErrors = [];
+  if (initialNoticeAssetIds.length) {
+    try {
+      initialDelivery = createAndSendNotificationGroups_(initialNoticeAssetIds, 'STALE_ASSET_NOTICE');
+      (initialDelivery.errors || []).forEach(function (error) { deliveryErrors.push(error); });
+    } catch (error) {
+      deliveryErrors.push({ messageType: 'STALE_ASSET_NOTICE', error: String(error.message || error).substring(0, 500) });
+    }
+  }
+  if (reminderAssetIds.length) {
+    try {
+      reminderDelivery = createAndSendNotificationGroups_(reminderAssetIds, 'CONTESTATION_REMINDER');
+      (reminderDelivery.errors || []).forEach(function (error) { deliveryErrors.push(error); });
+    } catch (error) {
+      deliveryErrors.push({ messageType: 'CONTESTATION_REMINDER', error: String(error.message || error).substring(0, 500) });
+    }
+  }
+  if (escalationAssetIds.length) {
+    try {
+      escalationDelivery = createAndSendNotificationGroups_(escalationAssetIds, 'OWNER_ESCALATION');
+      (escalationDelivery.errors || []).forEach(function (error) { deliveryErrors.push(error); });
+    } catch (error) {
+      deliveryErrors.push({ messageType: 'OWNER_ESCALATION', error: String(error.message || error).substring(0, 500) });
+    }
+  }
+
   cases.forEach(function (caseRecord) {
     const lifecycleState = canonicalLifecycleState_(caseRecord.STATE);
     if (lifecycleState === APP.lifecycle.notified && caseRecord.CONTEST_DEADLINE && new Date(caseRecord.CONTEST_DEADLINE) <= now) {
@@ -375,7 +441,8 @@ function runLifecycleAutomation() {
       return;
     }
     if (lifecycleState !== APP.lifecycle.quarantined) return;
-    if (caseRecord.PURGE_NOTICE_AT && new Date(caseRecord.PURGE_NOTICE_AT) <= now && !notificationExists_(caseRecord.CASE_ID, 'PURGE_NOTICE_30_DAY')) {
+    if (caseRecord.PURGE_NOTICE_AT && new Date(caseRecord.PURGE_NOTICE_AT) <= now &&
+        !sentNotifications[cleanText_(caseRecord.CASE_ID) + '|PURGE_NOTICE_30_DAY']) {
       purgeNoticeAssetIds.push(caseRecord.ASSET_ID);
     }
     if (caseRecord.PURGE_ELIGIBLE_DATE && new Date(caseRecord.PURGE_ELIGIBLE_DATE) <= now) {
@@ -393,21 +460,34 @@ function runLifecycleAutomation() {
   });
   let delivery = { assetCount: 0, groupCount: 0 };
   if (purgeNoticeAssetIds.length) {
-    try { delivery = createAndSendNotificationGroups_(purgeNoticeAssetIds, 'PURGE_NOTICE_30_DAY'); } catch (error) {}
+    try {
+      delivery = createAndSendNotificationGroups_(purgeNoticeAssetIds, 'PURGE_NOTICE_30_DAY');
+      (delivery.errors || []).forEach(function (error) { deliveryErrors.push(error); });
+    } catch (error) {
+      deliveryErrors.push({ messageType: 'PURGE_NOTICE_30_DAY', error: String(error.message || error).substring(0, 500) });
+    }
   }
   return {
     environment: profile.key,
+    initialNoticeAssets: initialDelivery.assetCount,
+    initialNoticeGroups: initialDelivery.groupCount,
+    reminderAssets: reminderDelivery.assetCount,
+    reminderGroups: reminderDelivery.groupCount,
+    escalationAssets: escalationDelivery.assetCount,
+    escalationGroups: escalationDelivery.groupCount,
     purgeNoticeAssets: delivery.assetCount,
     purgeNoticeGroups: delivery.groupCount,
     newlyPurgeEligible: newlyPurgeEligible,
     autoAccepted: autoAccepted,
-    purgeActionsQueued: 0
+    purgeActionsQueued: 0,
+    notificationFailureCount: deliveryErrors.length,
+    notificationErrors: deliveryErrors
   };
 }
 
 function runLifecycleAutomationNow() {
   assertAdmin_();
-  return runLifecycleAutomation();
+  return runLifecycleAutomation(getActiveEnvironment_());
 }
 
 function notificationExists_(caseId, messageType) {

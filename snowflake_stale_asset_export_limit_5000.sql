@@ -310,4 +310,5 @@ SELECT
 
     CURRENT_TIMESTAMP() AS source_snapshot_at
 FROM joined
-ORDER BY days_since_activity DESC NULLS FIRST;
+ORDER BY days_since_activity DESC NULLS FIRST
+LIMIT 5000;

@@ -1,13 +1,21 @@
 function getIntegrationStatus() {
   const properties = PropertiesService.getScriptProperties();
   const profile = getEnvironmentProfile_();
+  const config = getConfig_();
+  const slackWebhookConfigured = Boolean(properties.getProperty(APP.slackWorkflowProperty));
+  const slackChannelConfigured = isSlackChannelId_(config.EDG_CONTACT);
   const snowflakeEnabled = platformHandoffEnabled_('SNOWFLAKE');
   const data360Enabled = platformHandoffEnabled_('DATA360');
   return {
     slack: {
       enabled: configBoolean_('SLACK_NOTIFICATIONS_ENABLED', false),
-      configured: Boolean(properties.getProperty(APP.slackWorkflowProperty)),
-      blocked: profile.readOnly
+      configured: slackWebhookConfigured && slackChannelConfigured,
+      blocked: profile.readOnly,
+      reason: !slackWebhookConfigured
+        ? 'The Slack workflow webhook is not configured.'
+        : !slackChannelConfigured
+          ? 'Add an environment-specific EDG Slack channel ID before enabling delivery.'
+          : 'The workflow webhook and EDG Slack channel are configured.'
     },
     snowflakeActions: {
       enabled: snowflakeEnabled,
@@ -94,6 +102,7 @@ function getAdminConfiguration_() {
     purgeActionsEnabled: configBoolean_('PURGE_ACTIONS_ENABLED', false),
     recipientLock: profile.recipientLock,
     allowedRecipients: profile.recipientAllowlist.join(', '),
+    edgContact: cleanText_(config.EDG_CONTACT),
     exceptionAppUrl: cleanText_(config.EXCEPTION_APP_URL),
     exceptionDatabaseSpreadsheetId: cleanText_(config.EXCEPTION_DATABASE_SPREADSHEET_ID),
     exceptionDatabaseSheetName: cleanText_(config.EXCEPTION_DATABASE_SHEET_NAME) || 'Exception Log'
@@ -123,6 +132,16 @@ function saveAdminConfiguration(settings) {
   allowedRecipients.forEach(assertEmailAddress_);
   const exceptionAppUrl = cleanText_(input.exceptionAppUrl);
   if (exceptionAppUrl) assertHttpsUrl_(exceptionAppUrl, 'Exception application URL');
+  const edgContact = cleanText_(input.edgContact).toUpperCase();
+  if (edgContact && !isSlackChannelId_(edgContact)) {
+    throw new Error('EDG Slack channel ID must begin with C or G and contain only letters and numbers.');
+  }
+  if (Boolean(input.slackEnabled)) {
+    if (!edgContact) throw new Error('Add the EDG Slack channel ID before enabling Slack delivery.');
+    if (!PropertiesService.getScriptProperties().getProperty(APP.slackWorkflowProperty)) {
+      throw new Error('Configure the Slack workflow webhook before enabling Slack delivery.');
+    }
+  }
   const exceptionDatabaseSpreadsheetId = normalizeSpreadsheetId_(input.exceptionDatabaseSpreadsheetId);
   const exceptionDatabaseSheetName = cleanText_(input.exceptionDatabaseSheetName) || 'Exception Log';
   if (exceptionDatabaseSpreadsheetId) {
@@ -134,6 +153,7 @@ function saveAdminConfiguration(settings) {
   updateEnvironmentConfigValue_('PURGE_ACTIONS_ENABLED', Boolean(input.purgeActionsEnabled), profile.key);
   updateEnvironmentConfigValue_('PRIMARY_RECIPIENT_LOCK', recipientLock, profile.key);
   updateEnvironmentConfigValue_('ALLOWED_RECIPIENTS', allowedRecipients.join(','), profile.key);
+  updateEnvironmentConfigValue_('EDG_CONTACT', edgContact, profile.key);
   updateEnvironmentConfigValue_('EXCEPTION_APP_URL', exceptionAppUrl, profile.key);
   updateEnvironmentConfigValue_('EXCEPTION_DATABASE_SPREADSHEET_ID', exceptionDatabaseSpreadsheetId, profile.key);
   updateEnvironmentConfigValue_('EXCEPTION_DATABASE_SHEET_NAME', exceptionDatabaseSheetName, profile.key);
@@ -247,6 +267,8 @@ function resetDevUatData() {
       return { sheet: resolvedName, clearedRows: rows };
     });
     clearImportState_('DEV');
+    deleteIntakeReviewPreparationTriggers_();
+    clearIntakeReviewCache_('DEV');
     clearPendingIntakeReview_('DEV');
     const result = {
       environment: environment,
@@ -270,6 +292,81 @@ function verifyDevUatDataReset() {
   const result = { environment: 'DEV', blank: nonEmpty.length === 0, sheets: remainingRows };
   console.log(JSON.stringify(result));
   return result;
+}
+
+/**
+ * Clears PRD operational and staged records while preserving headers,
+ * configuration, administrators, user roles, and integration secrets.
+ * This maintenance function is intentionally not exposed in the application UI.
+ */
+function resetProductionOperationalData() {
+  const actor = assertAdmin_();
+  const environment = setExecutionEnvironment_('PRD', false);
+  if (environment !== 'PRD') throw new Error('Production reset refused outside PRD.');
+  const profile = getEnvironmentProfile_();
+  if (profile.readOnly) throw new Error('Production reset requires PRD writes to be enabled.');
+  const operationalSheets = productionOperationalSheetNames_();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000);
+  try {
+    deleteImportContinuationTriggers_();
+    deleteIntakeReviewPreparationTriggers_();
+    deleteImportNotificationCampaignTriggers_();
+    const cleared = operationalSheets.map(function (sheetName) {
+      const rows = readObjects_(sheetName).length;
+      clearDataRows_(sheetName);
+      return { sheet: resolveSheetName_(sheetName, 'PRD'), clearedRows: rows };
+    });
+    clearImportState_('PRD');
+    clearPendingIntakeReview_('PRD');
+    clearIntakeReviewCache_('PRD');
+    PropertiesService.getScriptProperties().deleteProperty(importNotificationCampaignProperty_('PRD'));
+    const result = {
+      environment: environment,
+      resetAt: nowIso_(),
+      resetBy: actor.email,
+      cleared: cleared,
+      remainingRows: inspectProductionOperationalData_()
+    };
+    console.log(JSON.stringify(result));
+    return result;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function verifyProductionOperationalDataReset() {
+  assertAdmin_();
+  setExecutionEnvironment_('PRD', false);
+  const remainingRows = inspectProductionOperationalData_();
+  return {
+    environment: 'PRD',
+    blank: remainingRows.every(function (item) { return item.rows === 0; }),
+    sheets: remainingRows
+  };
+}
+
+function productionOperationalSheetNames_() {
+  return [
+    APP.sheets.assetsCurrent,
+    APP.sheets.assetsStaging,
+    APP.sheets.assetsIndex,
+    APP.sheets.intakeUpload,
+    APP.sheets.snapshots,
+    APP.sheets.cases,
+    APP.sheets.events,
+    APP.sheets.notifications,
+    APP.sheets.exceptions,
+    APP.sheets.platformActions,
+    APP.sheets.jobs,
+    APP.sheets.dashboardSummary
+  ];
+}
+
+function inspectProductionOperationalData_() {
+  return productionOperationalSheetNames_().map(function (sheetName) {
+    return { sheet: resolveSheetName_(sheetName, 'PRD'), rows: readObjects_(sheetName).length };
+  });
 }
 
 function inspectDevUatData_() {

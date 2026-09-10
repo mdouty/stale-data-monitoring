@@ -22,7 +22,7 @@
 
     <nav class="environment-nav" aria-label="Application environment">
       <div class="environment-tabs" role="tablist">
-        <button id="environmentTabDEV" class="environment-tab" role="tab" onclick="switchEnvironment('DEV')">DEV <span>Test dataset</span></button>
+        <button id="environmentTabDEV" class="environment-tab hidden" role="tab" onclick="switchEnvironment('DEV')">DEV <span>Test dataset</span></button>
         <button id="environmentTabPRD" class="environment-tab" role="tab" onclick="switchEnvironment('PRD')">PRD <span>Full dataset</span></button>
       </div>
       <div id="environmentDescription" class="environment-description">Loading environment…</div>
@@ -61,6 +61,7 @@
           <div class="filters">
             <input id="search" type="search" placeholder="Search any asset data" oninput="debouncedLoad()">
             <div id="assetStatusFilter" class="multi-select asset-status-filter"></div>
+            <div id="assetTypeFilter" class="multi-select"></div>
             <div id="environmentFilter" class="multi-select"></div>
             <div id="stewardshipFilter" class="multi-select"></div>
             <div id="domainFilter" class="multi-select"></div>
@@ -79,8 +80,9 @@
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th class="select-column"><input id="selectAllAssets" type="checkbox" aria-label="Select all visible assets" onchange="toggleSelectAll(this.checked)"></th><th class="object-column">Object</th><th>Domain / subject</th><th>Activity</th><th>Stewardship</th><th>Asset status</th><th>Lifecycle</th></tr></thead>
-            <tbody id="assetRows"><tr><td colspan="7" class="empty">Loading assets…</td></tr></tbody>
+            <colgroup><col class="asset-col-select"><col class="asset-col-object"><col class="asset-col-type"><col class="asset-col-domain"><col class="asset-col-rows"><col class="asset-col-last-read"><col class="asset-col-inactivity"><col class="asset-col-notification"><col class="asset-col-stewardship"><col class="asset-col-status"><col class="asset-col-lifecycle"></colgroup>
+            <thead><tr><th class="select-column"><input id="selectAllAssets" type="checkbox" aria-label="Select all visible assets" onchange="toggleSelectAll(this.checked)"></th><th class="object-column">Object</th><th>Asset type</th><th>Domain / subject</th><th class="numeric-column">Rows</th><th>Last read</th><th>Read inactivity</th><th>Notification date</th><th>Stewardship</th><th>Asset status</th><th>Lifecycle</th></tr></thead>
+            <tbody id="assetRows"><tr><td colspan="11" class="empty">Loading assets…</td></tr></tbody>
           </table>
         </div>
         <div class="pagination"><button class="button subtle" onclick="changePage(-1)">Previous</button><span id="pageLabel">Page 1</span><button class="button subtle" onclick="changePage(1)">Next</button></div>
@@ -146,6 +148,7 @@
               <label>Purge notice (days)<input id="purgeNoticeDays" type="number" min="0" max="365"></label>
               <label>Locked Slack recipient<input id="recipientLock" type="email" placeholder="name@company.com"></label>
               <label>Allowed Slack recipients<input id="allowedRecipients" type="text" placeholder="email1@company.com, email2@company.com"></label>
+              <label>EDG Slack channel ID<input id="edgContact" type="text" pattern="[CGcg][A-Za-z0-9]+" placeholder="C065MLQ2HLL"></label>
               <label>Exception application URL<input id="exceptionAppUrl" type="url" placeholder="https://…"></label>
               <label>Exception database spreadsheet ID or URL<input id="exceptionDatabaseSpreadsheetId" type="text" placeholder="Google Sheet ID or URL"></label>
               <label>Exception database sheet name<input id="exceptionDatabaseSheetName" type="text" placeholder="Exception Log"></label>
@@ -219,7 +222,7 @@
             <span id="intakeReviewVisibleCount" class="badge gray">0 records</span>
           </div>
           <div id="intakeReviewFilters" class="review-filters">
-            <input id="intakeReviewSearch" type="search" placeholder="Search object, change, or recipient" oninput="filterIntakeReview()">
+            <input id="intakeReviewSearch" type="search" placeholder="Search object, staleness source, or recipient" oninput="filterIntakeReview()">
             <select id="intakeReviewCategoryFilter" onchange="filterIntakeReview()"><option value="">All review types</option></select>
             <select id="intakeReviewDomainFilter" onchange="filterIntakeReview()"><option value="">All domains</option></select>
             <select id="intakeReviewTypeFilter" onchange="filterIntakeReview()"><option value="">All asset types</option></select>
@@ -234,15 +237,19 @@
           </div>
           <div id="intakeReviewTableWrap" class="review-table-wrap">
             <table>
-              <thead><tr><th class="select-column"><input id="selectAllIntakeRecords" type="checkbox" aria-label="Select all visible review records" onchange="toggleAllIntakeReviewRecords(this.checked)"></th><th>Object</th><th>Review type</th><th>Change</th><th>Message / recipient</th><th>Domain</th><th></th></tr></thead>
+              <thead><tr><th class="select-column"><input id="selectAllIntakeRecords" type="checkbox" aria-label="Select all visible review records" onchange="toggleAllIntakeReviewRecords(this.checked)"></th><th>Object</th><th>Review type</th><th>Staleness source</th><th>Message / recipient</th><th>Domain</th><th></th></tr></thead>
               <tbody id="intakeReviewRows"></tbody>
             </table>
           </div>
           <div id="intakeReviewSampleNote" class="review-more hidden"></div>
         </section>
         <section id="intakeReviewPublish" class="review-impact panel hidden">
-          <div class="panel-heading"><div><h3>Ready to publish</h3><span>Confirm the resulting lifecycle changes</span></div></div>
+          <div class="panel-heading">
+            <div><h3>Ready to publish</h3><span>Confirm the resulting lifecycle changes</span></div>
+            <button id="exportIntakeReviewButton" class="button subtle" onclick="exportIntakeReviewDetails()">Export review CSV</button>
+          </div>
           <div id="intakeReviewImpact" class="review-impact-copy"></div>
+          <div id="intakeNotificationPayloads" class="review-payloads"></div>
         </section>
       </div>
       <footer class="intake-review-footer">
@@ -286,7 +293,7 @@
           </article>
           <article class="user-guide-section user-guide-actions">
             <span class="user-guide-number">3</span>
-            <div><h3>Choose the appropriate action</h3><dl><dt>Confirm Deprecation</dt><dd>Confirm the asset is no longer required. It enters the platform quarantine-handoff process.</dd><dt>Contest</dt><dd>Keep the asset for a valid business need. Complete the exception application first, then submit an approved, <strong>ACTIVE</strong> exception ID here.</dd><dt>Self Purge</dt><dd>Commit to deleting the asset yourself in Snowflake. Notifications, reminders, and partner handoffs stop while a later complete import verifies its absence.</dd><dt>Restore</dt><dd>Request access restoration while an asset is quarantined and still recoverable.</dd><dt>Export CSV</dt><dd>Download all available details for the selected records.</dd><dt>Dismiss</dt><dd>Administrator only. Remove an asset from the workflow with an audited decision.</dd></dl><p class="user-guide-done">Once you complete the appropriate action, your owner response is complete unless a later notification requires attention.</p></div>
+            <div><h3>Choose the appropriate action</h3><dl><dt>Self Purge</dt><dd>Commit to deleting the asset yourself in Snowflake. Notifications, reminders, and partner handoffs stop while a later complete import verifies its absence.</dd><dt>Confirm</dt><dd>Confirm the asset is no longer required. It enters the platform quarantine-handoff process.</dd><dt>Export</dt><dd>Download all available details for the selected records.</dd><dt>Contest</dt><dd>Keep the asset for a valid business need. Complete the exception application first, then submit an approved, <strong>ACTIVE</strong> exception ID here.</dd><dt>Restore</dt><dd>Request access restoration while an asset is quarantined and still recoverable.</dd></dl><p class="user-guide-done">Once you complete the appropriate action, your owner response is complete unless a later notification requires attention.</p></div>
           </article>
           <article class="user-guide-section">
             <span class="user-guide-number">4</span>
@@ -377,6 +384,7 @@
     </div>
     <div id="workflowLoadingOverlay" class="workflow-loading-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="workflowLoadingTitle" aria-describedby="workflowLoadingMessage">
       <div class="workflow-loading-card" role="status" aria-live="polite">
+        <button id="workflowLoadingDismiss" class="workflow-loading-dismiss hidden" type="button" aria-label="Continue using the application while background work runs" onclick="dismissPublishingLoading_()">×</button>
         <div class="loading-spinner" aria-hidden="true"></div>
         <h2 id="workflowLoadingTitle">Processing request</h2>
         <p id="workflowLoadingMessage">Updating the lifecycle record and sending the Slack notification…</p>
@@ -388,7 +396,7 @@
           <span id="workflowLoadingStage"></span>
         </div>
         <div id="workflowLoadingDetails" class="workflow-loading-details hidden"></div>
-        <small>Please keep this window open.</small>
+        <small id="workflowLoadingHint">Please keep this window open.</small>
       </div>
     </div>
     <div id="toast" class="toast hidden"></div>

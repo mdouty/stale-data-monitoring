@@ -75,11 +75,29 @@ function getUserAccessEmails_(email, role) {
 }
 
 function getAssetRoleEmails_(asset) {
-  return extractEmails_([
+  return extractAssetAccessIdentities_([
     asset.RECORD_OWNER, asset.BUSINESS_STEWARD, asset.TECHNICAL_STEWARD,
     asset.DPM_TEAM, asset.BDS_TEAM, asset.DATABASE_OWNER, asset.SCHEMA_OWNER,
     asset.SNOWFLAKE_TABLE_OWNER, asset.EMP_L5, asset.EMP_L6
   ]);
+}
+
+function extractAssetAccessIdentities_(values) {
+  const seen = {};
+  (values || []).forEach(function (value) {
+    cleanText_(value).split(/[;,\s]+/).forEach(function (part) {
+      const identity = normalizeAssetAccessIdentity_(part);
+      if (identity) seen[identity] = true;
+    });
+  });
+  return Object.keys(seen);
+}
+
+function normalizeAssetAccessIdentity_(value) {
+  const identity = cleanText_(value).toLowerCase();
+  const salesforceEmail = identity.match(/^([^@\s]+)@salesforce\.com$/);
+  if (salesforceEmail) return salesforceEmail[1];
+  return /^[a-z0-9][a-z0-9._-]*$/.test(identity) ? identity : '';
 }
 
 function canUserViewAsset_(asset, email, role) {
@@ -89,8 +107,10 @@ function canUserViewAsset_(asset, email, role) {
 
 function canAccessAssetWithEmails_(asset, accessEmails) {
   if (accessEmails === null) return true;
-  const recordEmails = getAssetRoleEmails_(asset);
-  return accessEmails.some(function (allowedEmail) { return recordEmails.indexOf(allowedEmail) !== -1; });
+  const recordIdentities = getAssetRoleEmails_(asset);
+  return accessEmails.some(function (allowedEmail) {
+    return recordIdentities.indexOf(normalizeAssetAccessIdentity_(allowedEmail)) !== -1;
+  });
 }
 
 function assertAssetViewAuthorization_(asset, email, role) {

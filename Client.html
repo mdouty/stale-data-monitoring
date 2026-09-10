@@ -1,5 +1,5 @@
 <script>
-  const state = { config: null, page: 1, pages: 1, timer: null, poller: null, uploadProgressTimer: null, detailRequestId: 0, dashboardRequestId: 0, loadingRequestId: 0, loadingRequests: {}, manualLoading: false, currentAssets: [], selectedAssets: {}, pendingAssetId: '', confirmationAction: null, adminStatusFlow: null, intakeReview: null, intakeReviewStep: 0, intakeReviewCompletedStep: 0, intakeReviewRecords: [], intakeReviewVisibleRecords: [], intakeReviewSelection: {}, intakeReviewDismissed: {}, purgeReview: null, purgeReviewTimer: null, exceptionFlow: null, myTeam: null, adminTeams: [], userGuideInitialized: false, userGuideDismissed: false, currentPage: 'LANDSCAPE', currentAdminSection: 'OPERATIONS', openDashboardFilter: '', dashboardFilters: { assetStatus: ['STALE'], lifecycle: [], environment: [], stewardship: [], domain: [] }, dashboardFilterOptions: {} };
+  const state = { config: null, page: 1, pages: 1, timer: null, poller: null, intakeReviewPoller: null, intakePreparation: null, intakeReviewOverlayDismissed: false, uploadProgressTimer: null, detailRequestId: 0, dashboardRequestId: 0, loadingRequestId: 0, loadingRequests: {}, manualLoading: false, publicationOverlayDismissed: false, currentAssets: [], selectedAssets: {}, pendingAssetId: '', confirmationAction: null, adminStatusFlow: null, intakeReview: null, intakeReviewStep: 0, intakeReviewCompletedStep: 0, intakeReviewRecords: [], intakeReviewVisibleRecords: [], intakeReviewSelection: {}, intakeReviewDismissed: {}, purgeReview: null, purgeReviewTimer: null, exceptionFlow: null, myTeam: null, adminTeams: [], userGuideInitialized: false, userGuideDismissed: false, currentPage: 'LANDSCAPE', currentAdminSection: 'OPERATIONS', openDashboardFilter: '', dashboardFilters: { assetStatus: ['STALE'], lifecycle: [], assetType: [], environment: [], stewardship: [], domain: [] }, pendingDashboardFilters: null, dashboardFilterOptions: {} };
 
   const INTAKE_REVIEW_STEPS = [
     { key: 'NEW_STALE', title: 'Newly stale', description: 'Review records entering or re-entering the stale lifecycle. Dismissals are recorded when the refresh is published.' },
@@ -20,6 +20,7 @@
   document.addEventListener('click', function () {
     if (!state.openDashboardFilter) return;
     state.openDashboardFilter = '';
+    state.pendingDashboardFilters = null;
     renderDashboardFilters_(state.dashboardFilterOptions);
   });
 
@@ -29,6 +30,7 @@
     renderDashboardFilters_({
       assetStatuses: ['STALE', 'ACTIVE', 'QUARANTINED', 'PURGED'],
       lifecycleStatuses: dashboardLifecycleStatuses_(),
+      assetTypes: [],
       environments: ['PRODUCTION', 'SANDBOX', 'DEVELOPMENT', 'NON_PRODUCTION'],
       stewards: [],
       domains: []
@@ -50,10 +52,11 @@
     state.page = 1;
     document.getElementById('appName').textContent = config.appName;
     document.getElementById('userBadge').textContent = (config.user.email || 'User') + ' · ' + config.user.role + ' · ' + config.environment.key;
-    renderEnvironment(config.environment);
+    renderEnvironment(config.environment, config.environments);
     const canImport = !config.environment.readOnly && config.environment.importEnabled && config.user.isAdmin;
+    const canRunManualAutomation = canImport && config.environment.key !== 'PRD';
     document.getElementById('importButton').classList.toggle('hidden', !canImport);
-    document.getElementById('runAutomationButton').classList.toggle('hidden', !canImport);
+    document.getElementById('runAutomationButton').classList.toggle('hidden', !canRunManualAutomation);
     document.getElementById('importButton').textContent = 'Import & Refresh Data';
     document.getElementById('adminTab').classList.toggle('hidden', !config.user.isAdmin);
     document.getElementById('adminPanel').classList.toggle('hidden', !config.user.isAdmin);
@@ -67,6 +70,10 @@
     if (config.importStatus.running) {
       showPublishingLoading_(config.importStatus);
       startPolling(true);
+    } else if (config.importStatus.notificationCampaign && config.importStatus.notificationCampaign.running) {
+      startPolling(false);
+    } else {
+      state.publicationOverlayDismissed = false;
     }
   }
 
@@ -93,9 +100,12 @@
     }).setUserGuidePreference({ dontShowAgain: dontShowAgain });
   }
 
-  function renderEnvironment(environment) {
+  function renderEnvironment(environment, environments) {
+    const available = {};
+    (environments || []).forEach(function (item) { available[item.key] = true; });
     ['DEV', 'PRD'].forEach(function (key) {
       const tab = document.getElementById('environmentTab' + key);
+      tab.classList.toggle('hidden', !available[key]);
       tab.classList.toggle('active', key === environment.key);
       tab.classList.toggle('production', key === 'PRD');
       tab.setAttribute('aria-selected', key === environment.key ? 'true' : 'false');
@@ -145,7 +155,7 @@
 
   function switchEnvironment(environment) {
     if (state.config && state.config.environment.key === environment) return;
-    clearInterval(state.poller);
+    clearTimeout(state.poller);
     state.poller = null;
     state.dashboardRequestId += 1;
     closeDrawer();
@@ -153,7 +163,7 @@
     clearAppErrorBanner_();
     banner.classList.remove('hidden');
     banner.textContent = 'Switching to ' + environment + '…';
-    document.getElementById('assetRows').innerHTML = '<tr><td colspan="7" class="empty">Loading ' + escapeHtml(environment) + ' assets…</td></tr>';
+    document.getElementById('assetRows').innerHTML = '<tr><td colspan="11" class="empty">Loading ' + escapeHtml(environment) + ' assets…</td></tr>';
     runServer('setActiveEnvironment', environment, function (config) {
       applyClientConfig(config);
       showToast('Viewing ' + environment + '.');
@@ -185,6 +195,7 @@
       search: document.getElementById('search').value,
       assetStatuses: state.dashboardFilters.assetStatus.slice(),
       lifecycleStatuses: state.dashboardFilters.lifecycle.slice(),
+      assetTypes: state.dashboardFilters.assetType.slice(),
       environments: state.dashboardFilters.environment.slice(),
       stewards: state.dashboardFilters.stewardship.slice(),
       domains: state.dashboardFilters.domain.slice()
@@ -200,7 +211,7 @@
       const body = document.getElementById('assetRows');
       const info = showAppError_(error, 'Unable to load the dashboard table.');
       body.setAttribute('aria-busy', 'false');
-      body.innerHTML = '<tr><td colspan="7"><div class="section-load-error"><strong>' + escapeHtml(info.title) + '</strong><span>' + escapeHtml(info.message) + '</span><button class="button subtle" type="button" onclick="' + (info.isAuth ? 'refreshApplication_()' : 'loadDashboard(state.page)') + '">' + (info.isAuth ? 'Refresh & sign in' : 'Try again') + '</button></div></td></tr>';
+      body.innerHTML = '<tr><td colspan="11"><div class="section-load-error"><strong>' + escapeHtml(info.title) + '</strong><span>' + escapeHtml(info.message) + '</span><button class="button subtle" type="button" onclick="' + (info.isAuth ? 'refreshApplication_()' : 'loadDashboard(state.page)') + '">' + (info.isAuth ? 'Refresh & sign in' : 'Try again') + '</button></div></td></tr>';
     });
     runner.getDashboard(request);
   }
@@ -208,7 +219,7 @@
   function showAssetTableLoading_(message) {
     const body = document.getElementById('assetRows');
     body.setAttribute('aria-busy', 'true');
-    body.innerHTML = '<tr><td colspan="7"><div class="section-loading compact"><div class="loading-spinner" aria-hidden="true"></div><span>' + escapeHtml(message || 'Loading assets…') + '</span></div></td></tr>';
+    body.innerHTML = '<tr><td colspan="11"><div class="section-loading compact"><div class="loading-spinner" aria-hidden="true"></div><span>' + escapeHtml(message || 'Loading assets…') + '</span></div></td></tr>';
     document.getElementById('selectAllAssets').disabled = true;
   }
 
@@ -244,6 +255,7 @@
     state.dashboardFilterOptions = {
       assetStatuses: supplied.assetStatuses || state.dashboardFilterOptions.assetStatuses || ['STALE', 'ACTIVE', 'QUARANTINED', 'PURGED'],
       lifecycleStatuses: supplied.lifecycleStatuses || state.dashboardFilterOptions.lifecycleStatuses || dashboardLifecycleStatuses_(),
+      assetTypes: supplied.assetTypes || state.dashboardFilterOptions.assetTypes || [],
       environments: supplied.environments || state.dashboardFilterOptions.environments || [],
       stewards: supplied.stewards || state.dashboardFilterOptions.stewards || [],
       domains: supplied.domains || state.dashboardFilterOptions.domains || []
@@ -258,6 +270,7 @@
       return option;
     }));
     renderDashboardMultiSelect_('assetStatusFilter', 'assetStatus', 'All statuses', statusOptions, ['assetStatus', 'lifecycle']);
+    renderDashboardMultiSelect_('assetTypeFilter', 'assetType', 'All asset types', valueOptions_(state.dashboardFilterOptions.assetTypes));
     renderDashboardMultiSelect_('environmentFilter', 'environment', 'All environments', valueOptions_(state.dashboardFilterOptions.environments));
     renderDashboardMultiSelect_('stewardshipFilter', 'stewardship', 'All stewards', valueOptions_(state.dashboardFilterOptions.stewards));
     renderDashboardMultiSelect_('domainFilter', 'domain', 'All domains', valueOptions_(state.dashboardFilterOptions.domains));
@@ -279,8 +292,10 @@
   function renderDashboardMultiSelect_(containerId, key, allLabel, options, clearKeys) {
     const container = document.getElementById(containerId);
     if (!container) return;
+    const isOpen = state.openDashboardFilter === containerId;
+    const displayedFilters = isOpen && state.pendingDashboardFilters ? state.pendingDashboardFilters : state.dashboardFilters;
     const selectedOptions = options.filter(function (option) {
-      return (state.dashboardFilters[option.filterKey || key] || []).indexOf(option.value) !== -1;
+      return (displayedFilters[option.filterKey || key] || []).indexOf(option.value) !== -1;
     });
     const selectedLookup = {};
     selectedOptions.forEach(function (option) { selectedLookup[(option.filterKey || key) + ':' + option.value] = true; });
@@ -295,7 +310,6 @@
       if (!groups.length || groups[groups.length - 1].name !== group) groups.push({ name: group, options: [] });
       groups[groups.length - 1].options.push(option);
     });
-    const isOpen = state.openDashboardFilter === containerId;
     const menu = options.length ? groups.map(function (group) {
       const heading = group.name ? '<div class="multi-select-group-label">' + escapeHtml(group.name) + '</div>' : '';
       return '<div class="multi-select-group">' + heading + group.options.map(function (option) {
@@ -304,39 +318,82 @@
       }).join('') + '</div>';
     }).join('') : '<div class="multi-select-empty">No options in the current data.</div>';
     const keysToClear = (clearKeys && clearKeys.length ? clearKeys : [key]).join(',');
+    const hasPendingChanges = isOpen && !dashboardFiltersEqual_(state.dashboardFilters, state.pendingDashboardFilters);
     container.innerHTML = '<button type="button" class="multi-select-trigger" aria-haspopup="true" aria-expanded="' + (isOpen ? 'true' : 'false') + '" onclick="toggleDashboardMultiSelect_(event, \'' + containerId + '\')"><span>' + escapeHtml(triggerLabel) + '</span><span class="multi-select-chevron" aria-hidden="true">⌄</span></button>' +
-      '<div class="multi-select-menu ' + (isOpen ? '' : 'hidden') + '" onclick="event.stopPropagation()">' + menu + '<div class="multi-select-footer"><button type="button" onclick="clearDashboardMultiSelect_(event, \'' + keysToClear + '\')" ' + (selectedOptions.length ? '' : 'disabled') + '>Clear selections</button></div></div>';
+      '<div class="multi-select-menu ' + (isOpen ? '' : 'hidden') + '" onclick="event.stopPropagation()">' + menu + '<div class="multi-select-footer"><button type="button" class="multi-select-clear" data-filter-keys="' + escapeHtml(keysToClear) + '" onclick="clearDashboardMultiSelect_(event, \'' + keysToClear + '\')" ' + (selectedOptions.length ? '' : 'disabled') + '>Clear</button><button type="button" class="button primary multi-select-apply" onclick="applyDashboardMultiSelect_(event)" ' + (hasPendingChanges ? '' : 'disabled') + '>Apply</button></div></div>';
   }
 
   function toggleDashboardMultiSelect_(event, containerId) {
     event.stopPropagation();
-    state.openDashboardFilter = state.openDashboardFilter === containerId ? '' : containerId;
+    const isClosing = state.openDashboardFilter === containerId;
+    state.openDashboardFilter = isClosing ? '' : containerId;
+    state.pendingDashboardFilters = isClosing ? null : cloneDashboardFilters_(state.dashboardFilters);
     renderDashboardFilters_(state.dashboardFilterOptions);
   }
 
   function dashboardMultiSelectChanged_(checkbox) {
     const key = checkbox.getAttribute('data-filter-key');
     const value = checkbox.getAttribute('data-filter-value');
-    const selected = state.dashboardFilters[key] || [];
+    if (!state.pendingDashboardFilters) state.pendingDashboardFilters = cloneDashboardFilters_(state.dashboardFilters);
+    const selected = (state.pendingDashboardFilters[key] || []).slice();
     const position = selected.indexOf(value);
     if (checkbox.checked && position === -1) selected.push(value);
     if (!checkbox.checked && position !== -1) selected.splice(position, 1);
-    state.dashboardFilters[key] = selected;
-    renderDashboardFilters_(state.dashboardFilterOptions);
-    debouncedDashboardFilterLoad_();
+    state.pendingDashboardFilters[key] = selected;
+    updateDashboardMultiSelectActions_(checkbox);
   }
 
   function clearDashboardMultiSelect_(event, key) {
     event.stopPropagation();
-    String(key || '').split(',').forEach(function (filterKey) { state.dashboardFilters[filterKey] = []; });
-    renderDashboardFilters_(state.dashboardFilterOptions);
-    debouncedDashboardFilterLoad_();
+    if (!state.pendingDashboardFilters) state.pendingDashboardFilters = cloneDashboardFilters_(state.dashboardFilters);
+    const filterKeys = String(key || '').split(',');
+    filterKeys.forEach(function (filterKey) { state.pendingDashboardFilters[filterKey] = []; });
+    const menu = event.currentTarget && event.currentTarget.closest('.multi-select-menu');
+    if (menu) {
+      menu.querySelectorAll('input[data-filter-key]').forEach(function (checkbox) {
+        if (filterKeys.indexOf(checkbox.getAttribute('data-filter-key')) !== -1) checkbox.checked = false;
+      });
+    }
+    updateDashboardMultiSelectActions_(event.currentTarget);
   }
 
-  function debouncedDashboardFilterLoad_() {
-    clearTimeout(state.timer);
-    showAssetTableLoading_('Applying filters…');
-    state.timer = setTimeout(function () { loadDashboard(1); }, 250);
+  function updateDashboardMultiSelectActions_(element) {
+    const menu = element && element.closest ? element.closest('.multi-select-menu') : null;
+    if (!menu) return;
+    const clearButton = menu.querySelector('.multi-select-clear');
+    const applyButton = menu.querySelector('.multi-select-apply');
+    const clearKeys = String(clearButton ? clearButton.getAttribute('data-filter-keys') : '').split(',').filter(Boolean);
+    if (clearButton) clearButton.disabled = !clearKeys.some(function (key) { return (state.pendingDashboardFilters[key] || []).length; });
+    if (applyButton) applyButton.disabled = dashboardFiltersEqual_(state.dashboardFilters, state.pendingDashboardFilters);
+  }
+
+  function applyDashboardMultiSelect_(event) {
+    event.stopPropagation();
+    if (!state.pendingDashboardFilters || dashboardFiltersEqual_(state.dashboardFilters, state.pendingDashboardFilters)) return;
+    state.dashboardFilters = cloneDashboardFilters_(state.pendingDashboardFilters);
+    state.pendingDashboardFilters = null;
+    state.openDashboardFilter = '';
+    renderDashboardFilters_(state.dashboardFilterOptions);
+    loadDashboard(1, { tableOnlyLoading: true });
+  }
+
+  function cloneDashboardFilters_(filters) {
+    const source = filters || {};
+    return {
+      assetStatus: (source.assetStatus || []).slice(),
+      lifecycle: (source.lifecycle || []).slice(),
+      assetType: (source.assetType || []).slice(),
+      environment: (source.environment || []).slice(),
+      stewardship: (source.stewardship || []).slice(),
+      domain: (source.domain || []).slice()
+    };
+  }
+
+  function dashboardFiltersEqual_(left, right) {
+    if (!left || !right) return false;
+    return ['assetStatus', 'lifecycle', 'assetType', 'environment', 'stewardship', 'domain'].every(function (key) {
+      return JSON.stringify(left[key] || []) === JSON.stringify(right[key] || []);
+    });
   }
 
   function updateDashboardQueueTitle_() {
@@ -368,14 +425,22 @@
     body.setAttribute('aria-busy', 'false');
     state.currentAssets = assets;
     document.getElementById('selectAllAssets').disabled = assets.length === 0;
-    if (!assets.length) { body.innerHTML = '<tr><td colspan="7" class="empty">No assets match these filters.</td></tr>'; updateBulkSelectionUi(); return; }
+    if (!assets.length) { body.innerHTML = '<tr><td colspan="11" class="empty">No assets match these filters.</td></tr>'; updateBulkSelectionUi(); return; }
     body.innerHTML = assets.map(function (asset) {
-      const days = asset.daysInactive === null ? 'Signal gap' : formatNumber(asset.daysInactive) + ' days';
-      const reason = asset.assetStatus === 'STALE' ? days + ' inactive · application threshold met' : asset.assetStatus === 'PURGED' ? 'Deletion verified in latest complete extract' : asset.assetStatus === 'QUARANTINED' ? 'Snowflake status is RESTRICTED' : 'Previously stale asset now active';
+      const noRead = ['NEW_UNREAD', 'STALE_NO_READ_IN_AVAILABLE_HISTORY'].indexOf(asset.sourceActivityStatus) !== -1;
+      const signalGap = /^(INVALID_|MISSING_)/.test(asset.sourceActivityStatus || '');
+      const readInactivity = asset.daysInactive === null
+        ? 'Read staleness signal unavailable'
+        : formatNumber(asset.daysInactive) + (noRead ? ' days since creation (no reads)' : ' days since last read');
+      const reason = asset.assetStatus === 'PURGED' ? 'Deletion verified in latest complete extract' : asset.assetStatus === 'QUARANTINED' ? 'Snowflake status is RESTRICTED' : signalGap ? 'Read staleness signal unavailable · lifecycle retained' : asset.assetStatus === 'STALE' ? readInactivity + ' · application threshold met' : 'Read activity is within the configured threshold';
       const checkbox = '<input class="asset-select" type="checkbox" value="' + escapeHtml(asset.assetId) + '" aria-label="Select ' + escapeHtml(asset.objectFqn) + '" onclick="event.stopPropagation()" onchange="toggleAssetSelection(this.value,this.checked)">';
       const stewardship = asset.businessSteward || asset.technicalSteward || 'No Slack email';
       const domain = asset.domain + (asset.subDomain ? ' · ' + asset.subDomain : '');
-      return '<tr onclick="openAsset(' + JSON.stringify(asset.assetId).replace(/"/g, '&quot;') + ')"><td class="select-column" onclick="event.stopPropagation()">' + checkbox + '</td><td class="object" title="' + escapeHtml(asset.objectFqn) + '">' + escapeHtml(asset.objectFqn) + '</td><td class="domain-cell" title="' + escapeHtml(domain) + '">' + escapeHtml(domain) + '</td><td>' + escapeHtml(reason) + '</td><td class="steward-cell" title="' + escapeHtml(stewardship) + '">' + escapeHtml(stewardship) + '</td><td>' + badge(asset.assetStatus) + '</td><td>' + mainTableLifecycleBadge_(asset.lifecycleState) + '</td></tr>';
+      const assetType = humanizeFilterValue_(asset.assetType || 'UNKNOWN');
+      const rowCount = asset.rowCount === null || asset.rowCount === undefined ? '—' : formatNumber(asset.rowCount);
+      const rowCountClass = Number(asset.rowCount) === 0 && asset.rowCount !== null ? ' row-count-zero' : '';
+      const rowCountTitle = rowCountClass ? 'This asset currently reports zero rows.' : rowCount + ' rows';
+      return '<tr onclick="openAsset(' + JSON.stringify(asset.assetId).replace(/"/g, '&quot;') + ')"><td class="select-column" onclick="event.stopPropagation()">' + checkbox + '</td><td class="object" title="' + escapeHtml(asset.objectFqn) + '">' + escapeHtml(asset.objectFqn) + '</td><td class="asset-type-cell">' + escapeHtml(assetType) + '</td><td class="domain-cell" title="' + escapeHtml(domain) + '">' + escapeHtml(domain) + '</td><td class="numeric-column"><span class="row-count-value' + rowCountClass + '" title="' + escapeHtml(rowCountTitle) + '">' + escapeHtml(rowCount) + '</span></td><td class="date-cell">' + escapeHtml(formatDate(asset.lastRead)) + '</td><td>' + escapeHtml(reason) + '</td><td class="date-cell">' + escapeHtml(formatDate(asset.notificationDate)) + '</td><td class="steward-cell" title="' + escapeHtml(stewardship) + '">' + escapeHtml(stewardship) + '</td><td>' + badge(asset.assetStatus) + '</td><td>' + mainTableLifecycleBadge_(asset.lifecycleState) + '</td></tr>';
     }).join('');
     updateBulkSelectionUi();
   }
@@ -583,7 +648,7 @@
     ];
     document.getElementById('integrationStatus').innerHTML = items.map(function (item) {
       let label = item[1].blocked ? 'BLOCKED' : (item[1].enabled && item[1].configured ? 'READY' : item[1].configured ? 'CONFIGURED' : 'DRAFT ONLY');
-      return '<div class="integration"><span>' + escapeHtml(item[0]) + '</span>' + badge(label) + '</div>';
+      return '<div class="integration"' + (item[1].reason ? ' title="' + escapeHtml(item[1].reason) + '"' : '') + '><span>' + escapeHtml(item[0]) + '</span>' + badge(label) + '</div>';
     }).join('');
   }
 
@@ -912,6 +977,7 @@
       purgeNoticeDays: config.purgeNoticeDays,
       recipientLock: config.recipientLock || '',
       allowedRecipients: config.allowedRecipients || '',
+      edgContact: config.edgContact || '',
       exceptionAppUrl: config.exceptionAppUrl || '',
       exceptionDatabaseSpreadsheetId: config.exceptionDatabaseSpreadsheetId || '',
       exceptionDatabaseSheetName: config.exceptionDatabaseSheetName || 'Exception Log'
@@ -1071,6 +1137,7 @@
       purgeNoticeDays: document.getElementById('purgeNoticeDays').value,
       recipientLock: document.getElementById('recipientLock').value,
       allowedRecipients: document.getElementById('allowedRecipients').value,
+      edgContact: document.getElementById('edgContact').value,
       exceptionAppUrl: document.getElementById('exceptionAppUrl').value,
       exceptionDatabaseSpreadsheetId: document.getElementById('exceptionDatabaseSpreadsheetId').value,
       exceptionDatabaseSheetName: document.getElementById('exceptionDatabaseSheetName').value,
@@ -1173,26 +1240,35 @@
   function renderDetail(detail) {
     const asset = detail.asset;
     const caseRecord = detail.caseRecord;
+    const daysSinceRead = Object.prototype.hasOwnProperty.call(asset, 'DAYS_SINCE_READ')
+      ? asset.DAYS_SINCE_READ : asset.DAYS_SINCE_ANY_ACTIVITY;
     const fields = [
       ['Asset ID', asset.ASSET_ID],
+      ['Snowflake table ID', asset.SNOWFLAKE_TABLE_ID || '—'],
       ['Asset status', asset.ASSET_STATUS], ['Lifecycle state', asset.LIFECYCLE_STATE],
-      ['Days inactive', asset.DAYS_SINCE_ANY_ACTIVITY !== '' ? asset.DAYS_SINCE_ANY_ACTIVITY : 'Signal gap'], ['Threshold', asset.STALE_THRESHOLD_DAYS + ' days'],
+      ['Days since read / creation fallback', daysSinceRead !== '' ? daysSinceRead : 'Signal unavailable'], ['Threshold', asset.STALE_THRESHOLD_DAYS + ' days'],
+      ['Read evaluation', asset.SOURCE_ACTIVITY_STATUS || '—'], ['Object created', formatDate(asset.OBJECT_CREATED_DATE)],
       ['Domain', asset.DOMAIN || 'Unassigned'], ['Sub-domain', asset.SUB_DOMAIN || '—'],
       ['Asset type', asset.ASSET_TYPE], ['Rows', asset.ROW_COUNT !== '' ? asset.ROW_COUNT : '—'],
       ['Size', asset.SIZE_GB !== '' ? asset.SIZE_GB + ' GB' : '—'], ['Ownership', asset.OWNERSHIP_STATUS],
-      ['Ownership source', asset.OWNERSHIP_SOURCE || '—'], ['Snowflake table owner', asset.SNOWFLAKE_TABLE_OWNER || asset.DATABASE_OWNER || '—'],
+      ['Ownership source', asset.OWNERSHIP_SOURCE || '—'], ['Snowflake table owner', asset.SNOWFLAKE_TABLE_OWNER || '—'],
+      ['Schema owner', asset.SCHEMA_OWNER_NAME || asset.SCHEMA_OWNER || '—'], ['Schema owner username', asset.SCHEMA_OWNER_USERNAME || '—'],
+      ['Schema assignment status', asset.SCHEMA_OWNER_ASSIGNMENT_STATUS || '—'], ['Database owner', asset.DATABASE_OWNER || '—'],
       ['Snowflake data status', asset.SNOWFLAKE_DATA_STATUS || 'ACTIVE'],
       ['DPM team', asset.DPM_TEAM || '—'], ['BDS team', asset.BDS_TEAM || '—'],
       ['Technical steward', asset.TECHNICAL_STEWARD || '—'], ['Business steward', asset.BUSINESS_STEWARD || '—'],
-      ['Slack contact coverage', asset.CONTACT_COVERAGE_STATUS || '—'], ['Last activity', formatDate(asset.LAST_ACTIVITY_TS || asset.ESTIMATED_LAST_ACTIVITY_DATE)],
+      ['Slack contact coverage', asset.CONTACT_COVERAGE_STATUS || '—'], ['Operational activity', formatDate(asset.LAST_ACTIVITY_TS)],
+      ['Days since operational activity', asset.DAYS_SINCE_OPERATIONAL_ACTIVITY !== '' && asset.DAYS_SINCE_OPERATIONAL_ACTIVITY !== undefined ? asset.DAYS_SINCE_OPERATIONAL_ACTIVITY : '—'],
       ['Last read', formatDate(asset.LAST_READ)], ['Last write', formatDate(asset.LAST_WRITE)],
       ['Last load', formatDate(asset.LAST_LOAD)], ['Last altered', formatDate(asset.LAST_ALTERED)],
-      ['T0 / intake approval', formatDate(caseRecord && caseRecord.T0)], ['Contest deadline', formatDate(caseRecord && caseRecord.CONTEST_DEADLINE)],
+      ['T0 / intake approval', formatDate(caseRecord && caseRecord.T0)], ['Owner notice due', formatDate(caseRecord && caseRecord.NOTICE_DUE_AT)],
+      ['Contest deadline', formatDate(caseRecord && caseRecord.CONTEST_DEADLINE)],
       ['Contest exception ID', caseRecord && caseRecord.CONTEST_REFERENCE || '—'],
       ['Quarantine start', formatDate(caseRecord && caseRecord.QUARANTINE_START_DATE)], ['Purge eligible', formatDate(caseRecord && caseRecord.PURGE_ELIGIBLE_DATE)]
     ];
     const classification = classificationFor(asset.ASSET_STATUS);
-    const classificationText = asset.ASSET_STATUS === 'QUARANTINED' ? 'Quarantined: Snowflake reports data status RESTRICTED. The lifecycle remains recoverable until the purge process is completed.' : asset.ASSET_STATUS === 'STALE' ? 'Stale: the application calculated that all available activity is outside the configured threshold. Lifecycle status shows the current governance action.' : asset.ASSET_STATUS === 'PURGED' ? 'Purged: the platform completed the purge and a complete Snowflake extract verified that the object is absent.' : 'Active: this asset remains visible because it was previously managed through the stale-data lifecycle.';
+    const hasReadSignalGap = /^(INVALID_|MISSING_)/.test(asset.SOURCE_ACTIVITY_STATUS || '');
+    const classificationText = asset.ASSET_STATUS === 'QUARANTINED' ? 'Quarantined: Snowflake reports data status RESTRICTED. The lifecycle remains recoverable until the purge process is completed.' : asset.ASSET_STATUS === 'PURGED' ? 'Purged: the platform completed the purge and a complete Snowflake extract verified that the object is absent.' : hasReadSignalGap ? 'Lifecycle retained: the latest extract could not be evaluated for read staleness, so no automatic lifecycle transition was made.' : asset.ASSET_STATUS === 'STALE' ? 'Stale: no qualifying read was recorded inside the configured threshold. Writes, loads, and metadata changes are retained as context but do not reset this clock.' : 'Active: qualifying read activity is inside the configured threshold.';
     let actions = '';
     if (caseRecord) {
       const actionAsset = {
@@ -1587,6 +1663,8 @@
     const summary = document.getElementById('workflowLoadingProgressSummary');
     const details = document.getElementById('workflowLoadingDetails');
     const config = normalizeWorkflowProgress_(progressConfig);
+    document.getElementById('workflowLoadingDismiss').classList.toggle('hidden', !config.dismissible);
+    document.getElementById('workflowLoadingHint').textContent = config.hint || 'Please keep this window open.';
     progress.classList.toggle('hidden', !config.visible);
     progress.classList.toggle('indeterminate', config.indeterminate);
     summary.classList.toggle('hidden', !config.visible);
@@ -1606,16 +1684,18 @@
   }
 
   function normalizeWorkflowProgress_(progressConfig) {
-    if (!progressConfig) return { visible: false, indeterminate: false, percent: 0, stage: '', details: [] };
-    if (progressConfig === true) return { visible: true, indeterminate: true, percent: 0, stage: 'Processing request', details: [] };
-    if (typeof progressConfig === 'number') return { visible: true, indeterminate: false, percent: Math.max(0, Math.min(100, Math.round(progressConfig))), stage: '', details: [] };
+    if (!progressConfig) return { visible: false, indeterminate: false, percent: 0, stage: '', details: [], dismissible: false, hint: '' };
+    if (progressConfig === true) return { visible: true, indeterminate: true, percent: 0, stage: 'Processing request', details: [], dismissible: false, hint: '' };
+    if (typeof progressConfig === 'number') return { visible: true, indeterminate: false, percent: Math.max(0, Math.min(100, Math.round(progressConfig))), stage: '', details: [], dismissible: false, hint: '' };
     const numericPercent = Number(progressConfig.percent);
     return {
       visible: true,
       indeterminate: Boolean(progressConfig.indeterminate) || !isFinite(numericPercent),
       percent: isFinite(numericPercent) ? Math.max(0, Math.min(100, Math.round(numericPercent))) : 0,
       stage: cleanClientText_(progressConfig.stage),
-      details: Array.isArray(progressConfig.details) ? progressConfig.details.filter(function (item) { return item && item.label && item.value !== undefined && item.value !== null && String(item.value) !== ''; }) : []
+      details: Array.isArray(progressConfig.details) ? progressConfig.details.filter(function (item) { return item && item.label && item.value !== undefined && item.value !== null && String(item.value) !== ''; }) : [],
+      dismissible: Boolean(progressConfig.dismissible),
+      hint: cleanClientText_(progressConfig.hint)
     };
   }
 
@@ -1642,7 +1722,22 @@
     document.getElementById('workflowLoadingProgress').classList.add('hidden');
     document.getElementById('workflowLoadingProgressSummary').classList.add('hidden');
     document.getElementById('workflowLoadingDetails').classList.add('hidden');
+    document.getElementById('workflowLoadingDismiss').classList.add('hidden');
     document.body.classList.remove('workflow-loading');
+  }
+
+  function dismissPublishingLoading_() {
+    if (state.intakePreparation && state.intakePreparation.running) {
+      state.intakeReviewOverlayDismissed = true;
+      state.manualLoading = false;
+      forceHideWorkflowLoading_();
+      showToast('Intake review preparation is continuing in the background.');
+      return;
+    }
+    state.publicationOverlayDismissed = true;
+    state.manualLoading = false;
+    forceHideWorkflowLoading_();
+    showToast('Publication is continuing in the background. Progress remains available in the status banner.');
   }
 
   function closeExceptionFlow() {
@@ -1691,6 +1786,11 @@
   }
 
   document.addEventListener('keydown', function (event) {
+    const publishingDismiss = document.getElementById('workflowLoadingDismiss');
+    if (event.key === 'Escape' && publishingDismiss && !publishingDismiss.classList.contains('hidden')) {
+      dismissPublishingLoading_();
+      return;
+    }
     const userGuideModal = document.getElementById('userGuideModal');
     if (userGuideModal && !userGuideModal.classList.contains('hidden') && event.key === 'Escape') {
       closeUserGuide_();
@@ -1698,6 +1798,7 @@
     }
     if (event.key === 'Escape' && state.openDashboardFilter) {
       state.openDashboardFilter = '';
+      state.pendingDashboardFilters = null;
       renderDashboardFilters_(state.dashboardFilterOptions);
       return;
     }
@@ -1735,7 +1836,7 @@
   }
 
   function closeDrawer() { state.detailRequestId += 1; document.getElementById('drawerBackdrop').classList.add('hidden'); document.getElementById('detailDrawer').classList.remove('open'); document.getElementById('detailDrawer').setAttribute('aria-hidden', 'true'); document.getElementById('detailDrawer').setAttribute('aria-busy', 'false'); }
-  function showAllAssets() { state.dashboardFilters.assetStatus = []; state.dashboardFilters.lifecycle = []; state.openDashboardFilter = ''; renderDashboardFilters_(state.dashboardFilterOptions); loadDashboard(1); document.querySelector('.asset-panel').scrollIntoView({ behavior: 'smooth' }); }
+  function showAllAssets() { state.dashboardFilters.assetStatus = []; state.dashboardFilters.lifecycle = []; state.pendingDashboardFilters = null; state.openDashboardFilter = ''; renderDashboardFilters_(state.dashboardFilterOptions); loadDashboard(1); document.querySelector('.asset-panel').scrollIntoView({ behavior: 'smooth' }); }
   function changePage(delta) { const next = Math.min(state.pages, Math.max(1, state.page + delta)); if (next !== state.page) loadDashboard(next); }
   function debouncedLoad() {
     clearTimeout(state.timer);
@@ -1786,22 +1887,16 @@
     banner.classList.add('hidden');
     banner.classList.remove('error');
     startUploadProgress_(file);
-    google.script.run.withSuccessHandler(function (review) {
+    google.script.run.withSuccessHandler(function (staged) {
       stopUploadProgress_();
-      renderWorkflowLoading_('Upload complete', 'The CSV is ready for EDG intake review.', {
-        percent: 100,
-        stage: 'Review prepared',
-        details: [
-          { label: 'File', value: fileName, wide: true },
-          { label: 'Source rows', value: formatNumber(review.sourceRows) },
-          { label: 'Review records', value: formatNumber((review.newlyStaleRecords || []).length + (review.existingLifecycleChanges || []).length + (review.quarantinePurgeChanges || []).length) }
-        ]
-      });
-      button.disabled = false;
-      hideWorkflowLoading_();
-      banner.classList.add('hidden');
-      state.intakeReview = review;
-      renderIntakeReview(review);
+      state.intakePreparation = Object.assign({}, staged, { running: true, clientStartedAt: Date.now() });
+      state.intakeReviewOverlayDismissed = false;
+      renderIntakeReviewPreparation_(state.intakePreparation);
+      google.script.run.withSuccessHandler(function (review) {
+        handleIntakeReviewPreparationStatus_(review);
+      }).withFailureHandler(function (error) {
+        failIntakeReviewPreparation_(error);
+      }).prepareSnowflakeIntakeReview({ token: staged.token });
     }).withFailureHandler(function (error) {
       stopUploadProgress_();
       button.disabled = false;
@@ -1811,6 +1906,81 @@
       banner.textContent = error.message || String(error);
       showToast(error.message || String(error), true);
     }).stageSnowflakeCsvUpload(document.getElementById('intakeUploadForm'));
+  }
+
+  function renderIntakeReviewPreparation_(status) {
+    const current = Object.assign({}, state.intakePreparation || {}, status || {});
+    state.intakePreparation = current;
+    if (state.intakeReviewOverlayDismissed) return;
+    const preparationStatus = cleanClientText_(current.status || current.preparationStatus).toUpperCase();
+    const queued = preparationStatus === 'QUEUED';
+    const merging = preparationStatus === 'MERGING_REVIEW';
+    const reconciling = preparationStatus === 'RECONCILING_REVIEW';
+    const startedAt = current.startedAt ? new Date(current.startedAt).getTime() : Number(current.clientStartedAt || Date.now());
+    const elapsedSeconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+    renderWorkflowLoading_('Preparing intake review', 'The CSV is safely staged. Review preparation is running independently, so you can continue using the application.', {
+      indeterminate: false,
+      percent: queued ? 2 : ((merging || reconciling) ? 99 : Number(current.percent || 0)),
+      stage: queued ? 'Queued for review' : (merging ? 'Assembling the completed review' : (reconciling ? 'Reconciling prior lifecycle records' :
+        'Evaluating source rows ' + formatNumber(current.processedRows || 0) + ' of ' + formatNumber(current.totalRows || current.sourceRows || 0))),
+      details: [
+        { label: 'File', value: current.fileName || '', wide: true },
+        { label: 'Source rows staged', value: formatNumber(current.sourceRows || 0) },
+        { label: 'Status', value: queued ? 'Queued' : ((merging || reconciling) ? 'Finalizing review' : 'Calculating review') },
+        { label: 'Upload size', value: formatFileSize(current.fileSizeBytes || 0) },
+        { label: 'Elapsed time', value: formatElapsedTime_(elapsedSeconds) }
+      ],
+      dismissible: true,
+      hint: 'Each completed batch is saved. You can close this window and resume from the latest checkpoint.'
+    });
+  }
+
+  function handleIntakeReviewPreparationStatus_(status) {
+    clearTimeout(state.intakeReviewPoller);
+    state.intakeReviewPoller = null;
+    const button = document.getElementById('importButton');
+    const banner = document.getElementById('statusBanner');
+    if (status && status.status === 'READY' && status.review) {
+      button.disabled = false;
+      state.intakePreparation = null;
+      state.intakeReviewOverlayDismissed = false;
+      hideWorkflowLoading_();
+      banner.classList.add('hidden');
+      state.intakeReview = status.review;
+      renderIntakeReview(status.review);
+      showToast('Intake review prepared successfully.');
+      return;
+    }
+    if (!status || status.status === 'FAILED' || !status.running) {
+      failIntakeReviewPreparation_(new Error(status && status.lastError || 'Review preparation did not complete.'));
+      return;
+    }
+    state.intakePreparation = Object.assign({}, state.intakePreparation || {}, status, { running: true });
+    renderIntakeReviewPreparation_(status);
+    state.intakeReviewPoller = setTimeout(pollIntakeReviewPreparation_, 1500);
+  }
+
+  function pollIntakeReviewPreparation_() {
+    const pending = state.intakePreparation;
+    if (!pending || !pending.token) return;
+    google.script.run.withSuccessHandler(handleIntakeReviewPreparationStatus_).withFailureHandler(function (error) {
+      failIntakeReviewPreparation_(error);
+    }).continueSnowflakeIntakeReview({ token: pending.token });
+  }
+
+  function failIntakeReviewPreparation_(error) {
+    clearTimeout(state.intakeReviewPoller);
+    state.intakeReviewPoller = null;
+    const message = error && error.message ? error.message : String(error || 'Review preparation failed.');
+    const banner = document.getElementById('statusBanner');
+    document.getElementById('importButton').disabled = false;
+    state.intakePreparation = null;
+    state.intakeReviewOverlayDismissed = false;
+    hideWorkflowLoading_();
+    banner.classList.remove('hidden');
+    banner.classList.add('error');
+    banner.textContent = 'The CSV was staged, but review preparation stopped: ' + message + ' Upload the file again to retry; nothing was published.';
+    showToast(message, true);
   }
 
   function startUploadProgress_(file) {
@@ -1901,6 +2071,10 @@
     const review = state.intakeReview;
     const dismissed = Object.keys(state.intakeReviewDismissed).length;
     const dismissedNotices = dismissedInitialNoticeCount_();
+    const dismissedOrphans = state.intakeReviewRecords.filter(function (item) {
+      return item.orphanQuarantine && state.intakeReviewDismissed[item.assetId];
+    }).length;
+    const orphanNotices = Math.max(0, Number(review.orphanStaleAssets || 0) - dismissedOrphans);
     const newlyStale = review.newlyStaleRecords === undefined
       ? Number(review.newCandidates || 0) + Number(review.changedCandidates || 0)
       : Number(review.newlyStaleRecords || 0);
@@ -1911,10 +2085,11 @@
       ? Number(review.initialRestrictedAssets || 0) + Number(review.restrictionTransitions || 0) + Number(review.expectedPurges || 0) + Number(review.expectedSelfPurges || 0)
       : Number(review.quarantinePurgeChanges || 0);
     const metrics = [
-      ['Newly stale', newlyStale, 'action', formatNumber(newlyStale) + ' entering or re-entering lifecycle' + (dismissed ? ' · ' + formatNumber(dismissed) + ' dismissed' : '')],
+      ['Newly stale', newlyStale, 'action', formatNumber(newlyStale) + ' entering or re-entering lifecycle · ' + formatNumber(review.orphanStaleAssets || 0) + ' orphan quarantine handoffs' + (dismissed ? ' · ' + formatNumber(dismissed) + ' dismissed' : '')],
       ['Existing lifecycle changes', existingChanges, 'notice', formatNumber(review.noLongerCandidates) + ' changing to Active'],
       ['Quarantine & purge', quarantinePurge, 'warning', formatNumber(review.initialRestrictedAssets) + ' newly restricted · ' + formatNumber(review.restrictionTransitions) + ' quarantine transitions · ' + formatNumber(Number(review.expectedPurges || 0) + Number(review.expectedSelfPurges || 0)) + ' purge verifications'],
-      ['Notifications', Math.max(0, Number(review.notificationAssets || 0) - dismissedNotices) + Number(review.quarantineNotificationAssets || 0) + Number(review.expectedPurges || 0) + Number(review.restorationNotificationAssets || 0), 'safe', formatNumber(Math.max(0, Number(review.notificationAssets || 0) - dismissedNotices)) + ' initial · ' + formatNumber(review.quarantineNotificationAssets) + ' quarantine · ' + formatNumber(review.expectedPurges) + ' purge complete · ' + formatNumber(review.restorationNotificationAssets || 0) + ' restoration']
+      ['Notifications', Math.max(0, Number(review.notificationAssets || 0) - dismissedNotices) + orphanNotices + Number(review.quarantineNotificationAssets || 0) + Number(review.expectedPurges || 0) + Number(review.restorationNotificationAssets || 0), 'safe', formatNumber(Math.max(0, Number(review.notificationAssets || 0) - dismissedNotices)) + ' immediate owner · ' + formatNumber(orphanNotices) + ' immediate orphan outreach · ' + formatNumber(review.quarantineNotificationAssets) + ' quarantine · ' + formatNumber(review.expectedPurges) + ' purge complete · ' + formatNumber(review.restorationNotificationAssets || 0) + ' restoration'],
+      ['Schema owners', Number(review.schemaOwnerMatchedAssets || 0), 'notice', formatNumber(review.schemaOwnerMatchedAssets || 0) + ' assets matched by database.schema · ' + formatNumber(review.schemaOwnerUnmatchedAssets || 0) + ' unmatched']
     ];
     document.getElementById('intakeReviewMetrics').innerHTML = metrics.map(function (item) {
       return '<article class="review-metric ' + item[2] + '"><span>' + escapeHtml(item[0]) + '</span><strong>' + formatNumber(item[1]) + '</strong><small>' + escapeHtml(item[3]) + '</small></article>';
@@ -2005,7 +2180,13 @@
   }
 
   function intakeReviewChangeText_(item) {
-    if (item.reviewType === 'NEW') return 'New stale record';
+    if (item.stalenessSignal && item.stalenessAnchor) {
+      const signal = item.stalenessSourceField || (item.stalenessSignal === 'LAST_READ' ? 'LAST_READ' : 'OBJECT_CREATED_DATE');
+      const sourceValue = item.stalenessSourceValue || item.stalenessAnchor;
+      const days = typeof item.daysInactive === 'number' ? formatNumber(item.daysInactive) + ' days' : String(item.daysInactive || 'Signal gap');
+      return signal + ': ' + sourceValue + ' · ' + days + ' · threshold ' + formatNumber(item.staleThresholdDays || 180) + ' days';
+    }
+    if (item.reviewType === 'NEW') return item.orphanQuarantine ? 'Orphaned stale record → quarantine handoff' : 'New stale record';
     if (item.reviewType === 'CHANGED') {
       const fields = (item.changes || []).map(function (change) { return change.field; });
       const shown = fields.slice(0, 4);
@@ -2014,11 +2195,11 @@
     if (item.reviewType === 'INITIAL_RESTRICTED') return 'New restricted record → Quarantined';
     if (item.reviewType === 'QUARANTINE') return 'Restriction confirmed → Quarantined';
     if (item.reviewType === 'RESTRICTION_CLEARED') return 'Restriction cleared — restoration review required';
-    if (item.reviewType === 'RECOVERED') return 'Activity detected → Active';
+    if (item.reviewType === 'RECOVERED') return 'Read detected → Active';
     if (item.reviewType === 'MISSING') return item.messageType === 'PURGE_COMPLETED'
       ? 'Missing after purge handoff → Purged'
       : 'Missing from extract — retained';
-    if (item.reviewType === 'SIGNAL_GAP') return 'No valid activity signal — not evaluated';
+    if (item.reviewType === 'SIGNAL_GAP') return 'Read staleness unavailable — existing lifecycle retained';
     return item.changeSummary || 'No lifecycle change';
   }
 
@@ -2133,14 +2314,87 @@
   function renderIntakeReviewImpact_() {
     const review = state.intakeReview;
     const dismissed = Object.keys(state.intakeReviewDismissed).length;
+    const dismissedOrphans = state.intakeReviewRecords.filter(function (item) {
+      return item.orphanQuarantine && state.intakeReviewDismissed[item.assetId];
+    }).length;
+    const orphanHandoffs = Math.max(0, Number(review.orphanStaleAssets || 0) - dismissedOrphans);
     const initialNotices = Math.max(0, Number(review.notificationAssets || 0) - dismissedInitialNoticeCount_());
-    const recipientText = initialNotices ? formatNumber(initialNotices) + ' newly opened cases in approximately ' + formatNumber(review.notificationGroups) + ' consolidated Slack message group' + (Number(review.notificationGroups) === 1 ? '' : 's') : 'No new initial notices';
+    const recipientText = initialNotices ? formatNumber(initialNotices) + ' newly opened cases queued for immediate owner notices in approximately ' + formatNumber(review.notificationGroups) + ' consolidated Slack message group' + (Number(review.notificationGroups) === 1 ? '' : 's') : 'No new immediate owner notices';
+    const orphanText = orphanHandoffs ? formatNumber(orphanHandoffs) + ' EDG-coordinated orphan outreach notice' + (orphanHandoffs === 1 ? '' : 's') + ' at T0' : 'No orphan outreach notices';
     const quarantineText = review.quarantineNotificationAssets ? formatNumber(review.quarantineNotificationAssets) + ' quarantine confirmations in approximately ' + formatNumber(review.quarantineNotificationGroups) + ' consolidated Slack message group' + (Number(review.quarantineNotificationGroups) === 1 ? '' : 's') : 'No new quarantine confirmations';
     const purgeText = review.expectedPurges ? formatNumber(review.expectedPurges) + ' purge completion' + (Number(review.expectedPurges) === 1 ? '' : 's') : 'No purge completions';
     const selfPurgeText = review.expectedSelfPurges ? formatNumber(review.expectedSelfPurges) + ' self-purge verification' + (Number(review.expectedSelfPurges) === 1 ? '' : 's') + ' with no notification' : 'No self-purge verifications';
     const restorationText = review.restorationNotificationAssets ? formatNumber(review.restorationNotificationAssets) + ' restoration confirmation' + (Number(review.restorationNotificationAssets) === 1 ? '' : 's') : 'No restoration confirmations';
-    const totalNotifications = initialNotices + Number(review.quarantineNotificationAssets || 0) + Number(review.expectedPurges || 0) + Number(review.restorationNotificationAssets || 0);
-    document.getElementById('intakeReviewImpact').innerHTML = '<div class="review-impact-grid"><div class="review-impact-stat"><strong>' + formatNumber(review.sourceRows) + '</strong><span>source rows evaluated</span></div><div class="review-impact-stat"><strong>' + formatNumber(dismissed) + '</strong><span>candidates dismissed</span></div><div class="review-impact-stat"><strong>' + formatNumber(totalNotifications) + '</strong><span>notification records</span></div></div><p><strong>On confirmation:</strong> the operational dataset will be refreshed, existing lifecycle state will be preserved, ' + formatNumber(review.initialRestrictedAssets) + ' newly observed restricted asset' + (Number(review.initialRestrictedAssets) === 1 ? '' : 's') + ' will enter as QUARANTINED, ' + formatNumber(review.restrictionTransitions) + ' existing asset' + (Number(review.restrictionTransitions) === 1 ? '' : 's') + ' will transition to QUARANTINED, recovered stale assets will become ACTIVE, ' + formatNumber(review.expectedPurges) + ' completed purge handoff' + (Number(review.expectedPurges) === 1 ? '' : 's') + ' and ' + formatNumber(review.expectedSelfPurges || 0) + ' owner self-purge' + (Number(review.expectedSelfPurges || 0) === 1 ? '' : 's') + ' will be verified, and ' + formatNumber(review.restorationNotificationAssets || 0) + ' previously purged asset' + (Number(review.restorationNotificationAssets || 0) === 1 ? '' : 's') + ' will be restored after reappearance.</p><p><strong>Dismissals:</strong> ' + formatNumber(dismissed) + ' selected candidate' + (dismissed === 1 ? '' : 's') + ' will publish as DISMISSED, receive no initial notice, and have pending platform actions cancelled.</p><p><strong>Notifications:</strong> ' + escapeHtml(recipientText) + '; ' + escapeHtml(quarantineText) + '; ' + escapeHtml(purgeText) + '; ' + escapeHtml(selfPurgeText) + '; ' + escapeHtml(restorationText) + '. Notifications are sent only after publication succeeds.</p><p><strong>Automatically handled:</strong> ' + formatNumber(review.unchangedCandidates) + ' unchanged candidates retain their current state; ' + formatNumber(review.belowThreshold) + ' net-new active rows remain outside the lifecycle table.</p>';
+    const totalNotifications = initialNotices + orphanHandoffs + Number(review.quarantineNotificationAssets || 0) + Number(review.expectedPurges || 0) + Number(review.restorationNotificationAssets || 0);
+    document.getElementById('intakeReviewImpact').innerHTML = '<div class="review-impact-grid"><div class="review-impact-stat"><strong>' + formatNumber(review.sourceRows) + '</strong><span>source rows evaluated</span></div><div class="review-impact-stat"><strong>' + formatNumber(dismissed) + '</strong><span>candidates dismissed</span></div><div class="review-impact-stat"><strong>' + formatNumber(totalNotifications) + '</strong><span>notification records</span></div></div><p><strong>On confirmation:</strong> the operational dataset will be refreshed, existing lifecycle state will be preserved, ' + formatNumber(orphanHandoffs) + ' orphaned stale asset' + (orphanHandoffs === 1 ? '' : 's') + ' will be accepted and queued for quarantine, ' + formatNumber(review.initialRestrictedAssets) + ' newly observed restricted asset' + (Number(review.initialRestrictedAssets) === 1 ? '' : 's') + ' will enter as QUARANTINED, ' + formatNumber(review.restrictionTransitions) + ' existing asset' + (Number(review.restrictionTransitions) === 1 ? '' : 's') + ' will transition to QUARANTINED, recovered stale assets will become ACTIVE, ' + formatNumber(review.expectedPurges) + ' completed purge handoff' + (Number(review.expectedPurges) === 1 ? '' : 's') + ' and ' + formatNumber(review.expectedSelfPurges || 0) + ' owner self-purge' + (Number(review.expectedSelfPurges || 0) === 1 ? '' : 's') + ' will be verified, and ' + formatNumber(review.restorationNotificationAssets || 0) + ' previously purged asset' + (Number(review.restorationNotificationAssets || 0) === 1 ? '' : 's') + ' will be restored after reappearance.</p><p><strong>Schema-owner enrichment:</strong> ' + formatNumber(review.schemaOwnerMatchedAssets || 0) + ' imported asset' + (Number(review.schemaOwnerMatchedAssets || 0) === 1 ? '' : 's') + ' matched an eligible Confirmed or Assigned - Final database.schema assignment; ' + formatNumber(review.schemaOwnerUnmatchedAssets || 0) + ' did not match. The raw delegate name and username are retained with the derived Salesforce email.</p><p><strong>Dismissals:</strong> ' + formatNumber(dismissed) + ' selected candidate' + (dismissed === 1 ? '' : 's') + ' will publish as DISMISSED, receive no initial notice, and have pending platform actions cancelled.</p><p><strong>Notifications:</strong> ' + escapeHtml(recipientText) + '; ' + escapeHtml(orphanText) + '; ' + escapeHtml(quarantineText) + '; ' + escapeHtml(purgeText) + '; ' + escapeHtml(selfPurgeText) + '; ' + escapeHtml(restorationText) + '. Recipient fallback is Technical Steward → Business Steward → Snowflake Table Owner → Schema Owner → Database Owner → EDG Operations. The exact resolved recipient is shown for every sampled notification above.</p><p><strong>Automatically handled:</strong> ' + formatNumber(review.unchangedCandidates) + ' unchanged candidates retain their current state; ' + formatNumber(review.belowThreshold) + ' active rows remain visible in inventory but outside the stale lifecycle workflow.</p>';
+    renderIntakeNotificationPayloads_();
+  }
+
+  function exportIntakeReviewDetails() {
+    const review = state.intakeReview;
+    const button = document.getElementById('exportIntakeReviewButton');
+    if (!review || !review.token) {
+      showToast('This intake review is no longer available for export.', true);
+      return;
+    }
+    button.disabled = true;
+    button.textContent = 'Preparing export…';
+    google.script.run.withSuccessHandler(function (exportData) {
+      button.disabled = false;
+      button.textContent = 'Export review CSV';
+      downloadCsvFile_(exportData);
+      showToast(formatNumber(exportData.rows.length) + ' review record' + (exportData.rows.length === 1 ? '' : 's') + ' exported.');
+    }).withFailureHandler(function (error) {
+      button.disabled = false;
+      button.textContent = 'Export review CSV';
+      showToast(error.message || String(error), true);
+    }).exportSnowflakeIntakeReview({
+      token: review.token,
+      dismissedAssetIds: Object.keys(state.intakeReviewDismissed)
+    });
+  }
+
+  function renderIntakeNotificationPayloads_() {
+    const container = document.getElementById('intakeNotificationPayloads');
+    const previews = (state.intakeReview && state.intakeReview.notificationPayloadPreviews || []).map(function (preview) {
+      const copy = Object.assign({}, preview);
+      copy.assetIds = (preview.assetIds || []).filter(function (assetId) { return !state.intakeReviewDismissed[assetId]; });
+      copy.assets = (preview.assets || []).filter(function (asset) { return !state.intakeReviewDismissed[asset.assetId]; });
+      copy.assetCount = copy.assetIds.length || Math.max(0, Number(preview.assetCount || 0) - Object.keys(state.intakeReviewDismissed).filter(function (assetId) {
+        return (preview.assetIds || []).indexOf(assetId) !== -1;
+      }).length);
+      return copy;
+    }).filter(function (preview) {
+      return preview.assetCount > 0;
+    });
+    if (!previews.length) {
+      container.innerHTML = '<div class="review-payload-heading"><div><h3>Slack notification review</h3><span>No Slack notifications are expected from this refresh.</span></div></div>';
+      return;
+    }
+    container.innerHTML = '<div class="review-payload-heading"><div><h3>Slack notification review</h3><span>' + formatNumber(previews.length) + ' consolidated notification' + (previews.length === 1 ? '' : 's') + ', grouped exactly as delivery by notification type and recipient.</span></div></div>' +
+      '<div class="review-payload-note">Each card below represents one Slack notification. Dismissed assets are removed from this review. Lists show up to 10 assets, matching the delivered Slack message.</div>' +
+      '<div class="review-payload-list">' + previews.map(function (preview, index) {
+        const shown = preview.assets.slice(0, 10);
+        const roleMap = {};
+        preview.assets.forEach(function (asset) { if (asset.recipientRole) roleMap[asset.recipientRole] = true; });
+        const roles = Object.keys(roleMap).sort().map(recipientRoleLabel_).join(', ') || recipientRoleLabel_(preview.recipientRole);
+        const assetRows = shown.map(function (asset) {
+          const activity = (asset.recipientRole ? 'Via ' + recipientRoleLabel_(asset.recipientRole) + ' · ' : '') + (asset.stalenessAnchor ? formatDate(asset.stalenessAnchor) + (asset.daysInactive !== '' ? ' · ' + formatNumber(asset.daysInactive) + ' days' : '') : 'Staleness basis unavailable');
+          return '<li><strong>' + escapeHtml(asset.fqn) + '</strong><span>' + escapeHtml(activity) + '</span></li>';
+        }).join('');
+        const remainder = preview.assetCount > shown.length ? '<p class="review-payload-more">' + formatNumber(preview.assetCount - shown.length) + ' additional asset' + (preview.assetCount - shown.length === 1 ? '' : 's') + ' will be included. Open the application to view all assets.</p>' : '';
+        return '<article class="review-payload-card"><div class="review-payload-card-heading"><div><span class="review-payload-type">' + escapeHtml(preview.messageType) + '</span><h4>' + escapeHtml(preview.recipient) + '</h4><small>Recipient role: ' + escapeHtml(roles) + '</small></div><span class="badge gray">' + formatNumber(preview.assetCount) + ' assets</span></div><ol class="review-payload-assets">' + assetRows + '</ol>' + remainder + '</article>';
+      }).join('') + '</div>';
+  }
+
+  function recipientRoleLabel_(role) {
+    const labels = {
+      TECHNICAL_STEWARD: 'Technical Steward', BUSINESS_STEWARD: 'Business Steward',
+      SNOWFLAKE_TABLE_OWNER: 'Snowflake Table Owner', SCHEMA_OWNER: 'Schema Owner',
+      DATABASE_OWNER: 'Database Owner', EDG_OPERATIONS_RECIPIENT: 'EDG Operations',
+      DEV_PRIMARY_RECIPIENT_LOCK: 'DEV Recipient Lock'
+    };
+    return labels[role] || String(role || 'Unresolved').replace(/_/g, ' ');
   }
 
   function dismissedInitialNoticeCount_() {
@@ -2182,6 +2436,7 @@
     const review = state.intakeReview;
     if (!review) return;
     const button = document.getElementById('confirmIntakeButton');
+    state.publicationOverlayDismissed = false;
     button.disabled = true;
     button.textContent = 'Publishing…';
     showPublishingLoading_({ phase: 'STARTING', completed: 0, total: review.sourceRows, percent: 0 });
@@ -2215,14 +2470,43 @@
     const current = status || {};
     const phase = cleanClientText_(current.phase || 'STARTING').toUpperCase();
     const rowPercent = Math.max(0, Math.min(100, Number(current.percent || 0)));
-    let overallPercent = 5;
-    let stage = 'Step 1 of 3 · Starting publication';
+    const progressStage = cleanClientText_(current.progressStage).toUpperCase();
+    const progressLabels = {
+      QUEUED_FOR_SOURCE_EVALUATION: 'Queued for source evaluation',
+      QUEUED_FOR_NEXT_SOURCE_BATCH: 'Source checkpoint saved; next batch queued',
+      PROCESSING_SOURCE_BATCH: 'Processing the next source batch',
+      SOURCE_EVALUATION_COMPLETE: 'Source evaluation complete',
+      PUBLISHING_ASSET_BUFFER: 'Publishing evaluated asset data',
+      RECONCILING_LIFECYCLE: 'Reconciling lifecycle records',
+      APPROVING_CANDIDATES: 'Applying reviewed decisions',
+      APPLYING_LIFECYCLE_CHANGES: 'Applying lifecycle changes',
+      REFRESHING_DASHBOARD: 'Refreshing dashboard data',
+      QUEUING_NOTIFICATIONS: 'Queueing background Slack delivery',
+      SENDING_NOTIFICATIONS: 'Sending consolidated Slack notifications',
+      COMPLETING_PUBLICATION: 'Completing publication'
+    };
+    let indeterminate = true;
+    let displayedPercent = 0;
+    let stage = 'Submitting approved review';
     if (phase === 'IMPORT') {
-      overallPercent = 10 + Math.round(rowPercent * .75);
-      stage = 'Step 2 of 3 · Evaluating source rows';
-    } else if (phase === 'FINALIZE') {
-      overallPercent = 92;
-      stage = 'Step 3 of 3 · Reconciling lifecycle and notifications';
+      displayedPercent = rowPercent;
+      indeterminate = ['QUEUED_FOR_SOURCE_EVALUATION', 'PROCESSING_SOURCE_BATCH'].indexOf(progressStage) !== -1;
+      stage = (progressLabels[progressStage] || 'Evaluating source rows') +
+        (indeterminate ? ' · ' + formatNumber(current.completed || 0) + ' rows completed' : ' · ' + Math.round(rowPercent) + '% complete');
+    } else if (phase === 'PREPARE_FINALIZE' || phase === 'FINALIZE') {
+      stage = progressLabels[progressStage] || 'Finalizing lifecycle and notifications';
+      displayedPercent = {
+        SOURCE_EVALUATION_COMPLETE: 84,
+        PUBLISHING_ASSET_BUFFER: 88,
+        APPROVING_CANDIDATES: 91,
+        RECONCILING_LIFECYCLE: 93,
+        APPLYING_LIFECYCLE_CHANGES: 95,
+        REFRESHING_DASHBOARD: 97,
+        QUEUING_NOTIFICATIONS: 98,
+        SENDING_NOTIFICATIONS: 98,
+        COMPLETING_PUBLICATION: 99
+      }[progressStage] || 85;
+      indeterminate = false;
     }
     const processedRows = Number(current.processedRows !== undefined ? current.processedRows : current.completed || 0);
     const totalRows = Number(current.total || 0);
@@ -2230,14 +2514,18 @@
     const detailRows = [
       { label: 'File', value: current.fileName || (state.intakeReview && state.intakeReview.fileName) || '', wide: true },
       { label: 'Rows processed', value: formatNumber(processedRows) + (totalRows ? ' of ' + formatNumber(totalRows) : '') },
-      { label: 'Published / managed', value: formatNumber(current.writtenRows !== undefined ? current.writtenRows : current.candidates || 0) },
+      { label: 'Published assets', value: formatNumber(current.writtenRows !== undefined ? current.writtenRows : current.candidates || 0) },
       { label: 'Row errors', value: formatNumber(current.errors || 0) },
       { label: 'Elapsed time', value: formatElapsedTime_(elapsedSeconds) }
     ];
     showWorkflowLoading_(
       'Publishing data refresh',
       current.message || 'Publishing reviewed data and completing lifecycle automation…',
-      { percent: overallPercent, stage: stage, details: detailRows }
+      {
+        indeterminate: indeterminate, percent: displayedPercent, stage: stage, details: detailRows,
+        dismissible: true,
+        hint: 'Each completed checkpoint is saved. Closing this window will not lose progress; reopening the app resumes processing.'
+      }
     );
   }
 
@@ -2254,27 +2542,43 @@
   }
 
   function startPolling(showOverlay) {
-    clearInterval(state.poller);
-    state.poller = setInterval(function () {
+    clearTimeout(state.poller);
+    let publicationCompleted = !showOverlay;
+    const poll = function () {
       google.script.run.withSuccessHandler(function (status) {
         renderImportStatus(status);
         if (status.running) {
-          if (showOverlay) showPublishingLoading_(status);
+          if (showOverlay && !state.publicationOverlayDismissed) showPublishingLoading_(status);
+          state.poller = setTimeout(poll, state.publicationOverlayDismissed ? 5000 : 1500);
           return;
         }
-        clearInterval(state.poller);
+        const campaignRunning = Boolean(status.notificationCampaign && status.notificationCampaign.running);
+        if (!publicationCompleted) {
+          publicationCompleted = true;
+          state.publicationOverlayDismissed = false;
+          document.getElementById('importButton').disabled = false;
+          if (showOverlay) hideWorkflowLoading_();
+          showOverlay = false;
+          loadDashboard(1);
+          showToast(status.phase === 'FAILED'
+            ? 'Data publication failed. Review the latest job details.'
+            : campaignRunning ? 'Data refresh published. Slack delivery is continuing in the background.' : 'Data refresh published successfully.', status.phase === 'FAILED');
+        }
+        if (campaignRunning) {
+          state.poller = setTimeout(poll, 2000);
+          return;
+        }
+        clearTimeout(state.poller);
         state.poller = null;
-        document.getElementById('importButton').disabled = false;
-        if (showOverlay) hideWorkflowLoading_();
-        loadDashboard(1);
-        showToast(status.phase === 'FAILED' ? 'Data publication failed. Review the latest job details.' : 'Data refresh published successfully.', status.phase === 'FAILED');
+        renderImportStatus(status);
       }).withFailureHandler(function (error) {
-        clearInterval(state.poller);
+        clearTimeout(state.poller);
         state.poller = null;
         if (showOverlay) hideWorkflowLoading_();
         showToast(error.message || String(error), true);
-      }).getImportStatus();
-    }, 2500);
+      }).advanceActiveImportWorkflow();
+    };
+    state.poller = setTimeout(poll, 2500);
   }
 
   function renderImportStatus(status) {
@@ -2282,9 +2586,154 @@
     if (banner.classList.contains('app-error') && status.running) clearAppErrorBanner_();
     if (state.config) state.config.importStatus = status;
     renderAdminImportSummary(status);
-    if (!status.running) { banner.classList.add('hidden'); document.getElementById('importButton').disabled = false; return; }
+    const campaign = status.notificationCampaign || {};
+    const publicationPhase = cleanClientText_(status.phase).toUpperCase();
+    if (!status.running && publicationPhase === 'FAILED') {
+      banner.classList.remove('hidden');
+      banner.classList.add('error', 'app-error');
+      banner.innerHTML = '<div class="app-error-copy"><strong>Publication finalization needs attention</strong><span>' +
+        escapeHtml(status.message || 'The latest publication checkpoint failed.') + '</span></div>' +
+        (status.recoverable
+          ? '<div class="app-error-actions"><button class="button secondary" type="button" onclick="resumeStalledPublication_()">Resume from saved checkpoint</button></div>'
+          : '');
+      document.getElementById('importButton').disabled = Boolean(status.recoverable);
+      return;
+    }
+    if (!status.running && campaign.running && campaign.stalled) {
+      banner.classList.remove('hidden', 'app-error');
+      banner.classList.add('error');
+      banner.innerHTML = '<span>Data is published, but Slack preparation stopped at ' +
+        formatNumber(campaign.completed || 0) + ' of ' + formatNumber(campaign.total || 0) +
+        ' assets. Existing drafts are safe and will not be duplicated.</span> ' +
+        '<button class="button secondary" type="button" onclick="resumeStalledNotificationCampaign_()">Resume Slack preparation</button>';
+      document.getElementById('importButton').disabled = true;
+      return;
+    }
+    if (!status.running && campaign.running) {
+      banner.classList.remove('hidden', 'error', 'app-error');
+      const campaignPhase = cleanClientText_(campaign.phase).toUpperCase();
+      const campaignText = campaignPhase === 'DRAFTING'
+        ? 'Data is published. Preparing one consolidated Slack message per owner: ' +
+          formatNumber(campaign.completed || 0) + ' of ' + formatNumber(campaign.total || 0) + ' assets staged.'
+        : 'Data is published. Sending one consolidated Slack message per owner: ' +
+          formatNumber(campaign.ownerMessagesDelivered || 0) + ' of ' + formatNumber(campaign.ownerMessagesTotal || 0) +
+          ' owner messages completed, covering ' + formatNumber(campaign.delivered || 0) + ' assets' +
+          (campaign.failed ? ', ' + formatNumber(campaign.failed) + ' needing attention' : '') + '.';
+      if (cleanClientText_(campaign.status).toUpperCase() === 'RETRYING') {
+        banner.innerHTML = '<span>' + escapeHtml(campaignText) + '</span> ' +
+          '<button class="button secondary" type="button" onclick="resumeStalledNotificationCampaign_()">Run next Slack checkpoint now</button>';
+      } else {
+        banner.textContent = campaignText;
+      }
+      document.getElementById('importButton').disabled = true;
+      return;
+    }
+    if (!status.running && ['PAUSED', 'COMPLETED_WITH_ERRORS'].indexOf(cleanClientText_(campaign.status).toUpperCase()) !== -1) {
+      const slackEnabled = Boolean(state.config && state.config.integrations && state.config.integrations.slack && state.config.integrations.slack.enabled);
+      banner.classList.remove('hidden', 'app-error');
+      banner.classList.add('error');
+      banner.innerHTML = '<span>Data is published. Slack delivery is ' + (campaign.status === 'PAUSED' ? 'paused' : 'complete with errors') + ': ' +
+        formatNumber(campaign.completed || 0) + ' of ' + formatNumber(campaign.total || 0) + ' processed, ' +
+        formatNumber(campaign.delivered || 0) + ' delivered, ' + formatNumber(campaign.failed || 0) + ' needing attention.</span>' +
+        (slackEnabled ? ' <button class="button secondary" type="button" onclick="resumeStalledNotificationCampaign_()">Resume from saved checkpoint</button>' : ' <span>Enable Slack notifications after correcting the workflow payload to retry.</span>');
+      document.getElementById('importButton').disabled = true;
+      return;
+    }
+    if (!status.running) {
+      banner.classList.add('hidden');
+      banner.classList.remove('error');
+      document.getElementById('importButton').disabled = false;
+      return;
+    }
     banner.classList.remove('hidden');
-    banner.textContent = 'Intake ' + status.phase.toLowerCase() + ': ' + formatNumber(status.completed) + ' / ' + formatNumber(status.total) + ' (' + status.percent + '%). ' + (status.message || '');
+    banner.classList.toggle('error', Boolean(status.stalled));
+    const phase = publicationPhase;
+    const statusText = phase === 'IMPORT'
+      ? 'Intake evaluating source rows: ' + formatNumber(status.completed) + ' / ' + formatNumber(status.total) + ' (' + status.percent + '%). ' + (status.message || '')
+      : phase === 'PREPARE_FINALIZE' || phase === 'FINALIZE'
+        ? 'Intake finalizing: all ' + formatNumber(status.total) + ' source rows evaluated. ' + (status.message || '')
+        : 'Intake publication is starting. ' + (status.message || '');
+    if (status.stalled) {
+      banner.innerHTML = '<div class="app-error-copy"><strong>Publication appears stalled</strong><span>' +
+        escapeHtml(statusText) + '</span></div><div class="app-error-actions"><button class="button secondary" type="button" onclick="resumeStalledPublication_()">Resume from checkpoint</button>' +
+        '<button class="button subtle" type="button" onclick="cancelStalledPublication_()">Clear stalled state</button></div>';
+      banner.classList.add('app-error');
+    } else {
+      banner.classList.remove('app-error');
+      banner.textContent = statusText;
+    }
+  }
+
+  function retryImportNotificationCampaign_() {
+    confirmAction({
+      title: 'Retry Slack delivery',
+      message: 'Retry failed and unprocessed notification candidates without republishing asset data?',
+      detail: 'Already-sent notification records are idempotent and will not be duplicated.',
+      confirmLabel: 'Retry delivery'
+    }, function () {
+      const loadingToken = beginServerLoading_('Restarting Slack delivery', 'Queueing failed and unprocessed notification candidates…', true);
+      google.script.run.withSuccessHandler(function (status) {
+        endServerLoading_(loadingToken);
+        showToast('Slack delivery retry queued.');
+        renderImportStatus({ running: false, notificationCampaign: status });
+        startPolling(false);
+      }).withFailureHandler(function (error) {
+        endServerLoading_(loadingToken);
+        showToast(error.message || String(error), true);
+      }).retryImportNotificationCampaign();
+    });
+  }
+
+  function resumeStalledNotificationCampaign_() {
+    const loadingToken = beginServerLoading_('Resuming Slack preparation', 'Continuing from the latest saved notification checkpoint…', true);
+    google.script.run.withSuccessHandler(function (campaign) {
+      endServerLoading_(loadingToken);
+      showToast('Slack preparation resumed from the saved checkpoint.');
+      renderImportStatus({ running: false, notificationCampaign: campaign });
+      startPolling(false);
+    }).withFailureHandler(function (error) {
+      endServerLoading_(loadingToken);
+      showToast(error.message || String(error), true);
+    }).resumeStalledImportNotificationCampaign();
+  }
+
+  function resumeStalledPublication_() {
+    const loadingToken = beginServerLoading_('Resuming publication', 'Restarting from the latest completed checkpoint…', true);
+    google.script.run.withSuccessHandler(function (status) {
+      endServerLoading_(loadingToken);
+      renderImportStatus(status);
+      showToast('Publication continuation queued from the latest checkpoint.');
+      startPolling(false);
+    }).withFailureHandler(function (error) {
+      endServerLoading_(loadingToken);
+      showToast(error.message || String(error), true);
+    }).resumeSnowflakeImport();
+  }
+
+  function cancelStalledPublication_() {
+    showConfirmation({
+      title: 'Clear stalled publication',
+      message: 'Stop the stalled publication state and return control to the application?',
+      detail: 'Already published asset data will remain in place. Unfinished Slack notifications will not be retried automatically.',
+      confirmLabel: 'Clear stalled state',
+      confirmClass: 'danger',
+      iconClass: 'red'
+    }, function () {
+      const loadingToken = beginServerLoading_('Clearing stalled publication', 'Stopping continuation triggers and clearing the stale job state…', true);
+      google.script.run.withSuccessHandler(function (status) {
+        endServerLoading_(loadingToken);
+        clearTimeout(state.poller);
+        state.poller = null;
+        state.publicationOverlayDismissed = false;
+        hideWorkflowLoading_();
+        renderImportStatus(status);
+        loadDashboard(1);
+        showToast('The stalled publication state was cleared. Published asset data was retained.');
+      }).withFailureHandler(function (error) {
+        endServerLoading_(loadingToken);
+        showToast(error.message || String(error), true);
+      }).cancelSnowflakeImport();
+    });
   }
 
   function saveSettings() {
@@ -2302,13 +2751,13 @@
     });
   }
 
-  function badge(value) { const v = String(value || 'UNKNOWN'); const color = /COVERED|READY|EXEMPT|DISMISSED|ACTIVE|RESTORED/.test(v) ? 'green' : /STALE|DETECTED|PENDING|CONFIGURED|DRAFT|ORPHANED|CONTESTED/.test(v) ? 'amber' : /PURGE|PURGED|BLOCKED|FAILED|NO_SLACK/.test(v) ? 'red' : /NOTIFIED|ACCEPTED|QUARANTINED|RESTRICTED/.test(v) ? 'blue' : 'gray'; return '<span class="badge ' + color + '">' + escapeHtml(v) + '</span>'; }
+  function badge(value) { const v = String(value || 'UNKNOWN'); const color = /COVERED|KNOWN|READY|EXEMPT|DISMISSED|ACTIVE|RESTORED/.test(v) ? 'green' : /STALE|DETECTED|PENDING|CONFIGURED|DRAFT|ORPHANED|CONTESTED/.test(v) ? 'amber' : /PURGE|PURGED|BLOCKED|FAILED|NO_SLACK/.test(v) ? 'red' : /NOTIFIED|ACCEPTED|QUARANTINED|RESTRICTED/.test(v) ? 'blue' : 'gray'; return '<span class="badge ' + color + '">' + escapeHtml(v) + '</span>'; }
   function mainTableLifecycleBadge_(value) { const v = String(value || 'UNKNOWN'); return v === 'ACCEPTED' ? '<span class="badge green">ACCEPTED</span>' : badge(v); }
   function dashboardStatusDescription_(type, value) {
     const status = String(value || 'UNKNOWN').toUpperCase();
     const assetDescriptions = {
-      STALE: 'Activity exceeds the configured inactivity threshold.',
-      ACTIVE: 'Recent qualifying activity is present.',
+      STALE: 'No qualifying read exists inside the configured threshold.',
+      ACTIVE: 'Recent qualifying read activity is present.',
       QUARANTINED: 'Platform access is restricted but recoverable.',
       PURGED: 'Deletion was verified in a complete import.',
       UNKNOWN: 'The current source condition is unavailable.'
@@ -2326,7 +2775,7 @@
       SELF_PURGE_PENDING: 'Owner will delete it; awaiting absence verification.',
       RESTORED: 'Access or lifecycle status was restored.',
       PURGED: 'Absence verified and the lifecycle case is complete.',
-      ACTIVE: 'Previously managed asset now has qualifying activity.',
+      ACTIVE: 'Previously managed asset now has qualifying read activity.',
       EXCLUDED: 'Policy excludes this record from lifecycle action.',
       UNKNOWN: 'The lifecycle position is unavailable.'
     };

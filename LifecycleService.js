@@ -131,6 +131,7 @@ function adminChangeLifecycleStatus(input) {
   const changedAt = nowIso_();
   if (targetState === APP.lifecycle.detected) {
     updatedCase.T0 = '';
+    updatedCase.NOTICE_DUE_AT = '';
     updatedCase.NOTIFIED_AT = '';
     updatedCase.CONTEST_DEADLINE = '';
     updatedCase.RESTRICT_AT = '';
@@ -139,6 +140,7 @@ function adminChangeLifecycleStatus(input) {
     updatedCase.PURGE_ELIGIBLE_DATE = '';
   } else if (targetState === APP.lifecycle.notified) {
     updatedCase.T0 = changedAt;
+    updatedCase.NOTICE_DUE_AT = changedAt;
     updatedCase.NOTIFIED_AT = changedAt;
     updatedCase.CONTEST_DEADLINE = addDaysIso_(changedAt, configNumber_('CONTEST_WINDOW_DAYS', 9));
     updatedCase.RESTRICT_AT = '';

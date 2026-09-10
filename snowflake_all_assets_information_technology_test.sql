@@ -1,10 +1,10 @@
-/*******************************************************************************
- * Snowflake Stale-Asset Export — Table Grain with Ownership Details
+/*************************************************************sti******************
+ * Snowflake All-Asset Test Export — Information Technology L1 Domain
  *
  * Purpose:
- *   Produce one row per in-scope Snowflake table with activity signals,
- *   preliminary staleness flags, and the underlying ownership attributes needed
- *   for governance validation and notification routing.
+ *   Produce one row per in-scope Snowflake table assigned to the L1 domain
+ *   Information Technology. This query intentionally does not filter on activity
+ *   or staleness; the application evaluates lifecycle state from the complete feed.
  *
  * Ownership output:
  *   - SNOWFLAKE_TABLE_OWNER: native Snowflake table owner
@@ -33,33 +33,6 @@ WITH tbls AS (
         last_altered
     FROM snowflake_ops.account_usage.tables
     WHERE deleted IS NULL
-      AND (
-            table_catalog IN (
-                'EDW_PRD',
-                'EDW_ODS_PRD',
-                'EDW_HERITAGE_PRD',
-                'EDW_DM_PRD',
-                'EDW_DM_FI_PRD',
-                'EDW_DM_ES_PRD',
-                'SSE_DM_TAB_DE_PRD',
-                'SSE_DM_REWS_PRD',
-                'SSE_DM_FIN_PRD',
-                'SSE_DM_GBSO_PRD',
-                'SSE_DM_BTINF_PRD',
-                'SSE_DM_ES_PRD'
-            )
-            OR (
-                table_catalog = 'EDH_PRD'
-                AND table_schema = 'SHARED'
-                AND (
-                    table_name LIKE 'XACTLY%'
-                    OR table_name LIKE 'COUPA%'
-                    OR table_name LIKE 'WORKDAY%'
-                    OR table_name LIKE 'BUDGETFORCE%'
-                    OR table_name LIKE 'FINANCEFORCE%'
-                )
-            )
-      )
 ),
 
 scoped_tags AS (
@@ -86,33 +59,6 @@ scoped_tags AS (
     FROM snowflake_ops.account_usage.tag_references tr
     WHERE tr.object_deleted IS NULL
       AND tr.column_name IS NULL
-      AND (
-            tr.object_database IN (
-                'EDW_PRD',
-                'EDW_ODS_PRD',
-                'EDW_HERITAGE_PRD',
-                'EDW_DM_PRD',
-                'EDW_DM_FI_PRD',
-                'EDW_DM_ES_PRD',
-                'SSE_DM_TAB_DE_PRD',
-                'SSE_DM_REWS_PRD',
-                'SSE_DM_FIN_PRD',
-                'SSE_DM_GBSO_PRD',
-                'SSE_DM_BTINF_PRD',
-                'SSE_DM_ES_PRD'
-            )
-            OR (
-                tr.object_database = 'EDH_PRD'
-                AND tr.object_schema = 'SHARED'
-                AND (
-                    tr.object_name LIKE 'XACTLY%'
-                    OR tr.object_name LIKE 'COUPA%'
-                    OR tr.object_name LIKE 'WORKDAY%'
-                    OR tr.object_name LIKE 'BUDGETFORCE%'
-                    OR tr.object_name LIKE 'FINANCEFORCE%'
-                )
-            )
-      )
 ),
 
 tags AS (
@@ -148,7 +94,8 @@ tags AS (
 ),
 
 access_activity AS (
-    -- Last read and write per table from ACCESS_HISTORY.
+    -- Last read and write per table from ACCESS_HISTORY. Reads include both
+    -- underlying/base access and direct access so views are evaluated correctly.
     SELECT
         f.value:objectName::string AS object_fqn,
         MAX(ah.query_start_time)   AS last_touched,
@@ -156,7 +103,19 @@ access_activity AS (
     FROM snowflake_ops.account_usage.access_history ah,
          LATERAL FLATTEN(input => ah.base_objects_accessed) f
     WHERE ah.query_start_time >= DATEADD(day, -365, CURRENT_TIMESTAMP())
-      AND f.value:objectDomain::string = 'Table'
+      AND f.value:objectDomain::string IN ('Table', 'View')
+    GROUP BY 1
+
+    UNION ALL
+
+    SELECT
+        f.value:objectName::string AS object_fqn,
+        MAX(ah.query_start_time)   AS last_touched,
+        'READ'                     AS activity
+    FROM snowflake_ops.account_usage.access_history ah,
+         LATERAL FLATTEN(input => ah.direct_objects_accessed) f
+    WHERE ah.query_start_time >= DATEADD(day, -365, CURRENT_TIMESTAMP())
+      AND f.value:objectDomain::string IN ('Table', 'View')
     GROUP BY 1
 
     UNION ALL
@@ -168,7 +127,7 @@ access_activity AS (
     FROM snowflake_ops.account_usage.access_history ah,
          LATERAL FLATTEN(input => ah.objects_modified) f
     WHERE ah.query_start_time >= DATEADD(day, -365, CURRENT_TIMESTAMP())
-      AND f.value:objectDomain::string = 'Table'
+      AND f.value:objectDomain::string IN ('Table', 'View')
     GROUP BY 1
 ),
 
@@ -262,6 +221,21 @@ joined AS (
       ON l.database_name = t.database_name
      AND l.schema_name   = t.schema_name
      AND l.table_name    = t.table_name
+
+    -- Test scope only: retain every table tagged to the Information Technology
+    -- L1 domain. EXISTS handles assets that carry more than one DOMAIN tag.
+    WHERE EXISTS (
+        SELECT 1
+        FROM scoped_tags domain_tag
+        WHERE domain_tag.object_database = t.database_name
+          AND domain_tag.object_schema   = t.schema_name
+          AND domain_tag.object_name     = t.table_name
+          AND domain_tag.canonical_tag   = 'DOMAIN'
+          AND (
+                UPPER(TRIM(domain_tag.tag_value)) = 'INFORMATION TECHNOLOGY'
+                OR UPPER(TRIM(domain_tag.tag_value)) LIKE 'INFORMATION TECHNOLOGY.%'
+          )
+    )
 )
 
 SELECT
@@ -292,20 +266,25 @@ SELECT
     last_load,
     last_altered,
 
-    -- Preliminary usage-based staleness evaluation.
+    -- LAST_ACTIVITY_TS remains operational context. Staleness is based only on
+    -- qualifying reads; writes, loads, and DDL changes do not reset the clock.
     last_activity_ts,
-    DATEDIFF(day, last_activity_ts, CURRENT_TIMESTAMP()) AS days_since_activity,
+    DATEDIFF(day, last_read, CURRENT_TIMESTAMP()) AS days_since_activity,
     (
-        last_activity_ts IS NULL
-        OR DATEDIFF(day, last_activity_ts, CURRENT_TIMESTAMP()) >= 90
+        last_read IS NULL
+        OR DATEDIFF(day, last_read, CURRENT_TIMESTAMP()) >= 30
+    ) AS is_stale_30,
+    (
+        last_read IS NULL
+        OR DATEDIFF(day, last_read, CURRENT_TIMESTAMP()) >= 90
     ) AS is_stale_90,
     (
-        last_activity_ts IS NULL
-        OR DATEDIFF(day, last_activity_ts, CURRENT_TIMESTAMP()) >= 180
+        last_read IS NULL
+        OR DATEDIFF(day, last_read, CURRENT_TIMESTAMP()) >= 180
     ) AS is_stale_180,
     (
-        last_activity_ts IS NULL
-        OR DATEDIFF(day, last_activity_ts, CURRENT_TIMESTAMP()) >= 365
+        last_read IS NULL
+        OR DATEDIFF(day, last_read, CURRENT_TIMESTAMP()) >= 365
     ) AS is_stale_365,
 
     CURRENT_TIMESTAMP() AS source_snapshot_at
