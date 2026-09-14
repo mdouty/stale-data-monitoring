@@ -106,7 +106,16 @@ function createNotificationDrafts(input) {
 }
 
 function createAndSendNotificationGroups_(assetIds, notificationType, skipLock) {
+  if (skipLock) return createAndSendNotificationGroupsLocked_(assetIds, notificationType);
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) throw new Error('Another consolidated Slack delivery is in progress. Try again shortly.');
+  try { return createAndSendNotificationGroupsLocked_(assetIds, notificationType); }
+  finally { lock.releaseLock(); }
+}
+
+function createAndSendNotificationGroupsLocked_(assetIds, notificationType) {
   const profile = assertEnvironmentWritable_();
+  recoverPendingSynchronousDelivery_();
   const type = normalizeSlackMessageType_(notificationType);
   const ids = Array.from(new Set((assetIds || []).map(cleanText_).filter(Boolean)));
   if (!ids.length) return { assetCount: 0, groupCount: 0, messageType: type, batches: [] };
@@ -147,10 +156,7 @@ function createAndSendNotificationGroups_(assetIds, notificationType, skipLock) 
       errors: errors
     };
   }
-  if (skipLock) return deliverGroups();
-  const lock = LockService.getScriptLock();
-  if (!lock.tryLock(30000)) throw new Error('Another consolidated Slack delivery is in progress. Try again shortly.');
-  try { return deliverGroups(); } finally { lock.releaseLock(); }
+  return deliverGroups();
 }
 
 function createNotificationDraftBatch_(assetIds, messageType) {
@@ -295,26 +301,10 @@ function sendPreparedNotificationOwnerGroup_(records, messageType, recipient) {
   if (profile.key === 'DEV' && profile.recipientAllowlist.length && profile.recipientAllowlist.indexOf(target) === -1) {
     throw new Error('DEV recipient allowlist blocked this notification. Allowed recipients: ' + profile.recipientAllowlist.join(', ') + '.');
   }
-  const batchId = uuid_();
-  const response = UrlFetchApp.fetch(url, {
-    method: 'post', contentType: 'application/json', payload: JSON.stringify(payload), muteHttpExceptions: true
-  });
-  const responseCode = response.getResponseCode();
-  if (responseCode < 200 || responseCode >= 300) {
-    throw new Error('Slack webhook returned HTTP ' + responseCode + ': ' + response.getContentText().substring(0, 500));
-  }
-  return {
-    batchId: batchId,
-    sentAt: nowIso_(),
-    responseCode: responseCode,
-    recipient: target,
-    messageType: type,
-    assetCount: selected.length,
-    messagePreview: buildNotificationPreview_(payload)
-  };
+  return deliverSlackPayloadOnce_(selected, type, target, payload, url);
 }
 
-function finalizeNotificationOwnerGroupChunk_(records, receipt) {
+function finalizeNotificationOwnerGroupChunk_(records, receipt, plan) {
   const delivery = receipt || {};
   const messageType = normalizeSlackMessageType_(delivery.messageType);
   const items = prepareNotificationBatchItems_(records || [], messageType);
@@ -339,9 +329,14 @@ function finalizeNotificationOwnerGroupChunk_(records, receipt) {
       messageType: messageType, primaryRecipient: delivery.recipient, responseCode: delivery.responseCode
     }));
   });
-  updateObjectsByKey_(APP.sheets.notifications, 'NOTIFICATION_ID', sentRecords);
-  appendRawRows_(APP.sheets.events, sentEvents);
-  if (messageType === 'STALE_ASSET_NOTICE') markInitialNotificationBatchNotified_(items, delivery.batchId, actor);
+  if (plan) {
+    planUpdateObjects_(plan, APP.sheets.notifications, 'NOTIFICATION_ID', sentRecords);
+    planAppendRows_(plan, APP.sheets.events, sentEvents);
+  } else {
+    updateObjectsByKey_(APP.sheets.notifications, 'NOTIFICATION_ID', sentRecords);
+    appendRawRows_(APP.sheets.events, sentEvents);
+  }
+  if (messageType === 'STALE_ASSET_NOTICE') markInitialNotificationBatchNotified_(items, delivery.batchId, actor, plan);
   return sentRecords.length;
 }
 
@@ -359,10 +354,20 @@ function sendNotification(notificationId) {
 }
 
 function sendNotificationBatchInternal_(notificationId, profile, actorContext, allowedNotificationIds) {
+  if (!actorContext) recoverPendingSynchronousDelivery_();
+  const completedKey = reliabilityProperty_('SynchronousDeliveryCompleted');
+  const saved = PropertiesService.getScriptProperties().getProperty(completedKey) === notificationId
+    ? null : readDurablePayload_('SynchronousDelivery', notificationId);
+  if (saved && !actorContext) { applyDurableWrites_(saved.writes); PropertiesService.getScriptProperties().setProperty(completedKey, notificationId); return saved.result; }
   const found = findObjectRow_(APP.sheets.notifications, 'NOTIFICATION_ID', notificationId);
   if (!found) throw new Error('Notification draft not found.');
   const selected = found.value;
-  if (actorContext) assertAssetResponseAuthorization_(selected.ASSET_ID);
+  if (actorContext) {
+    assertAssetResponseAuthorization_(selected.ASSET_ID);
+    const recovered = recoverPendingSynchronousDelivery_();
+    if (recovered && recovered.NOTIFICATION_ID === notificationId) return recovered;
+  }
+  if (saved) { applyDurableWrites_(saved.writes); PropertiesService.getScriptProperties().setProperty(completedKey, notificationId); return saved.result; }
   if (cleanText_(selected.STATUS).toUpperCase() === 'SENT') return selected;
   if (!configBoolean_('SLACK_NOTIFICATIONS_ENABLED', false)) {
     throw new Error('Slack notifications are disabled in Config. The drafts were retained.');
@@ -408,23 +413,16 @@ function sendNotificationBatchInternal_(notificationId, profile, actorContext, a
   if (profile.key === 'DEV' && profile.recipientAllowlist.length && profile.recipientAllowlist.indexOf(cleanText_(payload.primaryRecipient).toLowerCase()) === -1) {
     throw new Error('DEV recipient allowlist blocked this notification. Allowed recipients: ' + profile.recipientAllowlist.join(', ') + '.');
   }
-  const batchId = cleanText_(selected.BATCH_ID) || uuid_();
-  let response;
-  let responseCode = '';
+  let receipt;
   try {
-    response = UrlFetchApp.fetch(url, {
-      method: 'post', contentType: 'application/json', payload: JSON.stringify(payload), muteHttpExceptions: true
-    });
-    responseCode = response.getResponseCode();
-    if (responseCode < 200 || responseCode >= 300) {
-      throw new Error('Slack webhook returned HTTP ' + responseCode + ': ' + response.getContentText().substring(0, 500));
-    }
+    receipt = deliverSlackPayloadOnce_(batchItems.map(function (item) { return item.record; }), messageType, recipient, payload, url);
   } catch (error) {
-    markNotificationBatchFailed_(batchItems, batchId, responseCode, error);
+    markNotificationBatchFailed_(batchItems, cleanText_(selected.BATCH_ID), '', error);
     throw error;
   }
-
-  const sentAt = nowIso_();
+  const batchId = receipt.batchId;
+  const responseCode = receipt.responseCode;
+  const sentAt = receipt.sentAt;
   const actor = getCurrentUserEmail_() || 'SYSTEM';
   const sentEvents = [];
   const sentRecords = [];
@@ -445,21 +443,16 @@ function sendNotificationBatchInternal_(notificationId, profile, actorContext, a
       messageType: messageType, primaryRecipient: recipient, responseCode: responseCode
     }));
   });
-  updateObjectsByKey_(APP.sheets.notifications, 'NOTIFICATION_ID', sentRecords);
-  appendRawRows_(APP.sheets.events, sentEvents);
-
-  if (messageType === 'STALE_ASSET_NOTICE') {
-    try {
-      markInitialNotificationBatchNotified_(batchItems, batchId, actor);
-    } catch (error) {
-      appendRawRows_(APP.sheets.events, batchItems.map(function (item) {
-        return notificationEventRow_(item.record, 'NOTIFICATION_POST_SEND_TRANSITION_FAILED', item.detail.caseRecord.STATE, item.detail.caseRecord.STATE, actor, {
-          batchId: batchId, error: String(error.message || error).substring(0, 500)
-        });
-      }));
-    }
-  }
-  return Object.assign({}, selected, { STATUS: 'SENT', BATCH_ID: batchId, BATCH_SIZE: batchItems.length, SENT_AT: sentAt, RESPONSE_CODE: responseCode });
+  const plan = newDurableWritePlan_();
+  planUpdateObjects_(plan, APP.sheets.notifications, 'NOTIFICATION_ID', sentRecords);
+  planAppendRows_(plan, APP.sheets.events, sentEvents);
+  if (messageType === 'STALE_ASSET_NOTICE') markInitialNotificationBatchNotified_(batchItems, batchId, actor, plan);
+  const result = Object.assign({}, selected, { STATUS: 'SENT', BATCH_ID: batchId, BATCH_SIZE: batchItems.length, SENT_AT: sentAt, RESPONSE_CODE: responseCode });
+  const checkpoint = { writes: plan.writes, result: result };
+  saveDurablePayload_('SynchronousDelivery', notificationId, checkpoint);
+  applyDurableWrites_(checkpoint.writes);
+  PropertiesService.getScriptProperties().setProperty(completedKey, notificationId);
+  return result;
 }
 
 function prepareNotificationBatchItems_(records, messageType) {
@@ -509,7 +502,7 @@ function markNotificationBatchFailed_(items, batchId, responseCode, error) {
   appendRawRows_(APP.sheets.events, failedEvents);
 }
 
-function markInitialNotificationBatchNotified_(items, batchId, actor) {
+function markInitialNotificationBatchNotified_(items, batchId, actor, plan) {
   const now = nowIso_();
   const contestDeadline = addDaysIso_(now, configNumber_('CONTEST_WINDOW_DAYS', 9));
   const cases = [];
@@ -536,9 +529,15 @@ function markInitialNotificationBatchNotified_(items, batchId, actor) {
       batchId: batchId, notes: 'Consolidated Slack stale-data notice sent.'
     }));
   });
-  updateObjectsByKey_(APP.sheets.cases, 'CASE_ID', cases);
-  updateObjectsByKey_(APP.sheets.assetsCurrent, 'ASSET_ID', assets);
-  appendRawRows_(APP.sheets.events, events);
+  if (plan) {
+    planUpdateObjects_(plan, APP.sheets.cases, 'CASE_ID', cases);
+    planUpdateObjects_(plan, APP.sheets.assetsCurrent, 'ASSET_ID', assets);
+    planAppendRows_(plan, APP.sheets.events, events);
+  } else {
+    updateObjectsByKey_(APP.sheets.cases, 'CASE_ID', cases);
+    updateObjectsByKey_(APP.sheets.assetsCurrent, 'ASSET_ID', assets);
+    appendRawRows_(APP.sheets.events, events);
+  }
 }
 
 function notificationEventRow_(record, eventType, fromState, toState, actor, details) {

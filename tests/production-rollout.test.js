@@ -199,7 +199,8 @@ function context(values) {
   assert(source.includes("scheduleImportContinuation_(7 * 60 * 1000)"));
   assert(source.includes("stage: 'APPROVE_CANDIDATES'"));
   assert(source.includes("checkpoint.stage = 'RECONCILE'"));
-  assert(source.includes("checkpoint.stage = 'REFRESH_DASHBOARD'"));
+  assert(source.includes("result.stage = 'REFRESH_DASHBOARD'"));
+  assert(source.includes('Object.assign(checkpoint, saved.result)'));
   assert(source.includes("checkpoint.stage = 'NOTIFICATIONS'"));
   assert(source.includes("checkpoint.stage = 'COMPLETE'"));
   assert(source.includes("clearImportState_(state.environment)"));
@@ -224,7 +225,7 @@ function context(values) {
 }
 
 {
-  const resume = extractFunction('SnowflakeAdapter.js', 'resumeSnowflakeImport');
+  const resume = extractFunction('SnowflakeAdapter.js', 'resumeSnowflakeImportLocked_');
   const recover = extractFunction('SnowflakeAdapter.js', 'recoverFailedFinalizationState_');
   const fail = extractFunction('SnowflakeAdapter.js', 'failSnowflakeImport_');
   const status = extractFunction('SnowflakeAdapter.js', 'getImportStatus');
@@ -331,7 +332,7 @@ function context(values) {
 }
 
 {
-  const campaign = extractFunction('SnowflakeAdapter.js', 'continueImportNotificationCampaign');
+  const campaign = extractFunction('SnowflakeAdapter.js', 'continueImportNotificationCampaignLocked_');
   const queue = extractFunction('SnowflakeAdapter.js', 'queueImportNotificationCampaign_');
   assert(campaign.includes("state.phase === 'DRAFTING'"));
   assert(campaign.includes("state.phase === 'DELIVERING'"));
@@ -349,7 +350,7 @@ function context(values) {
 
 {
   const source = fs.readFileSync(path.join(root, 'Client.html'), 'utf8');
-  const resume = extractFunction('SnowflakeAdapter.js', 'resumeSnowflakeImport');
+  const resume = extractFunction('SnowflakeAdapter.js', 'resumeSnowflakeImportLocked_');
   assert(source.includes('Resume from checkpoint'));
   assert(source.includes('.resumeSnowflakeImport()'));
   assert(resume.includes('scheduleImportContinuation_(10000)'));
@@ -361,7 +362,7 @@ function context(values) {
 
 {
   const status = extractFunction('SnowflakeAdapter.js', 'getImportNotificationCampaignStatus_');
-  const selfHealing = extractFunction('SnowflakeAdapter.js', 'getSelfHealingImportNotificationCampaignStatus_');
+  const selfHealing = extractFunction('SnowflakeAdapter.js', 'healImportNotificationCampaignStatus_');
   assert(status.includes("['PAUSED', 'COMPLETED_WITH_ERRORS', 'SUCCEEDED']"));
   assert(status.includes("deleteProperty(importNotificationCampaignProperty_(state.environment))"));
   assert(status.includes('stalledForMs > 5 * 60 * 1000'));
@@ -371,11 +372,11 @@ function context(values) {
 
 {
   const scheduler = extractFunction('SnowflakeAdapter.js', 'scheduleImportNotificationCampaign_');
-  const resume = extractFunction('SnowflakeAdapter.js', 'resumeStalledImportNotificationCampaign');
+  const resume = extractFunction('SnowflakeAdapter.js', 'resumeStalledImportNotificationCampaignLocked_');
   assert(scheduler.indexOf('.create()') < scheduler.indexOf('ScriptApp.getProjectTriggers()'));
   assert(scheduler.includes('trigger.getUniqueId() !== replacementId'));
   assert(resume.includes("state.status = 'RETRYING'"));
-  assert(resume.includes('return continueImportNotificationCampaign(profile.key)'));
+  assert(resume.includes('return continueImportNotificationCampaignLocked_(profile.key)'));
 }
 
 {

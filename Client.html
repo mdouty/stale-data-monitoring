@@ -74,6 +74,7 @@
       startPolling(false);
     } else {
       state.publicationOverlayDismissed = false;
+      if (canImport && !config.importStatus.recoverable) recoverStagedIntake_();
     }
   }
 
@@ -1886,26 +1887,58 @@
     clearAppErrorBanner_();
     banner.classList.add('hidden');
     banner.classList.remove('error');
+    document.getElementById('uploadRequestId').value = Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+    const uploadRequestId = document.getElementById('uploadRequestId').value;
+    state.activeUploadRequestId = uploadRequestId;
     startUploadProgress_(file);
     google.script.run.withSuccessHandler(function (staged) {
       stopUploadProgress_();
       state.intakePreparation = Object.assign({}, staged, { running: true, clientStartedAt: Date.now() });
       state.intakeReviewOverlayDismissed = false;
       renderIntakeReviewPreparation_(state.intakePreparation);
-      google.script.run.withSuccessHandler(function (review) {
-        handleIntakeReviewPreparationStatus_(review);
-      }).withFailureHandler(function (error) {
-        failIntakeReviewPreparation_(error);
-      }).prepareSnowflakeIntakeReview({ token: staged.token });
-    }).withFailureHandler(function (error) {
+      // Staging also queues review preparation, so a lost response cannot strand it.
+      recoverStagedIntake_(uploadRequestId);
+    }).withFailureHandler(function () {
       stopUploadProgress_();
-      button.disabled = false;
-      hideWorkflowLoading_();
-      banner.classList.remove('hidden');
-      banner.classList.add('error');
-      banner.textContent = error.message || String(error);
-      showToast(error.message || String(error), true);
+      recoverStagedIntake_(uploadRequestId, 0);
     }).stageSnowflakeCsvUpload(document.getElementById('intakeUploadForm'));
+  }
+
+  function recoverStagedIntake_(uploadRequestId, attempt) {
+    const retry = Number(attempt || 0);
+    const environment = state.config && state.config.environment.key;
+    const current = function () { return environment === (state.config && state.config.environment.key) &&
+      (!state.activeUploadRequestId || state.activeUploadRequestId === uploadRequestId); };
+    google.script.run.withSuccessHandler(function (status) {
+      if (!current()) return;
+      if (status) {
+        state.activeUploadRequestId = null;
+        state.intakePreparation = Object.assign({}, status, { clientStartedAt: Date.now() });
+        handleIntakeReviewPreparationStatus_(status);
+        return;
+      }
+      if (uploadRequestId && retry < 6) {
+        state.intakeReviewPoller = setTimeout(function () { recoverStagedIntake_(uploadRequestId, retry + 1); }, 5000);
+        return;
+      }
+      if (uploadRequestId) {
+        hideWorkflowLoading_();
+        document.getElementById('importButton').disabled = false;
+        showToast('The upload could not be confirmed. Reopen the app to check for a staged review before uploading again.', true);
+      }
+    }).withFailureHandler(function () {
+      if (!current() || !uploadRequestId) return;
+      showWorkflowLoading_('Reconnecting', 'Checking whether the upload was saved. Review preparation continues if staging completed.', { indeterminate: true, stage: 'Waiting for connection', dismissible: true });
+      state.intakeReviewPoller = setTimeout(function () { recoverStagedIntake_(uploadRequestId, retry + 1); }, 5000);
+    }).recoverSnowflakeIntake({ uploadRequestId: uploadRequestId || '' });
+  }
+
+  function resumeIntakeReview_() {
+    const pending = state.intakePreparation;
+    if (!pending) return;
+    google.script.run.withSuccessHandler(handleIntakeReviewPreparationStatus_).withFailureHandler(function (error) {
+      showToast(error.message || String(error), true);
+    }).resumeSnowflakeIntakeReview({ token: pending.token });
   }
 
   function renderIntakeReviewPreparation_(status) {
@@ -1919,10 +1952,10 @@
     const startedAt = current.startedAt ? new Date(current.startedAt).getTime() : Number(current.clientStartedAt || Date.now());
     const elapsedSeconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
     renderWorkflowLoading_('Preparing intake review', 'The CSV is safely staged. Review preparation is running independently, so you can continue using the application.', {
-      indeterminate: false,
-      percent: queued ? 2 : ((merging || reconciling) ? 99 : Number(current.percent || 0)),
+      indeterminate: queued || merging || reconciling,
+      percent: Number(current.percent || 0),
       stage: queued ? 'Queued for review' : (merging ? 'Assembling the completed review' : (reconciling ? 'Reconciling prior lifecycle records' :
-        'Evaluating source rows ' + formatNumber(current.processedRows || 0) + ' of ' + formatNumber(current.totalRows || current.sourceRows || 0))),
+        'Source evaluation · ' + formatNumber(current.processedRows || 0) + ' of ' + formatNumber(current.totalRows || current.sourceRows || 0))),
       details: [
         { label: 'File', value: current.fileName || '', wide: true },
         { label: 'Source rows staged', value: formatNumber(current.sourceRows || 0) },
@@ -1963,23 +1996,36 @@
   function pollIntakeReviewPreparation_() {
     const pending = state.intakePreparation;
     if (!pending || !pending.token) return;
-    google.script.run.withSuccessHandler(handleIntakeReviewPreparationStatus_).withFailureHandler(function (error) {
-      failIntakeReviewPreparation_(error);
-    }).continueSnowflakeIntakeReview({ token: pending.token });
+    if (!state.intakeAdvanceInFlight) {
+      state.intakeAdvanceInFlight = true;
+      const finished = function () { state.intakeAdvanceInFlight = false; };
+      google.script.run.withSuccessHandler(finished).withFailureHandler(finished)
+        .continueSnowflakeIntakeReview({ token: pending.token });
+    }
+    google.script.run.withSuccessHandler(function (status) {
+      if (!state.intakePreparation || state.intakePreparation.token !== pending.token) return;
+      handleIntakeReviewPreparationStatus_(status);
+    }).withFailureHandler(function () {
+      if (!state.intakePreparation || state.intakePreparation.token !== pending.token) return;
+      // A transport error does not mean the saved review failed.
+      if (!state.intakeReviewOverlayDismissed) renderWorkflowLoading_('Reconnecting', 'Review preparation can continue in the background. Checking the saved checkpoint when the connection returns.', { indeterminate: true, stage: 'Waiting for connection', dismissible: true });
+      state.intakeReviewPoller = setTimeout(pollIntakeReviewPreparation_, 5000);
+    }).getIntakeReviewPreparationStatus({ token: pending.token });
   }
 
   function failIntakeReviewPreparation_(error) {
     clearTimeout(state.intakeReviewPoller);
     state.intakeReviewPoller = null;
     const message = error && error.message ? error.message : String(error || 'Review preparation failed.');
+    if (state.intakePreparation) state.intakePreparation.running = false;
     const banner = document.getElementById('statusBanner');
     document.getElementById('importButton').disabled = false;
-    state.intakePreparation = null;
     state.intakeReviewOverlayDismissed = false;
     hideWorkflowLoading_();
     banner.classList.remove('hidden');
     banner.classList.add('error');
-    banner.textContent = 'The CSV was staged, but review preparation stopped: ' + message + ' Upload the file again to retry; nothing was published.';
+    banner.innerHTML = '<span>Review preparation paused: ' + escapeHtml(message) + '</span>' +
+      (state.intakePreparation ? ' <button class="button secondary" type="button" onclick="resumeIntakeReview_()">Resume saved review</button>' : '');
     showToast(message, true);
   }
 
@@ -1988,22 +2034,9 @@
     const startedAt = Date.now();
     const render = function () {
       const elapsedSeconds = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
-      let percent = 8;
-      let stage = 'Uploading CSV';
-      let message = 'Transferring the selected file securely to the DEV intake workspace…';
-      if (elapsedSeconds >= 2) {
-        percent = Math.min(34, 18 + elapsedSeconds * 2);
-        stage = 'Validating file structure';
-        message = 'Checking required columns, data types, and source rows…';
-      }
-      if (elapsedSeconds >= 7) {
-        percent = Math.min(88, 42 + Math.floor((elapsedSeconds - 7) * 1.5));
-        stage = 'Calculating lifecycle changes';
-        message = 'Comparing the upload with current assets and preparing the intake review…';
-      }
-      showWorkflowLoading_('Preparing data import', message, {
-        percent: percent,
-        stage: stage + ' · estimated progress',
+      showWorkflowLoading_('Preparing data import', 'Uploading, validating, and staging the CSV. Review calculations begin after staging completes.', {
+        indeterminate: true,
+        stage: 'Waiting for the staged upload to be confirmed',
         details: [
           { label: 'File', value: file.name, wide: true },
           { label: 'File size', value: formatFileSize(file.size) },
@@ -2441,7 +2474,7 @@
     button.textContent = 'Publishing…';
     showPublishingLoading_({ phase: 'STARTING', completed: 0, total: review.sourceRows, percent: 0 });
     const dismissedAssetIds = Object.keys(state.intakeReviewDismissed);
-    google.script.run.withSuccessHandler(function (status) {
+    const published = function (status) {
       state.intakeReview = null;
       state.intakeReviewRecords = [];
       state.intakeReviewSelection = {};
@@ -2456,14 +2489,23 @@
       } else {
         hideWorkflowLoading_();
         loadDashboard(1);
-        showToast('EDG review published successfully.');
+        showToast(status.phase === 'FAILED' ? 'Publication paused. Resume from the saved checkpoint.' : 'EDG review published successfully.', status.phase === 'FAILED');
       }
-    }).withFailureHandler(function (error) {
-      button.disabled = false;
-      button.textContent = 'Confirm & Publish';
-      hideWorkflowLoading_();
-      showToast(error.message || String(error), true);
-    }).confirmSnowflakeIntake({ token: review.token, dismissedAssetIds: dismissedAssetIds });
+    };
+    const recover = function (error) {
+      google.script.run.withSuccessHandler(function (status) {
+        if (status && status.pending) { setTimeout(function () { recover(error); }, 5000); return; }
+        if (status) { published(status); return; }
+        button.disabled = false;
+        button.textContent = 'Confirm & Publish';
+        hideWorkflowLoading_();
+        showToast(error.message || String(error), true);
+      }).withFailureHandler(function () {
+        showWorkflowLoading_('Reconnecting', 'Checking whether publication started. The approved review will not be submitted twice.', { indeterminate: true, stage: 'Waiting for connection', dismissible: true });
+        setTimeout(function () { recover(error); }, 5000);
+      }).getSnowflakePublicationStatus({ token: review.token });
+    };
+    google.script.run.withSuccessHandler(published).withFailureHandler(recover).confirmSnowflakeIntake({ token: review.token, dismissedAssetIds: dismissedAssetIds });
   }
 
   function showPublishingLoading_(status) {
@@ -2472,6 +2514,7 @@
     const rowPercent = Math.max(0, Math.min(100, Number(current.percent || 0)));
     const progressStage = cleanClientText_(current.progressStage).toUpperCase();
     const progressLabels = {
+      RETRY_PENDING: 'Waiting to retry the saved checkpoint',
       QUEUED_FOR_SOURCE_EVALUATION: 'Queued for source evaluation',
       QUEUED_FOR_NEXT_SOURCE_BATCH: 'Source checkpoint saved; next batch queued',
       PROCESSING_SOURCE_BATCH: 'Processing the next source batch',
@@ -2490,23 +2533,13 @@
     let stage = 'Submitting approved review';
     if (phase === 'IMPORT') {
       displayedPercent = rowPercent;
-      indeterminate = ['QUEUED_FOR_SOURCE_EVALUATION', 'PROCESSING_SOURCE_BATCH'].indexOf(progressStage) !== -1;
+      indeterminate = !Number(current.total);
       stage = (progressLabels[progressStage] || 'Evaluating source rows') +
-        (indeterminate ? ' · ' + formatNumber(current.completed || 0) + ' rows completed' : ' · ' + Math.round(rowPercent) + '% complete');
+        (indeterminate ? ' · ' + formatNumber(current.completed || 0) + ' rows completed' : ' · ' + Math.round(rowPercent) + '% of source rows evaluated');
     } else if (phase === 'PREPARE_FINALIZE' || phase === 'FINALIZE') {
       stage = progressLabels[progressStage] || 'Finalizing lifecycle and notifications';
-      displayedPercent = {
-        SOURCE_EVALUATION_COMPLETE: 84,
-        PUBLISHING_ASSET_BUFFER: 88,
-        APPROVING_CANDIDATES: 91,
-        RECONCILING_LIFECYCLE: 93,
-        APPLYING_LIFECYCLE_CHANGES: 95,
-        REFRESHING_DASHBOARD: 97,
-        QUEUING_NOTIFICATIONS: 98,
-        SENDING_NOTIFICATIONS: 98,
-        COMPLETING_PUBLICATION: 99
-      }[progressStage] || 85;
-      indeterminate = false;
+      // Finalization stages have different costs; no measured overall percentage exists.
+      indeterminate = true;
     }
     const processedRows = Number(current.processedRows !== undefined ? current.processedRows : current.completed || 0);
     const totalRows = Number(current.total || 0);
@@ -2514,7 +2547,7 @@
     const detailRows = [
       { label: 'File', value: current.fileName || (state.intakeReview && state.intakeReview.fileName) || '', wide: true },
       { label: 'Rows processed', value: formatNumber(processedRows) + (totalRows ? ' of ' + formatNumber(totalRows) : '') },
-      { label: 'Published assets', value: formatNumber(current.writtenRows !== undefined ? current.writtenRows : current.candidates || 0) },
+      { label: phase === 'IMPORT' ? 'Assets staged' : 'Assets retained', value: formatNumber(current.writtenRows !== undefined ? current.writtenRows : current.candidates || 0) },
       { label: 'Row errors', value: formatNumber(current.errors || 0) },
       { label: 'Elapsed time', value: formatElapsedTime_(elapsedSeconds) }
     ];
@@ -2543,9 +2576,18 @@
 
   function startPolling(showOverlay) {
     clearTimeout(state.poller);
+    const generation = (state.publicationPollGeneration || 0) + 1;
+    state.publicationPollGeneration = generation;
     let publicationCompleted = !showOverlay;
     const poll = function () {
+      if (state.publicationPollGeneration !== generation) return;
+      if (!state.publicationAdvanceInFlight) {
+        state.publicationAdvanceInFlight = true;
+        const finished = function () { state.publicationAdvanceInFlight = false; };
+        google.script.run.withSuccessHandler(finished).withFailureHandler(finished).advanceActiveImportWorkflow();
+      }
       google.script.run.withSuccessHandler(function (status) {
+        if (state.publicationPollGeneration !== generation) return;
         renderImportStatus(status);
         if (status.running) {
           if (showOverlay && !state.publicationOverlayDismissed) showPublishingLoading_(status);
@@ -2556,7 +2598,7 @@
         if (!publicationCompleted) {
           publicationCompleted = true;
           state.publicationOverlayDismissed = false;
-          document.getElementById('importButton').disabled = false;
+          document.getElementById('importButton').disabled = Boolean(status.recoverable || campaignRunning);
           if (showOverlay) hideWorkflowLoading_();
           showOverlay = false;
           loadDashboard(1);
@@ -2571,12 +2613,12 @@
         clearTimeout(state.poller);
         state.poller = null;
         renderImportStatus(status);
-      }).withFailureHandler(function (error) {
-        clearTimeout(state.poller);
-        state.poller = null;
-        if (showOverlay) hideWorkflowLoading_();
-        showToast(error.message || String(error), true);
-      }).advanceActiveImportWorkflow();
+      }).withFailureHandler(function () {
+        if (state.publicationPollGeneration !== generation) return;
+        // Keep watching durable state after transient network failures.
+        if (showOverlay && !state.publicationOverlayDismissed) showWorkflowLoading_('Reconnecting', 'Processing can continue in the background. Checking the saved checkpoint when the connection returns.', { indeterminate: true, stage: 'Waiting for connection', dismissible: true });
+        state.poller = setTimeout(poll, 5000);
+      }).getImportStatus();
     };
     state.poller = setTimeout(poll, 2500);
   }
@@ -2635,7 +2677,7 @@
       banner.innerHTML = '<span>Data is published. Slack delivery is ' + (campaign.status === 'PAUSED' ? 'paused' : 'complete with errors') + ': ' +
         formatNumber(campaign.completed || 0) + ' of ' + formatNumber(campaign.total || 0) + ' processed, ' +
         formatNumber(campaign.delivered || 0) + ' delivered, ' + formatNumber(campaign.failed || 0) + ' needing attention.</span>' +
-        (slackEnabled ? ' <button class="button secondary" type="button" onclick="resumeStalledNotificationCampaign_()">Resume from saved checkpoint</button>' : ' <span>Enable Slack notifications after correcting the workflow payload to retry.</span>');
+        (slackEnabled ? ' <button class="button secondary" type="button" onclick="retryImportNotificationCampaign_()">Retry saved delivery</button> <button class="button secondary" type="button" onclick="reviewUncertainDeliveries_()">Verify uncertain deliveries</button>' : ' <span>Enable Slack notifications after correcting the workflow payload to retry.</span>');
       document.getElementById('importButton').disabled = true;
       return;
     }
@@ -2662,6 +2704,39 @@
       banner.classList.remove('app-error');
       banner.textContent = statusText;
     }
+  }
+
+  function reviewUncertainDeliveries_() {
+    google.script.run.withSuccessHandler(function (entries) {
+      const list = document.getElementById('uncertainDeliveryList');
+      list.textContent = '';
+      if (!entries.length) list.textContent = 'No uncertain deliveries remain. Retry the saved delivery to finish processing.';
+      entries.forEach(function (entry) {
+        const row = document.createElement('div');
+        const description = document.createElement('p');
+        description.textContent = entry.recipient + ' · ' + entry.type + ' · ' + entry.assets + ' assets · ' + formatDate(entry.attemptedAt);
+        row.appendChild(description);
+        [['RECEIVED', 'Confirmed received'], ['NOT_RECEIVED', 'Confirmed not received']].forEach(function (choice) {
+          const button = document.createElement('button');
+          button.className = 'button secondary';
+          button.textContent = choice[1];
+          button.onclick = function () {
+            confirmAction({ title: choice[1], message: 'Record your verification for ' + entry.recipient + '?',
+              detail: choice[0] === 'RECEIVED' ? 'The saved receipt will finish processing without sending again.' : 'A subsequent retry may send this message. Confirm only after verifying that Slack did not receive it.',
+              confirmLabel: choice[1] }, function () {
+              google.script.run.withSuccessHandler(function () {
+                reviewUncertainDeliveries_();
+                showToast('Verification saved. Retry the saved delivery to continue.');
+              }).withFailureHandler(function (error) { showToast(error.message || String(error), true); })
+                .resolveUncertainSlackDelivery({ id: entry.id, decision: choice[0] });
+            });
+          };
+          row.appendChild(button);
+        });
+        list.appendChild(row);
+      });
+      document.getElementById('uncertainDeliveryModal').classList.remove('hidden');
+    }).withFailureHandler(function (error) { showToast(error.message || String(error), true); }).getUncertainSlackDeliveries();
   }
 
   function retryImportNotificationCampaign_() {

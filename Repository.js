@@ -111,7 +111,7 @@ function repositoryBulkWindowSize_() {
 }
 
 function groupSheetRowsForBulkIo_(rowNumbers) {
-  const rows = (rowNumbers || []).slice().sort(function (left, right) { return left - right; });
+  const rows = Array.from(new Set(rowNumbers || [])).sort(function (left, right) { return left - right; });
   if (!rows.length) return [];
   const contiguous = [];
   rows.forEach(function (rowNumber) {
@@ -179,7 +179,10 @@ function updateObjectsByKey_(sheetName, keyHeader, objects) {
   groups.forEach(function (group) {
     const rowCount = Math.min(group.end, sheet.getLastRow()) - group.start + 1;
     const range = sheet.getRange(group.start, 1, rowCount, headers.length);
-    const rows = range.getDisplayValues();
+    // Fully selected ranges need no read before writing. Sparse windows retain their gaps.
+    const rows = Object.keys(group.selectedRows).length === rowCount
+      ? Array.from({ length: rowCount }, function (_, index) { return updatesByRow[group.start + index]; })
+      : range.getDisplayValues();
     Object.keys(group.selectedRows).forEach(function (rowNumberText) {
       const rowNumber = Number(rowNumberText);
       if (updatesByRow[rowNumber]) rows[rowNumber - group.start] = updatesByRow[rowNumber];
@@ -304,7 +307,8 @@ function updateJobRun_(runId, patch) {
   const existing = findObjectRow_(APP.sheets.jobs, 'RUN_ID', runId);
   if (!existing) throw new Error('Job run not found: ' + runId);
   const merged = Object.assign({}, existing.value, patch);
-  upsertObject_(APP.sheets.jobs, 'RUN_ID', merged);
+  getSheet_(APP.sheets.jobs).getRange(existing.rowNumber, 1, 1, existing.headers.length)
+    .setValues([objectToRow_(existing.headers, merged)]);
 }
 
 function logEvent_(caseId, assetId, eventType, fromState, toState, runId, details) {

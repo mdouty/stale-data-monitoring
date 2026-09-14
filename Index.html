@@ -111,6 +111,7 @@
             <div class="panel-heading">
               <div><h3>Data intake</h3><span>Import a reviewed Snowflake CSV and advance lifecycle operations.</span></div>
               <div class="top-actions">
+                <button class="button subtle" onclick="reviewUncertainDeliveries_()">Verify uncertain Slack deliveries</button>
                 <button id="runAutomationButton" class="button subtle hidden" onclick="runAutomationNow()">Run lifecycle automation</button>
                 <button id="importButton" class="button primary hidden" onclick="startImport()">Import &amp; Refresh Data</button>
               </div>
@@ -197,6 +198,7 @@
     </main>
 
     <form id="intakeUploadForm" class="hidden" onsubmit="return false;">
+      <input id="uploadRequestId" name="uploadRequestId" type="hidden">
       <input id="intakeFile" name="intakeFile" type="file" accept=".csv,text/csv" onchange="handleIntakeFile()">
     </form>
 
@@ -308,6 +310,14 @@
           <label class="user-guide-preference"><input id="userGuideDontShow" type="checkbox"> <span>Do not show this again when I open the application</span></label>
           <button class="button primary" type="button" onclick="closeUserGuide_()">Start using the application</button>
         </div>
+      </section>
+    </div>
+    <div id="uncertainDeliveryModal" class="confirmation-backdrop hidden" role="presentation">
+      <section class="confirmation-dialog" role="dialog" aria-modal="true" aria-labelledby="uncertainDeliveryTitle">
+        <h2 id="uncertainDeliveryTitle">Verify uncertain Slack deliveries</h2>
+        <p>Check Slack or its workflow history before confirming a result. Messages are held to prevent duplicate delivery.</p>
+        <div id="uncertainDeliveryList"></div>
+        <button class="button secondary" type="button" onclick="document.getElementById('uncertainDeliveryModal').classList.add('hidden')">Close</button>
       </section>
     </div>
     <div id="confirmationModal" class="confirmation-backdrop hidden" role="presentation" onclick="confirmationBackdropClicked(event)">

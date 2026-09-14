@@ -191,6 +191,15 @@ function getImportNotificationCampaignStatus_(environment) {
 }
 
 function getSelfHealingImportNotificationCampaignStatus_(environment) {
+  const status = getImportNotificationCampaignStatus_(environment || getActiveEnvironment_());
+  if (!status.stalled) return status;
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1)) return status;
+  try { return healImportNotificationCampaignStatus_(environment); }
+  finally { lock.releaseLock(); }
+}
+
+function healImportNotificationCampaignStatus_(environment) {
   const selectedEnvironment = normalizeEnvironment_(environment || getActiveEnvironment_());
   let status = getImportNotificationCampaignStatus_(selectedEnvironment);
   if (!status.stalled || !isAdminEmail_(getCurrentUserEmail_())) return status;
@@ -241,12 +250,14 @@ function getImportStatus() {
     const updatedAt = state.updatedAt || state.startedAt || '';
     const updatedDate = updatedAt ? new Date(updatedAt) : null;
     const stalled = Boolean(updatedDate && !isNaN(updatedDate.getTime()) && Date.now() - updatedDate.getTime() > 12 * 60 * 1000);
+    const paused = /_PAUSED$/.test(state.progressStage || '');
     return {
-      running: true,
+      running: !paused,
+      recoverable: paused,
       stalled: stalled,
       environment: state.environment,
       runId: state.runId,
-      phase: state.phase,
+      phase: paused ? 'FAILED' : state.phase,
       progressStage: state.progressStage || '',
       completed: completed,
       processedRows: Number(state.processedRows || completed || 0),
@@ -317,6 +328,7 @@ function advanceActiveImportWorkflow() {
   const profile = assertEnvironmentWritable_();
   const importState = getImportState_(profile.key);
   if (importState) {
+    if (/_PAUSED$/.test(importState.progressStage || '')) return getImportStatus();
     setExecutionEnvironment_(profile.key, false);
     return continueSnowflakeImport() || getImportStatus();
   }
@@ -354,6 +366,7 @@ function intakeReviewCacheSheet_(environment, createIfMissing) {
 }
 
 function clearIntakeReviewCache_(environment) {
+  PropertiesService.getScriptProperties().deleteProperty('RELIABILITY_' + normalizeEnvironment_(environment || getActiveEnvironment_()) + '_ReviewCache');
   const sheet = intakeReviewCacheSheet_(environment, false);
   if (!sheet) return;
   sheet.clearContents();
@@ -362,22 +375,13 @@ function clearIntakeReviewCache_(environment) {
 }
 
 function writeIntakeReviewCache_(review) {
-  const sheet = intakeReviewCacheSheet_(review.environment, true);
-  const serialized = JSON.stringify(review);
-  const chunkSize = 40000;
-  const rows = [];
-  for (let offset = 0; offset < serialized.length; offset += chunkSize) {
-    rows.push([offset === 0 ? review.token : '', serialized.substring(offset, offset + chunkSize)]);
-  }
-  ensureSheetCapacity_(sheet, rows.length + 1, 2);
-  sheet.clearContents();
-  sheet.getRange(1, 1, 1, 2).setValues([['TOKEN', 'JSON_CHUNK']]);
-  if (rows.length) sheet.getRange(2, 1, rows.length, 2).setValues(rows);
-  sheet.hideSheet();
-  SpreadsheetApp.flush();
+  saveDurablePayload_('ReviewCache', review.token, review);
 }
 
 function readIntakeReviewCache_(environment, token) {
+  const durable = readDurablePayload_('ReviewCache', token);
+  if (durable) return durable;
+  // Compatibility with reviews staged before durable cache storage was introduced.
   const sheet = intakeReviewCacheSheet_(environment, false);
   if (!sheet || sheet.getLastRow() < 2) return null;
   const rows = sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getDisplayValues();
@@ -392,12 +396,13 @@ function appendIntakeReviewPartial_(environment, token, partIndex, partial) {
   const rows = [];
   const chunkSize = 40000;
   for (let offset = 0, chunkIndex = 0; offset < serialized.length; offset += chunkSize, chunkIndex += 1) {
-    rows.push([token + '|PARTIAL|' + partIndex + '|' + chunkIndex, serialized.substring(offset, offset + chunkSize)]);
+    rows.push([token + '|PARTIAL|' + partIndex + '|' + chunkIndex + '|J', 'J' + serialized.substring(offset, offset + chunkSize)]);
   }
   const startRow = Math.max(2, sheet.getLastRow() + 1);
   ensureSheetCapacity_(sheet, startRow + rows.length - 1, 2);
   if (rows.length) sheet.getRange(startRow, 1, rows.length, 2).setValues(rows);
   sheet.hideSheet();
+  SpreadsheetApp.flush();
 }
 
 function readIntakeReviewPartials_(environment, token) {
@@ -412,7 +417,7 @@ function readIntakeReviewPartials_(environment, token) {
     const partIndex = Number(parts[0]);
     const chunkIndex = Number(parts[1]);
     if (!grouped[partIndex]) grouped[partIndex] = [];
-    grouped[partIndex][chunkIndex] = row[1] || '';
+    grouped[partIndex][chunkIndex] = parts[2] === 'J' ? (row[1] || '').substring(1) : (row[1] || '');
   });
   return Object.keys(grouped).map(Number).sort(function (left, right) { return left - right; }).map(function (partIndex) {
     return JSON.parse(grouped[partIndex].join(''));
@@ -592,12 +597,23 @@ function reconcileIntakeReviewChunk_(review, cursorRow, batchSize) {
 }
 
 function stageSnowflakeCsvUpload(formObject) {
+  assertAdmin_();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try { return stageSnowflakeCsvUploadLocked_(formObject); }
+  finally { lock.releaseLock(); }
+}
+
+function stageSnowflakeCsvUploadLocked_(formObject) {
   const actor = assertAdmin_();
   const profile = assertEnvironmentWritable_();
   clearBlankProductionWorkflowState_();
   if (!profile.importEnabled) throw new Error(profile.label + ' imports are disabled.');
   if (getAnyImportState_()) throw new Error('An import is already running. Wait for it to finish before uploading another file.');
   if (getAnyRunningImportNotificationCampaign_()) throw new Error('A post-import Slack campaign is still running. Wait for it to finish before uploading another file.');
+  const requestId = cleanText_(formObject && formObject.uploadRequestId);
+  const existing = getPendingIntakeReview_(profile.key);
+  if (requestId && existing && existing.uploadRequestId === requestId) return existing;
   const blob = formObject && formObject.intakeFile;
   if (!blob || typeof blob.getBytes !== 'function') throw new Error('Choose a CSV file to import.');
   const fileName = cleanText_(blob.getName && blob.getName()) || 'Snowflake intake.csv';
@@ -617,7 +633,9 @@ function stageSnowflakeCsvUpload(formObject) {
   const staged = {
     token: uuid_(),
     environment: profile.key,
-    preparationStatus: 'STAGED',
+    preparationStatus: 'QUEUED',
+    uploadRequestId: requestId,
+    preparationStartedAt: nowIso_(),
     sourceSpreadsheetId: APP.foundationSpreadsheetId,
     sourceSheetName: sheet.getName(),
     sourceRows: rows.length,
@@ -630,7 +648,39 @@ function stageSnowflakeCsvUpload(formObject) {
     uploadedAt: nowIso_()
   };
   setPendingIntakeReview_(staged);
+  scheduleIntakeReviewPreparation_();
   return staged;
+}
+
+function recoverSnowflakeIntake(input) {
+  assertAdmin_();
+  const profile = assertEnvironmentWritable_();
+  const pending = getPendingIntakeReview_(profile.key);
+  const requestId = cleanText_(input && input.uploadRequestId);
+  if (!pending || (requestId && pending.uploadRequestId !== requestId)) return null;
+  if (getImportState_(profile.key)) return null;
+  if (pending.preparationStatus === 'STAGED') return prepareSnowflakeIntakeReview({ token: pending.token });
+  return getIntakeReviewPreparationStatus({ token: pending.token });
+}
+
+function resumeSnowflakeIntakeReview(input) {
+  assertAdmin_();
+  const profile = assertEnvironmentWritable_();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const pending = getPendingIntakeReview_(profile.key);
+    if (!pending || pending.token !== cleanText_(input && input.token)) throw new Error('The staged review is no longer current.');
+    if (pending.preparationStatus === 'FAILED') {
+      pending.preparationStatus = pending.failedPreparationStatus || 'QUEUED';
+      pending.lastError = '';
+      pending.retryCount = 0;
+      pending.retryAfter = 0;
+      setPendingIntakeReview_(pending);
+    }
+    scheduleIntakeReviewPreparation_();
+    return getIntakeReviewPreparationStatus({ token: pending.token });
+  } finally { lock.releaseLock(); }
 }
 
 function prepareSnowflakeIntakeReview(input) {
@@ -640,6 +690,7 @@ function prepareSnowflakeIntakeReview(input) {
   const staged = getPendingIntakeReview_(profile.key);
   if (!staged || staged.token !== token) throw new Error('This staged upload is no longer current. Upload the CSV again.');
   if (getAnyImportState_()) throw new Error('An import is already running. Wait for it to finish before preparing another review.');
+  if (staged.preparationStatus !== 'STAGED') return getIntakeReviewPreparationStatus({ token: token });
   const source = SpreadsheetApp.openById(staged.sourceSpreadsheetId).getSheetByName(staged.sourceSheetName);
   if (!source) throw new Error('The staged intake data was not found. Upload the CSV again.');
   staged.preparationStatus = 'QUEUED';
@@ -655,15 +706,17 @@ function continueSnowflakeIntakeReview(input) {
   if (!lock.tryLock(1000)) return input && input.token ? getIntakeReviewPreparationStatus(input) : null;
   let staged;
   try {
-    deleteIntakeReviewPreparationTriggers_();
     const requestedToken = cleanText_(input && input.token);
     staged = ['PRD', 'DEV'].map(function (environment) { return getPendingIntakeReview_(environment); })
       .filter(function (review) {
         return review && ['QUEUED', 'CALCULATING_REVIEW', 'MERGING_REVIEW', 'RECONCILING_REVIEW'].indexOf(review.preparationStatus) !== -1 &&
           (!requestedToken || review.token === requestedToken);
       })[0];
-    if (!staged) return;
+    // A background trigger may have finished between browser requests.
+    if (!staged) return requestedToken ? getIntakeReviewPreparationStatus(input) : null;
     setExecutionEnvironment_(staged.environment, false);
+    if (Number(staged.retryAfter || 0) > Date.now()) return getIntakeReviewPreparationStatus({ token: staged.token });
+    scheduleIntakeReviewPreparation_(7 * 60 * 1000);
     const source = SpreadsheetApp.openById(staged.sourceSpreadsheetId).getSheetByName(staged.sourceSheetName);
     if (!source) throw new Error('The staged intake data was not found. Upload the CSV again.');
     const width = source.getLastColumn();
@@ -687,25 +740,38 @@ function continueSnowflakeIntakeReview(input) {
     if (staged.preparationStatus === 'CALCULATING_REVIEW') {
       const batchSize = Math.max(50, Math.min(250, configNumber_('INTAKE_REVIEW_BATCH_SIZE', 150)));
       const finalRow = staged.sourceRows + 1;
-      const count = Math.min(batchSize, finalRow - Number(staged.reviewCursorRow || 2) + 1);
-      if (count > 0) {
-        const rows = source.getRange(staged.reviewCursorRow, 1, count, width).getDisplayValues();
-        const partial = calculateIntakeReview_(headers, rows, {
-          fileName: staged.fileName, fileSizeBytes: staged.fileSizeBytes, uploadedBy: staged.uploadedBy,
-          environment: staged.environment, sourceSnapshotAt: staged.sourceSnapshotAt,
-          reviewSampleLimit: 20, incremental: true
-        });
-        appendIntakeReviewPartial_(staged.environment, staged.token, Number(staged.reviewPartCount || 0), partial);
-        staged.reviewCursorRow += count;
-        staged.reviewProcessedRows += count;
-        staged.reviewPartCount += 1;
-        staged.lastCheckpointAt = nowIso_();
-        if (staged.reviewCursorRow > finalRow) staged.preparationStatus = 'MERGING_REVIEW';
-        setPendingIntakeReview_(staged);
-        try { scheduleIntakeReviewPreparation_(); } catch (scheduleError) {}
-        return getIntakeReviewPreparationStatus({ token: staged.token });
-      }
-      staged.preparationStatus = 'MERGING_REVIEW';
+      const batchStartedAt = Date.now();
+      let completedBatches = 0;
+      do {
+        const count = Math.min(batchSize, finalRow - Number(staged.reviewCursorRow || 2) + 1);
+        if (count > 0) {
+          const rows = source.getRange(staged.reviewCursorRow, 1, count, width).getDisplayValues();
+          const partialKey = staged.token + '|' + staged.reviewPartCount;
+          let partial = readDurablePayload_('ReviewPartial', partialKey);
+          if (!partial) {
+            partial = calculateIntakeReview_(headers, rows, {
+              fileName: staged.fileName, fileSizeBytes: staged.fileSizeBytes, uploadedBy: staged.uploadedBy,
+              environment: staged.environment, sourceSnapshotAt: staged.sourceSnapshotAt,
+              reviewSampleLimit: 20, incremental: true
+            });
+            saveDurablePayload_('ReviewPartial', partialKey, partial);
+          }
+          appendIntakeReviewPartial_(staged.environment, staged.token, Number(staged.reviewPartCount || 0), partial);
+          staged.reviewCursorRow += count;
+          staged.reviewProcessedRows += count;
+          staged.reviewPartCount += 1;
+          staged.lastCheckpointAt = nowIso_();
+          staged.retryCount = 0;
+          staged.retryAfter = 0;
+          if (staged.reviewCursorRow > finalRow) staged.preparationStatus = 'MERGING_REVIEW';
+          setPendingIntakeReview_(staged);
+          completedBatches += 1;
+        } else {
+          staged.preparationStatus = 'MERGING_REVIEW';
+        }
+        // Keep the original batch boundaries and save each checkpoint before doing more work.
+      } while (staged.preparationStatus === 'CALCULATING_REVIEW' && completedBatches < 3 &&
+        Date.now() - batchStartedAt < 30000);
       setPendingIntakeReview_(staged);
       try { scheduleIntakeReviewPreparation_(); } catch (scheduleError) {}
       return getIntakeReviewPreparationStatus({ token: staged.token });
@@ -722,10 +788,13 @@ function continueSnowflakeIntakeReview(input) {
       mergedReview.sourceSheetName = staged.sourceSheetName;
       mergedReview.headerSignature = staged.headerSignature;
       mergedReview.uploadedAt = staged.uploadedAt;
+      mergedReview.uploadRequestId = staged.uploadRequestId || '';
       mergedReview.reviewedAt = nowIso_();
       writeIntakeReviewCache_(mergedReview);
       staged.preparationStatus = 'RECONCILING_REVIEW';
       staged.reconciliationCursorRow = 2;
+      staged.retryCount = 0;
+      staged.retryAfter = 0;
       setPendingIntakeReview_(staged);
       try { scheduleIntakeReviewPreparation_(); } catch (scheduleError) {}
       return getIntakeReviewPreparationStatus({ token: staged.token });
@@ -733,11 +802,14 @@ function continueSnowflakeIntakeReview(input) {
 
     const review = readIntakeReviewCache_(staged.environment, staged.token);
     if (!review) throw new Error('The merged intake review could not be loaded. Upload the CSV again.');
-    const reconciliation = reconcileIntakeReviewChunk_(review, Number(staged.reconciliationCursorRow || 2),
+    const reconciliation = reconcileIntakeReviewChunk_(review, Math.max(Number(staged.reconciliationCursorRow || 2), Number(review._reconciliationCursorRow || 2)),
       Math.max(50, Math.min(250, configNumber_('INTAKE_REVIEW_BATCH_SIZE', 150))));
     staged.reconciliationCursorRow = reconciliation.nextRow;
+    review._reconciliationCursorRow = reconciliation.nextRow;
     if (!reconciliation.done) {
       writeIntakeReviewCache_(review);
+      staged.retryCount = 0;
+      staged.retryAfter = 0;
       setPendingIntakeReview_(staged);
       try { scheduleIntakeReviewPreparation_(); } catch (scheduleError) {}
       return getIntakeReviewPreparationStatus({ token: staged.token });
@@ -752,10 +824,19 @@ function continueSnowflakeIntakeReview(input) {
     return getIntakeReviewPreparationStatus({ token: staged.token });
   } catch (error) {
     if (staged) {
-      staged.preparationStatus = 'FAILED';
+      // Resume from the persisted cursor, never from an in-memory cursor whose cache write failed.
+      const checkpoint = getPendingIntakeReview_(staged.environment);
+      if (checkpoint && checkpoint.token === staged.token) staged = checkpoint;
+      staged.failedPreparationStatus = staged.preparationStatus;
+      staged.retryCount = Number(staged.retryCount || 0) + 1;
+      staged.retryAfter = Date.now() + 60000 * staged.retryCount;
+      if (staged.retryCount >= 3) staged.preparationStatus = 'FAILED';
       staged.lastError = String(error && error.message ? error.message : error).substring(0, 1000);
       staged.failedAt = nowIso_();
       setPendingIntakeReview_(staged);
+      if (staged.preparationStatus !== 'FAILED') {
+        try { scheduleIntakeReviewPreparation_(60000 * staged.retryCount); } catch (scheduleError) {}
+      }
     }
     console.error(error && error.stack ? error.stack : error);
   } finally {
@@ -786,6 +867,7 @@ function calculateAndStoreIntakeReview_(staged) {
   review.sourceSheetName = staged.sourceSheetName;
   review.headerSignature = staged.headerSignature;
   review.uploadedAt = staged.uploadedAt;
+  review.uploadRequestId = staged.uploadRequestId || '';
   review.reviewedAt = nowIso_();
   writeIntakeReviewCache_(review);
   const summary = pendingIntakeReviewSummary_(review);
@@ -803,11 +885,8 @@ function getIntakeReviewPreparationStatus(input) {
   const stalled = ['QUEUED', 'CALCULATING_REVIEW', 'MERGING_REVIEW', 'RECONCILING_REVIEW'].indexOf(pending.preparationStatus) !== -1 &&
     updated && !isNaN(updated.getTime()) && Date.now() - updated.getTime() > 8 * 60 * 1000;
   if (stalled) {
-    pending.preparationStatus = 'FAILED';
-    pending.lastError = 'Review preparation stopped responding before it completed. The staged data was not published.';
-    pending.failedAt = nowIso_();
-    setPendingIntakeReview_(pending);
-    deleteIntakeReviewPreparationTriggers_();
+    // Reading status must never destroy a resumable checkpoint.
+    try { scheduleIntakeReviewPreparation_(); } catch (error) { console.error(String(error.message || error)); }
   }
   const status = {
     token: pending.token,
@@ -837,9 +916,8 @@ function getIntakeReviewPreparationStatus(input) {
   return status;
 }
 
-function scheduleIntakeReviewPreparation_() {
-  deleteIntakeReviewPreparationTriggers_();
-  ScriptApp.newTrigger('continueSnowflakeIntakeReview').timeBased().after(10000).create();
+function scheduleIntakeReviewPreparation_(delayMs) {
+  replaceWorkflowTrigger_('continueSnowflakeIntakeReview', Math.max(10000, Number(delayMs || 10000)));
 }
 
 function deleteIntakeReviewPreparationTriggers_() {
@@ -863,6 +941,7 @@ function pendingIntakeReviewSummary_(review) {
     fileSizeBytes: review.fileSizeBytes,
     uploadedBy: review.uploadedBy,
     uploadedAt: review.uploadedAt,
+    uploadRequestId: review.uploadRequestId || '',
     candidates: review.candidates,
     unassessable: review.unassessable,
     newCandidates: review.newCandidates,
@@ -1644,14 +1723,41 @@ function intakeReviewExportFileName_(sourceFileName) {
 }
 
 function confirmSnowflakeIntake(reviewInput) {
+  assertAdmin_();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try { return confirmSnowflakeIntakeLocked_(reviewInput); }
+  finally { lock.releaseLock(); }
+}
+
+function confirmSnowflakeIntakeLocked_(reviewInput) {
   const actor = assertAdmin_();
   const payload = reviewInput && typeof reviewInput === 'object' ? reviewInput : { token: reviewInput };
   const profile = assertEnvironmentWritable_();
+  const existing = getImportState_(profile.key);
+  if (existing && existing.reviewToken === cleanText_(payload.token)) return getImportStatus();
+  if (getAnyImportState_()) throw new Error('An import is already running.');
+  const approved = PropertiesService.getScriptProperties().getProperty(reliabilityProperty_('ApprovedReview'));
+  if (approved && JSON.parse(approved).token === cleanText_(payload.token)) return getImportStatus();
   let review = getPendingIntakeReview_(profile.key);
   if (!review || review.token !== cleanText_(payload.token)) throw new Error('This intake review is no longer current. Upload the CSV again.');
   if (review.preparationStatus !== 'READY') throw new Error('The intake review is not ready to publish.');
   review = applyIntakeReviewDecisions_(review, payload.dismissedAssetIds || []);
-  return startSnowflakeImportInternal_(actor, review.token);
+  return startSnowflakeImportInternal_(actor, review.token, true);
+}
+
+function getSnowflakePublicationStatus(input) {
+  assertAdmin_();
+  assertEnvironmentWritable_();
+  const token = cleanText_(input && input.token);
+  const current = getImportState_();
+  if (current && current.reviewToken === token) return getImportStatus();
+  const raw = PropertiesService.getScriptProperties().getProperty(reliabilityProperty_('ApprovedReview'));
+  if (raw && JSON.parse(raw).token === token) return getImportStatus();
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1)) return { pending: true };
+  lock.releaseLock();
+  return null;
 }
 
 function startSnowflakeImport(reviewToken) {
@@ -1708,15 +1814,15 @@ function applyIntakeReviewDecisions_(review, dismissedAssetIds) {
   return review;
 }
 
-function startSnowflakeImportInternal_(actor, reviewToken) {
+function startSnowflakeImportInternal_(actor, reviewToken, lockHeld) {
   const profile = assertEnvironmentWritable_();
   if (!profile.importEnabled) throw new Error(profile.label + ' imports are disabled.');
   const review = getPendingIntakeReview_(profile.key);
   if (!review || review.token !== cleanText_(reviewToken)) throw new Error('This intake review is no longer current. Upload the CSV again.');
   if (review.preparationStatus !== 'READY') throw new Error('The intake review is not ready to publish.');
   if (review.environment !== profile.key) throw new Error('The reviewed intake belongs to a different environment.');
-  const lock = LockService.getScriptLock();
-  lock.waitLock(20000);
+  const lock = lockHeld ? null : LockService.getScriptLock();
+  if (lock) lock.waitLock(20000);
   try {
     if (getAnyImportState_()) throw new Error('An import is already running.');
     ensureDataModelV2_();
@@ -1761,6 +1867,8 @@ function startSnowflakeImportInternal_(actor, reviewToken) {
       message: 'Publishing reviewed ' + profile.label + ' Snowflake intake'
     };
     setImportState_(state);
+    scheduleImportContinuation_(7 * 60 * 1000);
+    PropertiesService.getScriptProperties().setProperty(reliabilityProperty_('ApprovedReview'), JSON.stringify({ token: review.token, runId: runId }));
     const chunkSize = Math.max(100, configNumber_('IMPORT_CHUNK_SIZE', APP.defaultImportChunkSize));
     const configuredInlineLimit = Math.max(0, configNumber_('INLINE_IMPORT_MAX_ROWS', APP.defaultInlineImportMaxRows));
     const inlineLimit = Math.min(chunkSize, configuredInlineLimit);
@@ -1776,7 +1884,7 @@ function startSnowflakeImportInternal_(actor, reviewToken) {
     try { scheduleImportContinuation_(); } catch (scheduleError) {}
     return getImportStatus();
   } finally {
-    lock.releaseLock();
+    if (lock) lock.releaseLock();
   }
 }
 
@@ -1784,7 +1892,6 @@ function continueSnowflakeImport() {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(1000)) return getImportStatus();
   try {
-    deleteImportContinuationTriggers_();
     let state = getAnyImportState_();
     if (state && normalizeEnvironment_(state.environment) === 'PRD') {
       setExecutionEnvironment_('PRD', false);
@@ -1793,13 +1900,20 @@ function continueSnowflakeImport() {
     }
     if (!state) return getImportStatus();
     setExecutionEnvironment_(state.environment, false);
+    if (/_PAUSED$/.test(state.progressStage || '') || Number(state.retryAfter || 0) > Date.now()) return getImportStatus();
+    scheduleImportContinuation_(7 * 60 * 1000);
     if (state.phase === 'IMPORT') {
-      importSourceChunk_(state, false, true);
+      const batchStartedAt = Date.now();
+      let completedBatches = 0;
+      do {
+        importSourceChunk_(state, false, true);
+        completedBatches += 1;
+      } while (state.phase === 'IMPORT' && completedBatches < 3 && Date.now() - batchStartedAt < 30000);
       const current = getImportState_(state.environment);
       if (current && ['IMPORT', 'PREPARE_FINALIZE'].indexOf(current.phase) !== -1) {
         try { scheduleImportContinuation_(); } catch (scheduleError) {}
       }
-    } else if (state.phase === 'PREPARE_FINALIZE') beginImportFinalization_(state, false);
+    } else if (state.phase === 'PREPARE_FINALIZE' || (state.phase === 'FINALIZE' && !state.assetBuffersPublished && state.assetBufferIds)) beginImportFinalization_(state, false);
     else if (state.phase === 'FINALIZE') finalizeImport_(state);
     return getImportStatus();
   } catch (error) {
@@ -1814,6 +1928,16 @@ function continueSnowflakeImport() {
 function failSnowflakeImport_(state, error) {
   setExecutionEnvironment_(state.environment, false);
   const finalizationFailure = state.phase === 'FINALIZE' || state.phase === 'PREPARE_FINALIZE';
+  state.retryCount = Number(state.retryCount || 0) + 1;
+  if (state.retryCount < 3) {
+    state.progressStage = 'RETRY_PENDING';
+    state.retryAfter = Date.now() + 60000 * state.retryCount;
+    state.lastError = String(error.message || error).substring(0, 500);
+    state.message = 'Retrying the saved checkpoint after a service failure (' + state.retryCount + ' of 3): ' + state.lastError;
+    setImportState_(state);
+    try { scheduleImportContinuation_(60000 * state.retryCount); } catch (scheduleError) {}
+    return;
+  }
   updateJobRun_(state.runId, {
     STATUS: 'FAILED', COMPLETED_AT: nowIso_(), ERROR_COUNT: Number(state.errors || 0) + 1,
     MESSAGE: String(error && error.message ? error.message : error)
@@ -1826,12 +1950,19 @@ function failSnowflakeImport_(state, error) {
     setImportState_(state);
     deleteImportContinuationTriggers_();
   } else {
-    clearImportState_(state.environment);
+    state.progressStage = 'IMPORT_PAUSED';
+    state.message = 'Source import paused; saved batch writes can be resumed safely: ' + String(error.message || error).substring(0, 500);
+    state.lastError = String(error.message || error).substring(0, 500);
+    setImportState_(state);
+    deleteImportContinuationTriggers_();
   }
 }
 
 function importSourceChunk_(state, inlineExecution, deferScheduling) {
   setExecutionEnvironment_(state.environment, false);
+  const batchKey = state.runId + '|' + state.cursorRow;
+  const savedBatch = readDurablePayload_('SourceBatch', batchKey);
+  if (savedBatch) return completeSourceBatch_(state, savedBatch, inlineExecution, deferScheduling);
   const source = SpreadsheetApp.openById(state.sourceSpreadsheetId).getSheetByName(state.sourceSheetName);
   if (!source) throw new Error('The staged intake source is no longer available.');
   const headerMap = validateSnowflakeV2Headers_(state.sourceHeaders);
@@ -1896,15 +2027,27 @@ function importSourceChunk_(state, inlineExecution, deferScheduling) {
     }
   });
 
-  appendObjectRows_(APP.sheets.assetsStaging, ASSET_HEADERS, assetRows);
-  appendRawRows_(APP.sheets.snapshots, snapshots);
-  appendObjectRows_(APP.sheets.cases, CASE_HEADERS, newCases);
-  updateObjectsByKey_(APP.sheets.cases, 'CASE_ID', updatedCases);
-  appendRawRows_(APP.sheets.events, newEvents);
+  const plan = newDurableWritePlan_();
+  planAppendObjects_(plan, APP.sheets.assetsStaging, assetRows);
+  planAppendRows_(plan, APP.sheets.snapshots, snapshots);
+  planAppendObjects_(plan, APP.sheets.cases, newCases);
+  planUpdateObjects_(plan, APP.sheets.cases, 'CASE_ID', updatedCases);
+  planAppendRows_(plan, APP.sheets.events, newEvents);
   state.cursorRow += count;
   state.processedRows += count;
   state.writtenRows += assetRows.length;
   state.message = 'Evaluated and retained ' + state.processedRows + ' of ' + state.sourceRows + ' source rows';
+  const payload = { writes: plan.writes, nextState: state };
+  saveDurablePayload_('SourceBatch', batchKey, payload);
+  completeSourceBatch_(state, payload, inlineExecution, deferScheduling);
+}
+
+function completeSourceBatch_(state, payload, inlineExecution, deferScheduling) {
+  applyDurableWrites_(payload.writes);
+  Object.assign(state, payload.nextState);
+  state.retryCount = 0;
+  state.retryAfter = 0;
+  const finalSourceRow = state.sourceRows + 1;
   updateJobRun_(state.runId, {
     CURSOR_ROW: state.cursorRow, PROCESSED_ROWS: state.processedRows,
     WRITTEN_ROWS: state.writtenRows, ERROR_COUNT: state.errors, MESSAGE: state.message
@@ -1931,11 +2074,17 @@ function queueImportFinalization_(state, inlineExecution, deferScheduling) {
 }
 
 function beginImportFinalization_(state, inlineExecution) {
-  state.phase = 'FINALIZE';
+  state.phase = 'PREPARE_FINALIZE';
   state.progressStage = 'PUBLISHING_ASSET_BUFFER';
   state.message = 'Publishing the evaluated asset dataset';
   setImportState_(state);
-  swapAssetBuffers_();
+  if (!state.assetBufferIds) {
+    state.assetBufferIds = { current: getSheet_(APP.sheets.assetsCurrent).getSheetId(), staging: getSheet_(APP.sheets.assetsStaging).getSheetId() };
+    setImportState_(state);
+  }
+  swapAssetBuffers_(state.assetBufferIds);
+  state.assetBuffersPublished = true;
+  state.phase = 'FINALIZE';
   state.progressStage = 'RECONCILING_LIFECYCLE';
   state.message = 'Reconciling lifecycle cases and sending immediate consolidated stale-asset outreach';
   setImportState_(state);
@@ -2417,15 +2566,19 @@ function appendMissingHeaders_(sheet, requiredHeaders) {
   sheet.getRange(1, startColumn, 1, missing.length).setValues([missing]);
 }
 
-function swapAssetBuffers_() {
-  const current = getSheet_(APP.sheets.assetsCurrent);
-  const staging = getSheet_(APP.sheets.assetsStaging);
+function swapAssetBuffers_(ids) {
+  const book = getFoundationSpreadsheet_();
+  const current = ids ? book.getSheetById(ids.current) : getSheet_(APP.sheets.assetsCurrent);
+  const staging = ids ? book.getSheetById(ids.staging) : getSheet_(APP.sheets.assetsStaging);
+  if (!current || !staging) throw new Error('Asset publication buffers are missing.');
   const currentName = resolveSheetName_(APP.sheets.assetsCurrent);
   const stagingName = resolveSheetName_(APP.sheets.assetsStaging);
   const previousName = APP.environments[getActiveEnvironment_()].sheetPrefix + 'Assets_Previous';
-  current.setName(previousName);
-  staging.setName(currentName);
-  current.setName(stagingName);
+  if (staging.getName() !== currentName) {
+    if (current.getName() === currentName) current.setName(previousName);
+    staging.setName(currentName);
+  }
+  if (current.getName() !== stagingName) current.setName(stagingName);
   staging.showSheet();
   current.hideSheet();
 }
@@ -2480,19 +2633,28 @@ function finalizeImport_(state) {
 
   if (checkpoint.stage === 'APPLY_LIFECYCLE') {
     setFinalizationProgress_(state, 'APPLYING_LIFECYCLE_CHANGES', 'Applying restriction, recovery, restoration, and dismissal changes');
-    const lifecycleAssets = lifecycleEventAssetGroupsForRun_(state.runId);
-    const restrictionAssetIds = uniqueAssetIds_((lifecycleAssets.SNOWFLAKE_RESTRICTION_CONFIRMED || [])
-      .concat(lifecycleAssets.SNOWFLAKE_INITIAL_RESTRICTION || []));
-    const activeRecoveryAssetIds = lifecycleAssets.STALE_ASSET_BECAME_ACTIVE || [];
-    const dismissedAssetIds = lifecycleAssets.INTAKE_CANDIDATE_DISMISSED || [];
-    const cancelledActions = cancelImportPlatformActions_(activeRecoveryAssetIds, dismissedAssetIds);
-    checkpoint.cancelledRecoveryActions = cancelledActions.recovery;
-    checkpoint.cancelledDismissalActions = cancelledActions.dismissal;
-    checkpoint.completedQuarantineActions = completeQuarantineActionsFromImport_(restrictionAssetIds, state.snapshotAt, state.runId);
-    checkpoint.restrictionAssets = restrictionAssetIds.length;
-    checkpoint.activeRecoveryAssets = activeRecoveryAssetIds.length;
-    checkpoint.dismissedAssets = dismissedAssetIds.length;
-    checkpoint.stage = 'REFRESH_DASHBOARD';
+    let saved = readDurablePayload_('LifecycleChanges', state.runId);
+    if (!saved) {
+      const plan = newDurableWritePlan_();
+      const result = {};
+      const lifecycleAssets = lifecycleEventAssetGroupsForRun_(state.runId);
+      const restrictionAssetIds = uniqueAssetIds_((lifecycleAssets.SNOWFLAKE_RESTRICTION_CONFIRMED || [])
+        .concat(lifecycleAssets.SNOWFLAKE_INITIAL_RESTRICTION || []));
+      const activeRecoveryAssetIds = lifecycleAssets.STALE_ASSET_BECAME_ACTIVE || [];
+      const dismissedAssetIds = lifecycleAssets.INTAKE_CANDIDATE_DISMISSED || [];
+      const cancelledActions = cancelImportPlatformActions_(activeRecoveryAssetIds, dismissedAssetIds, plan);
+      result.cancelledRecoveryActions = cancelledActions.recovery;
+      result.cancelledDismissalActions = cancelledActions.dismissal;
+      result.completedQuarantineActions = completeQuarantineActionsFromImport_(restrictionAssetIds, state.snapshotAt, state.runId, plan);
+      result.restrictionAssets = restrictionAssetIds.length;
+      result.activeRecoveryAssets = activeRecoveryAssetIds.length;
+      result.dismissedAssets = dismissedAssetIds.length;
+      result.stage = 'REFRESH_DASHBOARD';
+      saved = { writes: plan.writes, result: result };
+      saveDurablePayload_('LifecycleChanges', state.runId, saved);
+    }
+    applyDurableWrites_(saved.writes);
+    Object.assign(checkpoint, saved.result);
     checkpointImportFinalization_(state, 'REFRESHING_DASHBOARD', 'Lifecycle changes checkpointed; refreshing dashboard summaries');
     return;
   }
@@ -2538,13 +2700,15 @@ function finalizeImport_(state) {
       ' Snowflake restrictions and completed ' + Number(checkpoint.completedQuarantineActions || 0) + ' quarantine work items.' +
       (checkpoint.notificationMessage ? ' ' + cleanText_(checkpoint.notificationMessage) : '')
   });
-  clearImportState_(state.environment);
   clearIntakeReviewCache_(state.environment);
   clearPendingIntakeReview_(state.environment);
+  clearImportState_(state.environment);
   deleteImportContinuationTriggers_();
 }
 
 function checkpointImportFinalization_(state, progressStage, message) {
+  state.retryCount = 0;
+  state.retryAfter = 0;
   state.finalization.updatedAt = nowIso_();
   setFinalizationProgress_(state, progressStage, message);
   try { scheduleImportContinuation_(10000); } catch (scheduleError) {}
@@ -2597,6 +2761,7 @@ function finalizeImportNotifications_(state) {
   }
 
   let message = '';
+  let needsRecovery = false;
   [
     ['Immediate owner Slack', approvalAssetIds, 'STALE_ASSET_NOTICE'],
     ['Orphan outreach at T0', orphanAssetIds, 'ORPHAN_QUARANTINE_NOTICE'],
@@ -2607,11 +2772,17 @@ function finalizeImportNotifications_(state) {
     if (!item[1].length) return;
     try {
       const delivery = createAndSendImportNotificationGroups_(item[1], item[2], state.runId);
+      needsRecovery = needsRecovery || Boolean(delivery.failedAssetCount);
       message += importNotificationDeliveryMessage_(item[0], delivery);
     } catch (error) {
+      needsRecovery = true;
       message += ' ' + item[0] + ' needs attention: ' + String(error.message || error).substring(0, 300) + '.';
     }
   });
+  if (needsRecovery && profile.isProduction) {
+    queueImportNotificationCampaign_(state.runId, state.environment);
+    message += ' Unfinished deliveries are retained in the background recovery campaign.';
+  }
   return message;
 }
 
@@ -2780,6 +2951,13 @@ function queueImportNotificationCampaign_(runId, environment) {
 }
 
 function continueImportNotificationCampaign(environment) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return null;
+  try { return continueImportNotificationCampaignLocked_(environment); }
+  finally { lock.releaseLock(); }
+}
+
+function continueImportNotificationCampaignLocked_(environment) {
   // Time-driven triggers pass an event object; only internal/manual calls pass an environment string.
   const selectedEnvironment = typeof environment === 'string' ? cleanText_(environment) : '';
   let state = selectedEnvironment
@@ -2799,6 +2977,7 @@ function continueImportNotificationCampaign(environment) {
   setExecutionEnvironment_(state.environment, false);
   try {
     const profile = assertEnvironmentWritable_();
+    recoverPendingSynchronousDelivery_();
     if (!configBoolean_('SLACK_NOTIFICATIONS_ENABLED', false)) {
       state.status = 'PAUSED';
       state.lastError = profile.label + ' Slack notifications are disabled.';
@@ -2865,18 +3044,28 @@ function continueImportNotificationCampaign(environment) {
     }
 
     if (state.phase === 'DELIVERING' && state.currentOwnerDelivery) {
-      const receipt = state.currentOwnerDelivery;
       let batchesProcessed = 0;
       while (state.currentOwnerDelivery && batchesProcessed < maxBatchesPerExecution && Date.now() < executionDeadline) {
-        const remaining = importNotificationCampaignOwnerRecords_(groups, receipt.messageType, receipt.recipient);
-        const finalized = finalizeNotificationOwnerGroupChunk_(remaining.slice(0, batchSize), receipt);
-        state.delivered += finalized;
-        batchesProcessed += 1;
-        if (remaining.length <= batchSize) {
-          state.currentOwnerDelivery = null;
-          state.ownerMessagesDelivered += 1;
+        const receipt = state.currentOwnerDelivery;
+        const key = state.runId + '|' + receipt.batchId + '|' + Number(state.delivered || 0);
+        let saved = readDurablePayload_('NotificationBatch', key);
+        if (!saved) {
+          const remaining = importNotificationCampaignOwnerRecords_(groups, receipt.messageType, receipt.recipient);
+          const plan = newDurableWritePlan_();
+          const finalized = finalizeNotificationOwnerGroupChunk_(remaining.slice(0, batchSize), receipt, plan);
+          const nextState = JSON.parse(JSON.stringify(state));
+          nextState.delivered += finalized;
+          if (remaining.length <= batchSize) {
+            nextState.currentOwnerDelivery = null;
+            nextState.ownerMessagesDelivered += 1;
+          }
+          saved = { writes: plan.writes, nextState: nextState };
+          saveDurablePayload_('NotificationBatch', key, saved);
         }
+        applyDurableWrites_(saved.writes);
+        state = saved.nextState;
         setImportNotificationCampaignState_(state);
+        batchesProcessed += 1;
       }
       try { scheduleImportNotificationCampaign_(60000); } catch (scheduleError) {}
       return getImportNotificationCampaignStatus_(state.environment);
@@ -2979,6 +3168,14 @@ function importNotificationCampaignOwnerRecords_(groups, messageType, recipient)
 
 function retryImportNotificationCampaign() {
   assertAdmin_();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try { return retryImportNotificationCampaignLocked_(); }
+  finally { lock.releaseLock(); }
+}
+
+function retryImportNotificationCampaignLocked_() {
+  assertAdmin_();
   const profile = assertEnvironmentWritable_();
   if (!configBoolean_('SLACK_NOTIFICATIONS_ENABLED', false)) {
     throw new Error('Enable Slack notifications before retrying the paused delivery campaign.');
@@ -3014,6 +3211,14 @@ function retryImportNotificationCampaign() {
 
 function resumeStalledImportNotificationCampaign() {
   assertAdmin_();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try { return resumeStalledImportNotificationCampaignLocked_(); }
+  finally { lock.releaseLock(); }
+}
+
+function resumeStalledImportNotificationCampaignLocked_() {
+  assertAdmin_();
   const profile = assertEnvironmentWritable_();
   if (!configBoolean_('SLACK_NOTIFICATIONS_ENABLED', false)) {
     throw new Error('Enable Slack notifications before resuming delivery.');
@@ -3030,7 +3235,7 @@ function resumeStalledImportNotificationCampaign() {
   setImportNotificationCampaignState_(state);
   // Execute the first resumed checkpoint immediately so recovery does not depend on
   // Apps Script deciding when to service the replacement time trigger.
-  return continueImportNotificationCampaign(profile.key);
+  return continueImportNotificationCampaignLocked_(profile.key);
 }
 
 function scheduleImportNotificationCampaign_(delayMs) {
@@ -3129,7 +3334,7 @@ function setFinalizationProgress_(state, progressStage, message) {
   });
 }
 
-function cancelImportPlatformActions_(activeRecoveryAssetIds, dismissedAssetIds) {
+function cancelImportPlatformActions_(activeRecoveryAssetIds, dismissedAssetIds, plan) {
   const targets = {};
   (activeRecoveryAssetIds || []).forEach(function (assetId) {
     targets[assetId] = { bucket: 'recovery', reason: 'Latest complete extract shows the asset is active.' };
@@ -3150,11 +3355,14 @@ function cancelImportPlatformActions_(activeRecoveryAssetIds, dismissedAssetIds)
     result[target.bucket] += 1;
     return action;
   });
-  updateObjectsByKey_(APP.sheets.platformActions, 'ACTION_ID', updates);
+  if (plan) planUpdateObjects_(plan, APP.sheets.platformActions, 'ACTION_ID', updates);
+  else updateObjectsByKey_(APP.sheets.platformActions, 'ACTION_ID', updates);
   return result;
 }
 
 function queueImportOrphanQuarantineActions_(assetIds, runId) {
+  const saved = readDurablePayload_('OrphanHandoffs', runId);
+  if (saved) { applyDurableWrites_(saved.writes); return saved.prepared; }
   const ids = Array.from(new Set((assetIds || []).map(cleanText_).filter(Boolean)));
   if (!ids.length) return 0;
   const assets = indexObjectsBy_(readObjectsByKeys_(APP.sheets.assetsCurrent, 'ASSET_ID', ids), 'ASSET_ID');
@@ -3205,8 +3413,12 @@ function queueImportOrphanQuarantineActions_(assetIds, runId) {
       }));
     prepared += 1;
   });
-  appendObjectRows_(APP.sheets.platformActions, [], additions);
-  appendRawRows_(APP.sheets.events, events);
+  const plan = newDurableWritePlan_();
+  planAppendObjects_(plan, APP.sheets.platformActions, additions);
+  planAppendRows_(plan, APP.sheets.events, events);
+  const payload = { writes: plan.writes, prepared: prepared };
+  saveDurablePayload_('OrphanHandoffs', runId, payload);
+  applyDurableWrites_(payload.writes);
   return prepared;
 }
 
@@ -3253,11 +3465,11 @@ function lifecycleEventAssetsForRun_(runId, eventType) {
   });
 }
 
-function completeQuarantineActionsFromImport_(assetIds, completedAt, runId) {
+function completeQuarantineActionsFromImport_(assetIds, completedAt, runId, plan) {
   const targets = {};
   (assetIds || []).forEach(function (assetId) { targets[assetId] = true; });
   if (!Object.keys(targets).length) return 0;
-  const updates = readObjects_(APP.sheets.platformActions).filter(function (action) {
+  const updates = objectsWithPlannedWrites_(readObjects_(APP.sheets.platformActions), plan, APP.sheets.platformActions, 'ACTION_ID').filter(function (action) {
     return targets[action.ASSET_ID] && cleanText_(action.ACTION).toUpperCase() === 'QUARANTINE' &&
       ['READY', 'EXPORTED', 'ACCEPTED'].indexOf(cleanText_(action.STATUS).toUpperCase()) !== -1;
   }).map(function (action) {
@@ -3273,7 +3485,8 @@ function completeQuarantineActionsFromImport_(assetIds, completedAt, runId) {
     action.ERROR = '';
     return action;
   });
-  updateObjectsByKey_(APP.sheets.platformActions, 'ACTION_ID', updates);
+  if (plan) planUpdateObjects_(plan, APP.sheets.platformActions, 'ACTION_ID', updates);
+  else updateObjectsByKey_(APP.sheets.platformActions, 'ACTION_ID', updates);
   return updates.length;
 }
 
@@ -3333,6 +3546,9 @@ function approveImportedCandidates_(runId, approvedAt) {
 }
 
 function approveImportedCandidatesChunk_(runId, approvedAt, cursorRow, batchSize) {
+  const key = runId + '|' + cursorRow;
+  const saved = readDurablePayload_('ApprovalBatch', key);
+  if (saved) return applyApprovalBatch_(saved);
   const sheet = getSheet_(APP.sheets.cases);
   const lastRow = sheet.getLastRow();
   const lastColumn = sheet.getLastColumn();
@@ -3375,25 +3591,27 @@ function approveImportedCandidatesChunk_(runId, approvedAt, cursorRow, batchSize
     if (isOrphan) orphanAssetIds.push(item.ASSET_ID);
     else notificationAssetIds.push(item.ASSET_ID);
   });
-  updateObjectsByKey_(APP.sheets.cases, 'CASE_ID', updates);
-  updateImportedCandidateAssetStates_(updates);
-  appendRawRows_(APP.sheets.events, events);
-  let notificationDrafts = 0;
-  if (notificationAssetIds.length) {
-    notificationDrafts += createNotificationDraftBatch_(notificationAssetIds, 'STALE_ASSET_NOTICE').records.length;
-  }
-  if (orphanAssetIds.length) {
-    notificationDrafts += createNotificationDraftBatch_(orphanAssetIds, 'ORPHAN_QUARANTINE_NOTICE').records.length;
-  }
+  const plan = newDurableWritePlan_();
+  planUpdateObjects_(plan, APP.sheets.cases, 'CASE_ID', updates);
+  updateImportedCandidateAssetStates_(updates, plan);
+  planAppendRows_(plan, APP.sheets.events, events);
   const nextRow = startRow + count;
-  return {
-    nextRow: nextRow, done: nextRow > lastRow,
-    approvedAssets: notificationAssetIds.length, orphanAssets: orphanAssetIds.length,
-    notificationDrafts: notificationDrafts
-  };
+  const payload = { writes: plan.writes, notificationAssetIds: notificationAssetIds, orphanAssetIds: orphanAssetIds,
+    result: { nextRow: nextRow, done: nextRow > lastRow, approvedAssets: notificationAssetIds.length, orphanAssets: orphanAssetIds.length } };
+  saveDurablePayload_('ApprovalBatch', key, payload);
+  return applyApprovalBatch_(payload);
 }
 
-function updateImportedCandidateAssetStates_(caseRecords) {
+function applyApprovalBatch_(payload) {
+  applyDurableWrites_(payload.writes);
+  let notificationDrafts = 0;
+  if (payload.notificationAssetIds.length) notificationDrafts += createNotificationDraftBatch_(payload.notificationAssetIds, 'STALE_ASSET_NOTICE').records.length;
+  if (payload.orphanAssetIds.length) notificationDrafts += createNotificationDraftBatch_(payload.orphanAssetIds, 'ORPHAN_QUARANTINE_NOTICE').records.length;
+  SpreadsheetApp.flush();
+  return Object.assign({}, payload.result, { notificationDrafts: notificationDrafts });
+}
+
+function updateImportedCandidateAssetStates_(caseRecords, plan) {
   const records = caseRecords || [];
   if (!records.length) return 0;
   const casesByAsset = indexObjectsBy_(records, 'ASSET_ID');
@@ -3412,10 +3630,14 @@ function updateImportedCandidateAssetStates_(caseRecords) {
     asset.ASSET_STATUS = deriveAssetStatus_(asset, caseRecord.STATE);
     return asset;
   });
+  if (plan) { planUpdateObjects_(plan, APP.sheets.assetsCurrent, 'ASSET_ID', updates); return updates.length; }
   return updateObjectsByKey_(APP.sheets.assetsCurrent, 'ASSET_ID', updates);
 }
 
 function carryForwardAndReconcileChunk_(state, cursorRow, batchSize) {
+  const key = state.runId + '|' + cursorRow;
+  const saved = readDurablePayload_('ReconciliationBatch', key);
+  if (saved) { applyDurableWrites_(saved.writes); return saved.result; }
   const caseSheet = getSheet_(APP.sheets.cases);
   const lastRow = caseSheet.getLastRow();
   const lastColumn = caseSheet.getLastColumn();
@@ -3482,14 +3704,18 @@ function carryForwardAndReconcileChunk_(state, cursorRow, batchSize) {
     oldAsset.SNAPSHOT_AT = state.snapshotAt;
     carry.push(oldAsset);
   });
-  appendObjectRows_(APP.sheets.assetsCurrent, ASSET_HEADERS, carry);
-  updateObjectsByKey_(APP.sheets.cases, 'CASE_ID', caseUpdates);
-  appendRawRows_(APP.sheets.events, events);
+  const plan = newDurableWritePlan_();
+  planAppendObjects_(plan, APP.sheets.assetsCurrent, carry);
+  planUpdateObjects_(plan, APP.sheets.cases, 'CASE_ID', caseUpdates);
+  planAppendRows_(plan, APP.sheets.events, events);
   const nextRow = startRow + count;
-  return {
+  const payload = { writes: plan.writes, result: {
     nextRow: nextRow, done: nextRow > lastRow, carriedForward: carry.length,
     purgedAssets: purgedAssets, selfPurgedAssets: selfPurgedAssets
-  };
+  } };
+  saveDurablePayload_('ReconciliationBatch', key, payload);
+  applyDurableWrites_(payload.writes);
+  return payload.result;
 }
 
 function carryForwardAndReconcile_(state) {
@@ -3566,8 +3792,7 @@ function refreshDashboardIndex_() {
 }
 
 function scheduleImportContinuation_(delayMs) {
-  deleteImportContinuationTriggers_();
-  ScriptApp.newTrigger('continueSnowflakeImport').timeBased().after(Math.max(10000, Number(delayMs || 10000))).create();
+  replaceWorkflowTrigger_('continueSnowflakeImport', Math.max(10000, Number(delayMs || 10000)));
 }
 
 function deleteImportContinuationTriggers_() {
@@ -3577,6 +3802,14 @@ function deleteImportContinuationTriggers_() {
 }
 
 function cancelSnowflakeImport() {
+  assertAdmin_();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try { return cancelSnowflakeImportLocked_(); }
+  finally { lock.releaseLock(); }
+}
+
+function cancelSnowflakeImportLocked_() {
   assertAdmin_();
   assertEnvironmentWritable_();
   const state = getImportState_();
@@ -3588,12 +3821,23 @@ function cancelSnowflakeImport() {
 
 function resumeSnowflakeImport() {
   assertAdmin_();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try { return resumeSnowflakeImportLocked_(); }
+  finally { lock.releaseLock(); }
+}
+
+function resumeSnowflakeImportLocked_() {
+  assertAdmin_();
   const profile = assertEnvironmentWritable_();
   reclaimOperationalGridCapacity_();
   let state = getImportState_(profile.key);
   if (!state) state = recoverFailedFinalizationState_(profile.key);
   state.message = 'A recovery continuation was requested; resuming from the latest saved checkpoint';
   state.recoveryRequestedAt = nowIso_();
+  state.retryCount = 0;
+  state.retryAfter = 0;
+  state.progressStage = state.phase === 'IMPORT' ? 'QUEUED_FOR_NEXT_SOURCE_BATCH' : 'RECONCILING_LIFECYCLE';
   state.lastError = '';
   setImportState_(state);
   updateJobRun_(state.runId, {
