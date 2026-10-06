@@ -142,11 +142,22 @@ function context(values) {
       lifecycle: { detected: 'DETECTED', notified: 'NOTIFIED', accepted: 'ACCEPTED', quarantined: 'QUARANTINED' },
       sheets: { cases: 'cases', notifications: 'notifications' }
     },
-    readObjectsByField_: () => [
-      { ASSET_ID: 'asset-b', STATE: 'DETECTED', OWNER_STATUS: 'KNOWN' },
-      { ASSET_ID: 'asset-a', STATE: 'NOTIFIED', OWNER_STATUS: 'KNOWN' },
-      { ASSET_ID: 'asset-c', STATE: 'ACCEPTED', OWNER_STATUS: 'ORPHANED' }
-    ],
+    getSheet_: () => ({
+      getLastRow: () => 4,
+      getLastColumn: () => 4,
+      getRange: (row, col, count, width) => ({
+        getDisplayValues: () => {
+          const headers = ['LAST_EVALUATION_RUN_ID', 'ASSET_ID', 'STATE', 'OWNER_STATUS'];
+          const rows = [
+            ['run-1', 'asset-b', 'DETECTED', 'KNOWN'],
+            ['run-1', 'asset-a', 'NOTIFIED', 'KNOWN'],
+            ['run-1', 'asset-c', 'ACCEPTED', 'ORPHANED']
+          ];
+          if (row === 1) return [headers.slice(col - 1, col - 1 + (width || 1))];
+          return rows.slice(row - 2, row - 2 + count).map(item => item.slice(col - 1, col - 1 + (width || 1)));
+        }
+      })
+    }),
     readObjects_: () => [
       { ASSET_ID: 'asset-a', TYPE: 'STALE_ASSET_NOTICE', STATUS: 'DRAFT' }
     ],
@@ -222,6 +233,15 @@ function context(values) {
   assert(grouping.includes('repositoryBulkWindowSize_()'));
   assert(reclaim.includes('usedRows + 1000'));
   assert(reclaim.includes('sheet.deleteRows('));
+  assert(reclaim.includes('Assets_Previous'));
+  assert(reclaim.includes('intakeUpload'));
+  const events = extractFunction('SnowflakeAdapter.js', 'lifecycleEventAssetGroupsForRun_');
+  assert(events.includes('forEachMatchingSheetRows_'));
+  assert(!events.includes('readObjects_(APP.sheets.events)'));
+  const prune = extractFunction('Repository.js', 'pruneEvaluationSnapshots_');
+  assert(prune.includes('SNAPSHOT_RETENTION_RUNS'));
+  const swap = extractFunction('SnowflakeAdapter.js', 'swapAssetBuffers_');
+  assert(swap.includes('deleteRows(usedRows + 1001'));
 }
 
 {
@@ -390,6 +410,7 @@ function context(values) {
     cleanText_: value => String(value == null ? '' : value).trim(),
     normalizeSlackMessageType_: value => String(value).toUpperCase(),
     isSlackEmail_: value => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(value || '').trim()),
+    IMPORT_NOTIFICATION_RECORDS_SNAPSHOT_: null,
     readObjects_: () => [
       { ASSET_ID: 'a1', TYPE: 'STALE_ASSET_NOTICE', RECIPIENTS: 'owner@salesforce.com', STATUS: 'DRAFT' },
       { ASSET_ID: 'a2', TYPE: 'STALE_ASSET_NOTICE', RECIPIENTS: 'owner@salesforce.com', STATUS: 'FAILED' },
@@ -397,6 +418,7 @@ function context(values) {
     ]
   });
   vm.runInContext(extractFunction('SnowflakeAdapter.js', 'importNotificationCampaignEligibility_'), sandbox);
+  vm.runInContext(extractFunction('SnowflakeAdapter.js', 'importNotificationCampaignReadRecords_'), sandbox);
   vm.runInContext(extractFunction('SnowflakeAdapter.js', 'importNotificationCampaignRecipientGroups_'), sandbox);
   const groups = JSON.parse(JSON.stringify(sandbox.importNotificationCampaignRecipientGroups_([
     { messageType: 'STALE_ASSET_NOTICE', assetIds: ['a1', 'a2', 'a3'] }

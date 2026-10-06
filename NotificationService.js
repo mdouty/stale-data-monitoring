@@ -168,7 +168,7 @@ function createNotificationDraftBatch_(assetIds, messageType) {
   });
   const eventsByAsset = {};
   if (['CONTESTATION_RECEIVED', 'RESTORATION_CONFIRMED'].indexOf(messageType) !== -1) {
-    readObjects_(APP.sheets.events).forEach(function (event) {
+    readObjectsByKeys_(APP.sheets.events, 'ASSET_ID', ids).forEach(function (event) {
       if (!assets[event.ASSET_ID]) return;
       if (!eventsByAsset[event.ASSET_ID]) eventsByAsset[event.ASSET_ID] = [];
       eventsByAsset[event.ASSET_ID].unshift(event);
@@ -777,11 +777,16 @@ function slackAssetSummaryLine_(detail, messageType) {
   const restrictAt = formatSlackDate_(caseRecord.RESTRICT_AT);
   const quarantineAt = formatSlackDate_(caseRecord.QUARANTINE_START_DATE);
   const purgeAt = formatSlackDate_(caseRecord.PURGE_ELIGIBLE_DATE);
+  // Surface the schema owner on the review-family notices so a fallback recipient (e.g. the
+  // EDG_OPERATIONS_RECIPIENT catch-all) can forward the item to the right person when no
+  // steward/owner resolved to a Slack email. Only appended when a value is present.
+  const schemaOwner = truncateSlackText_(cleanText_(asset.SCHEMA_OWNER), 120);
+  const schemaOwnerSuffix = schemaOwner ? ' · schema owner ' + schemaOwner : '';
   let detailText = '';
   if (messageType === 'STALE_ASSET_NOTICE') {
-    detailText = (daysInactive ? daysInactive + ' days since last read or creation' : 'read staleness signal unavailable') + (contestDeadline ? ' · respond by ' + contestDeadline : '');
+    detailText = (daysInactive ? daysInactive + ' days since last read or creation' : 'read staleness signal unavailable') + (contestDeadline ? ' · respond by ' + contestDeadline : '') + schemaOwnerSuffix;
   } else if (messageType === 'CONTESTATION_REMINDER' || messageType === 'OWNER_ESCALATION') {
-    detailText = (contestDeadline ? 'review by ' + contestDeadline : 'owner response overdue') + (restrictAt ? ' · restriction ' + restrictAt : '');
+    detailText = (contestDeadline ? 'review by ' + contestDeadline : 'owner response overdue') + (restrictAt ? ' · restriction ' + restrictAt : '') + schemaOwnerSuffix;
   } else if (messageType === 'CONTESTATION_RECEIVED') {
     detailText = 'contestation received · lifecycle paused';
   } else if (messageType === 'DEPRECATION_ACCEPTED') {

@@ -18,7 +18,8 @@ function harness() {
       getLastColumn: () => Math.max(0, ...sheet.data.map(row => row.length)),
       getMaxRows: () => sheet.maxRows, getMaxColumns: () => sheet.maxColumns,
       insertRowsAfter: (row, count) => { sheet.maxRows += count; }, insertColumnsAfter: (col, count) => { sheet.maxColumns += count; },
-      deleteColumns: (col, count) => { sheet.maxColumns -= count; }, hideSheet: noop, showSheet: noop,
+      deleteRows: (row, count) => { sheet.data.splice(row - 1, count); sheet.maxRows = Math.max(1, sheet.maxRows - count); },
+      deleteColumns: (col, count) => { sheet.maxColumns -= count; }, hideSheet: noop, showSheet: noop, clearContents: () => { sheet.data = []; },
       getRange: (row, col, count = 1, width = 1) => {
         const values = () => Array.from({ length: count }, (_, i) => Array.from({ length: width }, (_, j) => sheet.data[row - 1 + i]?.[col - 1 + j] ?? ''));
         return {
@@ -100,6 +101,82 @@ for (const after of [false, true]) for (let boundary = 1; boundary <= 4; boundar
   sheet.data.push(['someone-else', 'event']);
   assert.throws(() => s.applyDurableWrites_(plan.writes), /conflicting row/);
   assert.strictEqual(sheet.data[1][0], 'someone-else');
+}
+
+// When another writer took a reserved append row, the delivery-replay recovery
+// relocates only its own appends to the sheet's current end: the foreign row is
+// preserved, fixed-row updates stay put, every planned row lands exactly once, and
+// re-running the rebased plan is idempotent (no duplicate audit rows).
+{
+  const h = harness(), s = h.sandbox;
+  const events = h.makeSheet('events', [['ID', 'VALUE']]);
+  const notifications = h.makeSheet('notifications', [['NOTIFICATION_ID', 'STATUS'], ['n1', 'DRAFT']]);
+  const plan = s.newDurableWritePlan_();
+  s.planUpdateObjects_(plan, 'notifications', 'NOTIFICATION_ID', [{ NOTIFICATION_ID: 'n1', STATUS: 'SENT' }]);
+  s.planAppendRows_(plan, 'events', [['audit-1', 'NOTIFIED']]); // reserves events row 2
+  events.data.push(['someone-else', 'event']);                  // foreign writer takes row 2
+  assert.throws(() => s.applyDurableWrites_(plan.writes), /conflicting row/);
+  const rebased = s.rebaseDurableAppendWrites_(plan.writes);
+  s.applyDurableWrites_(rebased);
+  s.applyDurableWrites_(rebased); // idempotent replay must not duplicate
+  assert.strictEqual(events.data[1][0], 'someone-else'); // foreign row untouched
+  assert.strictEqual(events.data[2][0], 'audit-1');      // planned audit row relocated to the end
+  assert.strictEqual(events.getLastRow(), 3);            // written exactly once
+  assert.strictEqual(notifications.data[1][1], 'SENT');  // fixed-row update still applied
+}
+
+// Slack-free resume drains a delivered owner group's pending finalization writes
+// (rebasing an append the reserved row of which was taken) without ever sending, and
+// completes the campaign only when no owner groups still require a real Slack send.
+// The third case is a paused DELIVERING campaign whose finalization already applied
+// (no currentOwnerDelivery) and nothing left to send: resume must complete it so import
+// unblocks, without sending.
+for (const scenario of [
+  { remainingGroups: [], currentOwnerDelivery: { batchId: 'b1', messageType: 'STALE_ASSET_NOTICE', recipient: 'owner@example.com' }, expect: 'SUCCEEDED' },
+  { remainingGroups: [{ key: 'other|late@example.com' }], currentOwnerDelivery: { batchId: 'b1', messageType: 'STALE_ASSET_NOTICE', recipient: 'owner@example.com' }, expect: 'PAUSED' },
+  { remainingGroups: [], currentOwnerDelivery: null, expect: 'SUCCEEDED' }
+]) {
+  const remainingGroups = scenario.remainingGroups;
+  const h = harness(), s = h.sandbox;
+  const events = h.makeSheet('events', [['ID', 'VALUE']]);
+  h.makeSheet('notifications', [['NOTIFICATION_ID', 'STATUS'], ['n1', 'SENT']]);
+  let campaignState = {
+    status: 'PAUSED', phase: 'DELIVERING', environment: 'DEV', runId: 'run',
+    delivered: 0, failed: 0, ownerMessagesDelivered: 0, ownerMessagesTotal: 2,
+    attemptedOwnerGroupKeys: [], currentOwnerDelivery: scenario.currentOwnerDelivery
+  };
+  s.assertAdmin_ = () => ({ email: 'admin@example.com' });
+  s.assertEnvironmentWritable_ = () => ({ key: 'DEV' });
+  s.setExecutionEnvironment_ = noop;
+  s.deleteImportNotificationCampaignTriggers_ = noop;
+  s.getImportNotificationCampaignState_ = () => campaignState ? clone(campaignState) : null;
+  s.setImportNotificationCampaignState_ = value => { campaignState = clone(value); };
+  s.importNotificationCampaignProperty_ = () => 'IMPORT_NOTIFICATION_CAMPAIGN_DEV';
+  s.importNotificationCampaignGroups_ = () => [];
+  s.importNotificationCampaignOwnerRecords_ = () => [{ NOTIFICATION_ID: 'n1' }];
+  s.importNotificationCampaignRecipientGroups_ = () => clone(remainingGroups);
+  s.sendPreparedNotificationOwnerGroup_ = () => assert.fail('resume must not send a Slack message');
+  s.deliverSlackPayloadOnce_ = () => assert.fail('resume must not send a Slack message');
+  // Another writer took the reserved append row; recovery must relocate, not overwrite.
+  s.finalizeNotificationOwnerGroupChunk_ = (records, receipt, plan) => {
+    s.planAppendRows_(plan, 'events', [['audit-' + receipt.batchId, 'NOTIFIED']]);
+    return records.length;
+  };
+  events.data.push(['someone-else', 'event']); // occupies the reserved append row (row 2)
+  const status = s.resumePausedImportNotificationDeliveryLocked_();
+  assert.strictEqual(events.data[1][0], 'someone-else'); // foreign row never overwritten
+  if (scenario.currentOwnerDelivery) {
+    assert.strictEqual(events.data.filter(row => row[0] === 'audit-b1').length, 1); // audit row written exactly once
+  } else {
+    assert.ok(!events.data.some(row => row[0] === 'audit-b1')); // nothing to finalize, no writes
+  }
+  if (scenario.expect === 'SUCCEEDED') {
+    assert.strictEqual(status.status, 'SUCCEEDED');
+    assert.strictEqual(campaignState.phase, 'COMPLETE');
+  } else {
+    assert.strictEqual(status.status, 'PAUSED');
+    assert.ok(/still need sending/.test(campaignState.lastError));
+  }
 }
 
 // A crash after either rename resumes by sheet identity, never swapping back.

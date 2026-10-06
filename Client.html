@@ -57,6 +57,7 @@
     const canRunManualAutomation = canImport && config.environment.key !== 'PRD';
     document.getElementById('importButton').classList.toggle('hidden', !canImport);
     document.getElementById('runAutomationButton').classList.toggle('hidden', !canRunManualAutomation);
+    document.getElementById('sendRemindersButton').classList.toggle('hidden', !canImport);
     document.getElementById('importButton').textContent = 'Import & Refresh Data';
     document.getElementById('adminTab').classList.toggle('hidden', !config.user.isAdmin);
     document.getElementById('adminPanel').classList.toggle('hidden', !config.user.isAdmin);
@@ -67,10 +68,16 @@
     renderImportStatus(config.importStatus);
     renderAdminImportSummary(config.importStatus);
     loadDashboard(1);
-    if (config.importStatus.running) {
+    // Only admins poll import/campaign progress. Import publication and Slack delivery are
+    // admin-only operations (assertAdmin_); a non-admin viewer can't act on the status and
+    // only needs the static banner rendered above. Polling from every dashboard viewer is
+    // what produced the server-side lock-contention storm during a running campaign, so a
+    // non-admin session renders once and never enters the poll loop. (A non-admin dashboard
+    // will pick up freshly published data on its next natural page load rather than live.)
+    if (config.user.isAdmin && config.importStatus.running) {
       showPublishingLoading_(config.importStatus);
       startPolling(true);
-    } else if (config.importStatus.notificationCampaign && config.importStatus.notificationCampaign.running) {
+    } else if (config.user.isAdmin && config.importStatus.notificationCampaign && config.importStatus.notificationCampaign.running) {
       startPolling(false);
     } else {
       state.publicationOverlayDismissed = false;
@@ -164,7 +171,7 @@
     clearAppErrorBanner_();
     banner.classList.remove('hidden');
     banner.textContent = 'Switching to ' + environment + '…';
-    document.getElementById('assetRows').innerHTML = '<tr><td colspan="11" class="empty">Loading ' + escapeHtml(environment) + ' assets…</td></tr>';
+    document.getElementById('assetRows').innerHTML = '<tr><td colspan="13" class="empty">Loading ' + escapeHtml(environment) + ' assets…</td></tr>';
     runServer('setActiveEnvironment', environment, function (config) {
       applyClientConfig(config);
       showToast('Viewing ' + environment + '.');
@@ -212,7 +219,7 @@
       const body = document.getElementById('assetRows');
       const info = showAppError_(error, 'Unable to load the dashboard table.');
       body.setAttribute('aria-busy', 'false');
-      body.innerHTML = '<tr><td colspan="11"><div class="section-load-error"><strong>' + escapeHtml(info.title) + '</strong><span>' + escapeHtml(info.message) + '</span><button class="button subtle" type="button" onclick="' + (info.isAuth ? 'refreshApplication_()' : 'loadDashboard(state.page)') + '">' + (info.isAuth ? 'Refresh & sign in' : 'Try again') + '</button></div></td></tr>';
+      body.innerHTML = '<tr><td colspan="13"><div class="section-load-error"><strong>' + escapeHtml(info.title) + '</strong><span>' + escapeHtml(info.message) + '</span><button class="button subtle" type="button" onclick="' + (info.isAuth ? 'refreshApplication_()' : 'loadDashboard(state.page)') + '">' + (info.isAuth ? 'Refresh & sign in' : 'Try again') + '</button></div></td></tr>';
     });
     runner.getDashboard(request);
   }
@@ -220,7 +227,7 @@
   function showAssetTableLoading_(message) {
     const body = document.getElementById('assetRows');
     body.setAttribute('aria-busy', 'true');
-    body.innerHTML = '<tr><td colspan="11"><div class="section-loading compact"><div class="loading-spinner" aria-hidden="true"></div><span>' + escapeHtml(message || 'Loading assets…') + '</span></div></td></tr>';
+    body.innerHTML = '<tr><td colspan="13"><div class="section-loading compact"><div class="loading-spinner" aria-hidden="true"></div><span>' + escapeHtml(message || 'Loading assets…') + '</span></div></td></tr>';
     document.getElementById('selectAllAssets').disabled = true;
   }
 
@@ -426,7 +433,7 @@
     body.setAttribute('aria-busy', 'false');
     state.currentAssets = assets;
     document.getElementById('selectAllAssets').disabled = assets.length === 0;
-    if (!assets.length) { body.innerHTML = '<tr><td colspan="11" class="empty">No assets match these filters.</td></tr>'; updateBulkSelectionUi(); return; }
+    if (!assets.length) { body.innerHTML = '<tr><td colspan="13" class="empty">No assets match these filters.</td></tr>'; updateBulkSelectionUi(); return; }
     body.innerHTML = assets.map(function (asset) {
       const noRead = ['NEW_UNREAD', 'STALE_NO_READ_IN_AVAILABLE_HISTORY'].indexOf(asset.sourceActivityStatus) !== -1;
       const signalGap = /^(INVALID_|MISSING_)/.test(asset.sourceActivityStatus || '');
@@ -436,12 +443,14 @@
       const reason = asset.assetStatus === 'PURGED' ? 'Deletion verified in latest complete extract' : asset.assetStatus === 'QUARANTINED' ? 'Snowflake status is RESTRICTED' : signalGap ? 'Read staleness signal unavailable · lifecycle retained' : asset.assetStatus === 'STALE' ? readInactivity + ' · application threshold met' : 'Read activity is within the configured threshold';
       const checkbox = '<input class="asset-select" type="checkbox" value="' + escapeHtml(asset.assetId) + '" aria-label="Select ' + escapeHtml(asset.objectFqn) + '" onclick="event.stopPropagation()" onchange="toggleAssetSelection(this.value,this.checked)">';
       const stewardship = asset.businessSteward || asset.technicalSteward || 'No Slack email';
+      const techSteward = asset.technicalSteward || '—';
+      const schemaOwner = asset.schemaOwnerName || asset.schemaOwner || '—';
       const domain = asset.domain + (asset.subDomain ? ' · ' + asset.subDomain : '');
       const assetType = humanizeFilterValue_(asset.assetType || 'UNKNOWN');
       const rowCount = asset.rowCount === null || asset.rowCount === undefined ? '—' : formatNumber(asset.rowCount);
       const rowCountClass = Number(asset.rowCount) === 0 && asset.rowCount !== null ? ' row-count-zero' : '';
       const rowCountTitle = rowCountClass ? 'This asset currently reports zero rows.' : rowCount + ' rows';
-      return '<tr onclick="openAsset(' + JSON.stringify(asset.assetId).replace(/"/g, '&quot;') + ')"><td class="select-column" onclick="event.stopPropagation()">' + checkbox + '</td><td class="object" title="' + escapeHtml(asset.objectFqn) + '">' + escapeHtml(asset.objectFqn) + '</td><td class="asset-type-cell">' + escapeHtml(assetType) + '</td><td class="domain-cell" title="' + escapeHtml(domain) + '">' + escapeHtml(domain) + '</td><td class="numeric-column"><span class="row-count-value' + rowCountClass + '" title="' + escapeHtml(rowCountTitle) + '">' + escapeHtml(rowCount) + '</span></td><td class="date-cell">' + escapeHtml(formatDate(asset.lastRead)) + '</td><td>' + escapeHtml(reason) + '</td><td class="date-cell">' + escapeHtml(formatDate(asset.notificationDate)) + '</td><td class="steward-cell" title="' + escapeHtml(stewardship) + '">' + escapeHtml(stewardship) + '</td><td>' + badge(asset.assetStatus) + '</td><td>' + mainTableLifecycleBadge_(asset.lifecycleState) + '</td></tr>';
+      return '<tr onclick="openAsset(' + JSON.stringify(asset.assetId).replace(/"/g, '&quot;') + ')"><td class="select-column" onclick="event.stopPropagation()">' + checkbox + '</td><td class="object" title="' + escapeHtml(asset.objectFqn) + '">' + escapeHtml(asset.objectFqn) + '</td><td class="asset-type-cell">' + escapeHtml(assetType) + '</td><td class="domain-cell" title="' + escapeHtml(domain) + '">' + escapeHtml(domain) + '</td><td class="numeric-column"><span class="row-count-value' + rowCountClass + '" title="' + escapeHtml(rowCountTitle) + '">' + escapeHtml(rowCount) + '</span></td><td class="date-cell">' + escapeHtml(formatDate(asset.lastRead)) + '</td><td>' + escapeHtml(reason) + '</td><td class="date-cell">' + escapeHtml(formatDate(asset.notificationDate)) + '</td><td class="steward-cell" title="' + escapeHtml(stewardship) + '">' + escapeHtml(stewardship) + '</td><td class="steward-cell" title="' + escapeHtml(techSteward) + '">' + escapeHtml(techSteward) + '</td><td class="steward-cell" title="' + escapeHtml(schemaOwner) + '">' + escapeHtml(schemaOwner) + '</td><td>' + badge(asset.assetStatus) + '</td><td>' + mainTableLifecycleBadge_(asset.lifecycleState) + '</td></tr>';
     }).join('');
     updateBulkSelectionUi();
   }
@@ -961,7 +970,33 @@
     const container = document.getElementById('adminImportSummary');
     if (!container || !state.config) return;
     const running = status && status.running;
-    container.innerHTML = '<div class="admin-summary-item"><strong>' + (running ? 'Import in progress' : 'Ready for reviewed import') + '</strong><span>' + (running ? escapeHtml(status.message || status.phase) : 'CSV files open an intake review before publication.') + '</span></div><div class="admin-summary-item"><strong>' + escapeHtml(state.config.environment.key) + '</strong><span>environment</span></div><div class="admin-summary-item"><strong>' + (state.config.environment.importEnabled && !state.config.environment.readOnly ? 'Enabled' : 'Locked') + '</strong><span>import control</span></div>';
+    const campaign = (status && status.notificationCampaign) || {};
+    const campaignStatus = cleanClientText_(campaign.status).toUpperCase();
+    // Only a PAUSED campaign is genuinely mid-flight and blocks import. A
+    // COMPLETED_WITH_ERRORS campaign is terminal — the server already allows a
+    // new import in this state, so surface it as ready with an errors note
+    // rather than a hard block.
+    const blocked = !running && campaignStatus === 'PAUSED';
+    const completedWithErrors = !running && campaignStatus === 'COMPLETED_WITH_ERRORS';
+    const campaignReason = cleanClientText_(campaign.lastError);
+    let intakeTitle;
+    let intakeDetail;
+    if (running) {
+      intakeTitle = 'Import in progress';
+      intakeDetail = escapeHtml(status.message || status.phase);
+    } else if (blocked) {
+      intakeTitle = 'Import blocked · Slack delivery paused';
+      intakeDetail = escapeHtml(campaignReason || 'Resolve the paused Slack delivery to re-enable import.');
+    } else if (completedWithErrors) {
+      intakeTitle = 'Ready for reviewed import · Slack delivery completed with errors';
+      intakeDetail = escapeHtml(campaignReason || 'Some notifications still need attention, but import is re-enabled. Resolve uncertain deliveries when convenient.');
+    } else {
+      intakeTitle = 'Ready for reviewed import';
+      intakeDetail = 'CSV files open an intake review before publication.';
+    }
+    const deliveryResumable = blocked && Boolean(campaign.deliveryResumable);
+    container.innerHTML = '<div class="admin-summary-item"><strong>' + escapeHtml(intakeTitle) + '</strong><span>' + intakeDetail + '</span></div><div class="admin-summary-item"><strong>' + escapeHtml(state.config.environment.key) + '</strong><span>environment</span></div><div class="admin-summary-item"><strong>' + (blocked ? 'Blocked' : (state.config.environment.importEnabled && !state.config.environment.readOnly ? 'Enabled' : 'Locked')) + '</strong><span>import control</span></div>' +
+      (deliveryResumable ? '<div class="admin-summary-item"><strong>Finish paused delivery</strong><span>Apply saved records and complete without sending or enabling Slack.</span><button class="button secondary" type="button" onclick="resumePausedNotificationDelivery_()">Resume paused delivery</button></div>' : '');
   }
 
   function loadAdminSettings() {
@@ -984,10 +1019,10 @@
       exceptionDatabaseSheetName: config.exceptionDatabaseSheetName || 'Exception Log'
     };
     Object.keys(values).forEach(function (id) { document.getElementById(id).value = values[id]; });
-    ['includeViews', 'importEnabled', 'slackEnabled', 'purgeActionsEnabled'].forEach(function (id) {
+    ['includeViews', 'importEnabled', 'slackEnabled', 'lifecycleAutomationEnabled', 'purgeActionsEnabled'].forEach(function (id) {
       document.getElementById(id).checked = Boolean(config[id]);
     });
-    const environmentControlIds = Object.keys(values).concat(['includeViews', 'importEnabled', 'slackEnabled', 'purgeActionsEnabled', 'slackWorkflowWebhook', 'snowflakeEndpoint', 'data360Endpoint']);
+    const environmentControlIds = Object.keys(values).concat(['includeViews', 'importEnabled', 'slackEnabled', 'lifecycleAutomationEnabled', 'purgeActionsEnabled', 'slackWorkflowWebhook', 'snowflakeEndpoint', 'data360Endpoint']);
     environmentControlIds.forEach(function (id) { document.getElementById(id).disabled = Boolean(data.readOnly); });
     document.querySelectorAll('#adminPanel button[onclick="saveAdminConfiguration()"], #adminPanel button[onclick="saveSettings()"]')
       .forEach(function (button) { button.disabled = Boolean(data.readOnly); });
@@ -1145,6 +1180,7 @@
       includeViews: document.getElementById('includeViews').checked,
       importEnabled: document.getElementById('importEnabled').checked,
       slackEnabled: document.getElementById('slackEnabled').checked,
+      lifecycleAutomationEnabled: document.getElementById('lifecycleAutomationEnabled').checked,
       purgeActionsEnabled: document.getElementById('purgeActionsEnabled').checked
     };
     runServer('saveAdminConfiguration', payload, function (data) {
@@ -1156,6 +1192,7 @@
       const canImport = data.configuration.importEnabled && !state.config.environment.readOnly && state.config.user.isAdmin;
       document.getElementById('importButton').classList.toggle('hidden', !canImport);
       document.getElementById('runAutomationButton').classList.toggle('hidden', !canImport);
+      document.getElementById('sendRemindersButton').classList.toggle('hidden', !canImport);
       showToast('Admin configurations saved.');
     });
   }
@@ -1870,6 +1907,96 @@
     });
   }
 
+  function openReminderSweep() {
+    showConfirmation({
+      title: 'Send lifecycle reminders',
+      message: 'Resend Slack reminders for stale-data assets without changing any lifecycle state.',
+      detail: 'Detected assets receive the stale-data notice; notified assets receive a contestation reminder, or an owner escalation once their contest deadline has passed. Assets that already received the same notice are skipped.',
+      reviewHtml:
+        '<fieldset class="reminder-mode-choice" style="border:0;padding:0;margin:0;display:flex;flex-direction:column;gap:8px;">' +
+        '<label class="check"><input type="radio" name="reminderSweepMode" value="DUE" checked> Only assets currently due (respects notice and reminder dates)</label>' +
+        '<label class="check"><input type="radio" name="reminderSweepMode" value="ALL_DETECTED"> All detected assets — resend the stale-data notice (ignore due dates)</label>' +
+        '<label class="check"><input type="radio" name="reminderSweepMode" value="ALL_NOTIFIED"> All notified assets — resend contestation reminders &amp; escalations (ignore due dates)</label>' +
+        '</fieldset>',
+      confirmLabel: 'Preview recipients',
+      confirmClass: 'primary'
+    }, function () {
+      const selected = document.querySelector('input[name="reminderSweepMode"]:checked');
+      previewReminderSweep_(reminderSweepSelection_(selected ? selected.value : 'DUE'));
+    });
+  }
+
+  function reminderSweepSelection_(value) {
+    if (value === 'ALL_DETECTED') return { mode: 'ALL', scope: 'DETECTED' };
+    if (value === 'ALL_NOTIFIED') return { mode: 'ALL', scope: 'NOTIFIED' };
+    return { mode: 'DUE', scope: 'ALL' };
+  }
+
+  function previewReminderSweep_(selection) {
+    const loadingToken = beginServerLoading_('Preparing reminders', 'Counting assets due for a reminder…', false);
+    google.script.run.withSuccessHandler(function (preview) {
+      endServerLoading_(loadingToken);
+      const total = preview.total || 0;
+      if (!total) {
+        const emptyWhat = selection.mode === 'ALL'
+          ? (selection.scope === 'DETECTED' ? 'detected' : 'notified')
+          : 'currently due';
+        showToast('No ' + emptyWhat + ' assets need a reminder right now.');
+        return;
+      }
+      showConfirmation({
+        title: 'Send ' + formatNumber(total) + ' reminder' + (total === 1 ? '' : 's') + '?',
+        message: 'Consolidated Slack messages will be grouped by recipient and sent now.',
+        detail: formatNumber(preview.staleCount) + ' stale-data notice(s), ' + formatNumber(preview.reminderCount) +
+          ' contestation reminder(s), and ' + formatNumber(preview.escalationCount) + ' owner escalation(s).',
+        confirmLabel: 'Send reminders',
+        confirmClass: 'primary'
+      }, function () { runReminderSweep_(selection); });
+    }).withFailureHandler(function (error) {
+      endServerLoading_(loadingToken);
+      showToast(error.message || String(error), true);
+    }).previewLifecycleReminders({ mode: selection.mode, scope: selection.scope });
+  }
+
+  function runReminderSweep_(selection) {
+    const button = document.getElementById('sendRemindersButton');
+    if (button) button.disabled = true;
+    const totals = { processed: 0, groups: 0, failures: 0 };
+    const loadingToken = beginServerLoading_('Sending reminders', 'Delivering consolidated Slack reminders…', true);
+    let iterations = 0;
+    let lastRemaining = -1;
+    const finish = function () {
+      endServerLoading_(loadingToken);
+      if (button) button.disabled = false;
+      loadAdminOperations();
+    };
+    const step = function () {
+      iterations += 1;
+      google.script.run.withSuccessHandler(function (result) {
+        totals.processed += result.processed || 0;
+        totals.groups += (result.staleGroups || 0) + (result.reminderGroups || 0) + (result.escalationGroups || 0);
+        totals.failures += result.notificationFailureCount || 0;
+        // Stop if the backlog stopped shrinking (e.g. unroutable cases) to avoid an endless loop.
+        const noProgress = result.remaining === lastRemaining && (result.processed || 0) === 0;
+        lastRemaining = result.remaining;
+        if (!result.done && iterations < 200 && !noProgress) {
+          renderWorkflowLoading_('Sending reminders', 'Delivered ' + formatNumber(totals.processed) +
+            ' reminder(s); ' + formatNumber(result.remaining || 0) + ' remaining…', true);
+          step();
+          return;
+        }
+        finish();
+        const suffix = totals.failures ? ' ' + formatNumber(totals.failures) + ' delivery failure(s) — see execution logs.' : '';
+        showToast('Reminder delivery complete: ' + formatNumber(totals.processed) + ' asset(s) in ' +
+          formatNumber(totals.groups) + ' message group(s).' + suffix, Boolean(totals.failures));
+      }).withFailureHandler(function (error) {
+        finish();
+        showToast(error.message || String(error), true);
+      }).sendLifecycleReminderBatch({ mode: selection.mode, scope: selection.scope });
+    };
+    step();
+  }
+
   function startImport() {
     const input = document.getElementById('intakeFile');
     input.value = '';
@@ -1898,17 +2025,18 @@
       renderIntakeReviewPreparation_(state.intakePreparation);
       // Staging also queues review preparation, so a lost response cannot strand it.
       recoverStagedIntake_(uploadRequestId);
-    }).withFailureHandler(function () {
+    }).withFailureHandler(function (error) {
       stopUploadProgress_();
-      recoverStagedIntake_(uploadRequestId, 0);
+      recoverStagedIntake_(uploadRequestId, 0, error);
     }).stageSnowflakeCsvUpload(document.getElementById('intakeUploadForm'));
   }
 
-  function recoverStagedIntake_(uploadRequestId, attempt) {
+  function recoverStagedIntake_(uploadRequestId, attempt, stageError) {
     const retry = Number(attempt || 0);
     const environment = state.config && state.config.environment.key;
     const current = function () { return environment === (state.config && state.config.environment.key) &&
       (!state.activeUploadRequestId || state.activeUploadRequestId === uploadRequestId); };
+    const stageErrorMessage = stageError && (stageError.message || String(stageError));
     google.script.run.withSuccessHandler(function (status) {
       if (!current()) return;
       if (status) {
@@ -1917,8 +2045,18 @@
         handleIntakeReviewPreparationStatus_(status);
         return;
       }
+      // Recover found no staged review. If the original staging call reported a
+      // server error, it never persisted — surface that reason immediately
+      // instead of masking it behind the 30-second "could not be confirmed" timeout.
+      if (stageErrorMessage) {
+        state.activeUploadRequestId = null;
+        hideWorkflowLoading_();
+        document.getElementById('importButton').disabled = false;
+        showToast(stageErrorMessage, true);
+        return;
+      }
       if (uploadRequestId && retry < 6) {
-        state.intakeReviewPoller = setTimeout(function () { recoverStagedIntake_(uploadRequestId, retry + 1); }, 5000);
+        state.intakeReviewPoller = setTimeout(function () { recoverStagedIntake_(uploadRequestId, retry + 1, stageError); }, 5000);
         return;
       }
       if (uploadRequestId) {
@@ -1929,7 +2067,7 @@
     }).withFailureHandler(function () {
       if (!current() || !uploadRequestId) return;
       showWorkflowLoading_('Reconnecting', 'Checking whether the upload was saved. Review preparation continues if staging completed.', { indeterminate: true, stage: 'Waiting for connection', dismissible: true });
-      state.intakeReviewPoller = setTimeout(function () { recoverStagedIntake_(uploadRequestId, retry + 1); }, 5000);
+      state.intakeReviewPoller = setTimeout(function () { recoverStagedIntake_(uploadRequestId, retry + 1, stageError); }, 5000);
     }).recoverSnowflakeIntake({ uploadRequestId: uploadRequestId || '' });
   }
 
@@ -2576,18 +2714,29 @@
 
   function startPolling(showOverlay) {
     clearTimeout(state.poller);
+    // Seed whether the client should drive the publication workflow. Only an actively
+    // running import needs advanceActiveImportWorkflow; this is re-derived from
+    // status.running on every tick below, so a resume that starts with showOverlay=false
+    // self-corrects after the first status read.
+    state.publicationAdvancing = Boolean(showOverlay);
     const generation = (state.publicationPollGeneration || 0) + 1;
     state.publicationPollGeneration = generation;
     let publicationCompleted = !showOverlay;
     const poll = function () {
       if (state.publicationPollGeneration !== generation) return;
-      if (!state.publicationAdvanceInFlight) {
+      // Only drive the publication workflow while an import is actually running. During the
+      // notification-campaign-only phase, Slack delivery is driven by the Head Time-Driven
+      // continueImportNotificationCampaign trigger, so calling advanceActiveImportWorkflow from
+      // every open client tab would only contend for the script lock (and fail outright for
+      // non-admin viewers), starving and slowing delivery.
+      if (state.publicationAdvancing && !state.publicationAdvanceInFlight) {
         state.publicationAdvanceInFlight = true;
         const finished = function () { state.publicationAdvanceInFlight = false; };
         google.script.run.withSuccessHandler(finished).withFailureHandler(finished).advanceActiveImportWorkflow();
       }
       google.script.run.withSuccessHandler(function (status) {
         if (state.publicationPollGeneration !== generation) return;
+        state.publicationAdvancing = Boolean(status.running);
         renderImportStatus(status);
         if (status.running) {
           if (showOverlay && !state.publicationOverlayDismissed) showPublishingLoading_(status);
@@ -2671,14 +2820,23 @@
       return;
     }
     if (!status.running && ['PAUSED', 'COMPLETED_WITH_ERRORS'].indexOf(cleanClientText_(campaign.status).toUpperCase()) !== -1) {
+      const isPaused = cleanClientText_(campaign.status).toUpperCase() === 'PAUSED';
       const slackEnabled = Boolean(state.config && state.config.integrations && state.config.integrations.slack && state.config.integrations.slack.enabled);
-      banner.classList.remove('hidden', 'app-error');
-      banner.classList.add('error');
-      banner.innerHTML = '<span>Data is published. Slack delivery is ' + (campaign.status === 'PAUSED' ? 'paused' : 'complete with errors') + ': ' +
+      const campaignReason = cleanClientText_(campaign.lastError);
+      banner.classList.remove('hidden');
+      banner.classList.add('error', 'app-error');
+      const summaryText = 'Data is published. Slack delivery is ' + (isPaused ? 'paused' : 'complete with errors') + ': ' +
         formatNumber(campaign.completed || 0) + ' of ' + formatNumber(campaign.total || 0) + ' processed, ' +
-        formatNumber(campaign.delivered || 0) + ' delivered, ' + formatNumber(campaign.failed || 0) + ' needing attention.</span>' +
-        (slackEnabled ? ' <button class="button secondary" type="button" onclick="retryImportNotificationCampaign_()">Retry saved delivery</button> <button class="button secondary" type="button" onclick="reviewUncertainDeliveries_()">Verify uncertain deliveries</button>' : ' <span>Enable Slack notifications after correcting the workflow payload to retry.</span>');
-      document.getElementById('importButton').disabled = true;
+        formatNumber(campaign.delivered || 0) + ' delivered, ' + formatNumber(campaign.failed || 0) + ' needing attention.';
+      banner.innerHTML = '<div class="app-error-copy"><strong>' + escapeHtml(summaryText) + '</strong>' +
+        (campaignReason ? '<span>Reason: ' + escapeHtml(campaignReason) + '</span>' : '') +
+        (slackEnabled ? '' : '<span>Enable Slack notifications after correcting the workflow payload to retry.</span>') +
+        '</div>' +
+        (slackEnabled ? '<div class="app-error-actions"><button class="button secondary" type="button" onclick="retryImportNotificationCampaign_()">Retry saved delivery</button> <button class="button secondary" type="button" onclick="reviewUncertainDeliveries_()">Verify uncertain deliveries</button></div>' : '');
+      // PAUSED is mid-flight and still blocks import. COMPLETED_WITH_ERRORS is
+      // terminal — the server already allows a new import, so leave the button
+      // enabled and let the delivery actions above resolve the failures.
+      document.getElementById('importButton').disabled = isPaused;
       return;
     }
     if (!status.running) {
@@ -2721,7 +2879,7 @@
           button.className = 'button secondary';
           button.textContent = choice[1];
           button.onclick = function () {
-            confirmAction({ title: choice[1], message: 'Record your verification for ' + entry.recipient + '?',
+            showConfirmation({ title: choice[1], message: 'Record your verification for ' + entry.recipient + '?',
               detail: choice[0] === 'RECEIVED' ? 'The saved receipt will finish processing without sending again.' : 'A subsequent retry may send this message. Confirm only after verifying that Slack did not receive it.',
               confirmLabel: choice[1] }, function () {
               google.script.run.withSuccessHandler(function () {
@@ -2740,7 +2898,7 @@
   }
 
   function retryImportNotificationCampaign_() {
-    confirmAction({
+    showConfirmation({
       title: 'Retry Slack delivery',
       message: 'Retry failed and unprocessed notification candidates without republishing asset data?',
       detail: 'Already-sent notification records are idempotent and will not be duplicated.',
@@ -2756,6 +2914,26 @@
         endServerLoading_(loadingToken);
         showToast(error.message || String(error), true);
       }).retryImportNotificationCampaign();
+    });
+  }
+
+  function resumePausedNotificationDelivery_() {
+    showConfirmation({
+      title: 'Resume paused delivery',
+      message: 'Finish applying the paused delivery’s saved records without sending any Slack messages?',
+      detail: 'The message for this owner was already delivered; this only writes its saved audit records. If other owners still need a message, you’ll be told to enable Slack and retry.',
+      confirmLabel: 'Resume delivery'
+    }, function () {
+      const loadingToken = beginServerLoading_('Resuming paused delivery', 'Applying saved delivery records without sending…', true);
+      google.script.run.withSuccessHandler(function (status) {
+        endServerLoading_(loadingToken);
+        showToast('Paused delivery finalization resumed.');
+        renderImportStatus({ running: false, notificationCampaign: status });
+        startPolling(false);
+      }).withFailureHandler(function (error) {
+        endServerLoading_(loadingToken);
+        showToast(error.message || String(error), true);
+      }).resumePausedImportNotificationDelivery();
     });
   }
 

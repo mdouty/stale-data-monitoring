@@ -126,6 +126,44 @@ function applyDurableWrites_(writes) {
   SpreadsheetApp.flush();
 }
 
+// Recovery for a durable append whose reserved rows were claimed by another writer
+// between planning and replay. Relocates only the plan's own append writes to each
+// sheet's current end, mirroring applyDurableWrites_'s conflict test so it moves
+// exactly the writes that would otherwise throw. It never overwrites the foreign row
+// (it writes to empty space) and preserves every planned row and ID, so replaying the
+// rebased plan stays idempotent and loses no audit history. Non-append writes
+// (fixed-row updates) are returned unchanged.
+function rebaseDurableAppendWrites_(writes) {
+  const list = writes || [];
+  const ends = {};
+  return list.map(function (write) {
+    if (!write.append || !write.rows.length) return write;
+    const sheet = getSheet_(write.sheet);
+    if (ends[write.sheet] === undefined) ends[write.sheet] = Math.max(2, sheet.getLastRow() + 1);
+    let conflict = false;
+    if (sheet.getLastRow() >= write.row) {
+      sheet.getRange(write.row, 1, write.rows.length, write.rows[0].length).getValues().forEach(function (row, index) {
+        const rowNumber = write.row + index;
+        const matchesPlanned = list.some(function (other) {
+          return other.sheet === write.sheet && rowNumber >= other.row && rowNumber < other.row + other.rows.length &&
+            row.every(function (cell, column) {
+              const expected = other.rows[rowNumber - other.row];
+              return String(cell) === String(expected[column] === undefined ? '' : expected[column]);
+            });
+        });
+        if (row.some(function (cell) { return cell !== ''; }) && !matchesPlanned) conflict = true;
+      });
+    }
+    if (!conflict) {
+      ends[write.sheet] = Math.max(ends[write.sheet], write.row + write.rows.length);
+      return write;
+    }
+    const rebased = { sheet: write.sheet, row: ends[write.sheet], rows: write.rows, append: true };
+    ends[write.sheet] += write.rows.length;
+    return rebased;
+  });
+}
+
 function replaceWorkflowTrigger_(handler, delayMs) {
   // Keep the old fallback until its replacement exists.
   const replacement = ScriptApp.newTrigger(handler).timeBased().after(delayMs).create();
@@ -212,6 +250,101 @@ function deliverSlackPayloadOnce_(records, type, recipient, payload, url) {
   if ([400, 401, 403, 404, 405, 410, 413, 415, 422, 429].indexOf(receipt.responseCode) !== -1) setSlackDeliveryReceipt_(entry, 'REJECTED');
   else throw new Error('DELIVERY_UNCERTAIN: Slack returned HTTP ' + receipt.responseCode + ' for ' + receipt.batchId + '. Verify delivery before retrying.');
   throw new Error('Slack webhook returned HTTP ' + receipt.responseCode + ': ' + response.getContentText().substring(0, 500));
+}
+
+/**
+ * DIAGNOSTIC (run from the Apps Script editor Run menu). Probes the configured
+ * Slack workflow webhook the same way deliverSlackPayloadOnce_ does, but WITHOUT
+ * writing anything to the delivery ledger. It answers the one question the
+ * ledger cannot: what does the endpoint actually return today?
+ *
+ *   FETCH_THREW  -> timeout / DNS / connection failure  (leaves real rows ATTEMPTING)
+ *   REDIRECT_3xx -> webhook URL moved                    (leaves real rows ATTEMPTING)
+ *   SERVER_ERROR -> workflow errored on Slack's side     (leaves real rows ATTEMPTING)
+ *   CLIENT_ERROR -> 4xx; real sends would be REJECTED, not ATTEMPTING
+ *   ACCEPTED_2xx -> reachable and healthy
+ *
+ * Safety: if the webhook + workflow are healthy this sends exactly ONE real Slack
+ * message. It is addressed to the account running the function
+ * (Session.getEffectiveUser) — never a data steward — and the body is clearly
+ * marked as a connectivity test. Read the result in View > Executions (it is
+ * both Logger.log'd and returned).
+ */
+function probeSlackWebhook() {
+  const url = PropertiesService.getScriptProperties().getProperty(APP.slackWorkflowProperty);
+  const self = Session.getEffectiveUser().getEmail();
+  const result = { runBy: self, ranAt: new Date().toISOString(), urlHost: '' };
+  if (!url) {
+    result.outcome = 'NOT_CONFIGURED';
+    result.diagnosis = APP.slackWorkflowProperty + ' is empty. Set the webhook in Admin > Settings before enabling delivery.';
+    Logger.log(JSON.stringify(result, null, 2));
+    return result;
+  }
+  result.urlHost = url.replace(/^https?:\/\//, '').split('/')[0];
+
+  // The Slack workflow trigger types edgContact as a Channel ID and primaryRecipient
+  // as a user email. A real send fills edgContact from config.EDG_CONTACT (and throws
+  // locally unless it is a valid channel ID). Mirror that here so the probe is faithful —
+  // otherwise an empty edgContact makes Slack reject with invalid_workflow_input even
+  // though real sends would succeed.
+  const edgContact = cleanText_(getConfig_().EDG_CONTACT);
+  if (!isSlackChannelId_(edgContact)) {
+    result.outcome = 'NOT_CONFIGURED';
+    result.diagnosis = 'EDG_CONTACT is not a valid Slack channel ID (expected e.g. C065MLQ2HLL). ' +
+      'Set it in Admin > Settings. Real sends throw locally on this before ever reaching Slack, ' +
+      'and the workflow trigger rejects an empty channel with invalid_workflow_input.';
+    Logger.log(JSON.stringify(result, null, 2));
+    return result;
+  }
+
+  // Mirror the exact shape a real send posts, but self-addressed and marked test.
+  const payload = normalizeSlackWorkflowPayload_({
+    messageType: 'STALE_ASSET_NOTICE',
+    primaryRecipient: self,
+    edgContact: edgContact,
+    environment: getActiveEnvironment_(),
+    assetCount: 0,
+    assetSummary: '[Connectivity test from probeSlackWebhook — safe to ignore]'
+  });
+
+  const started = Date.now();
+  let response;
+  try {
+    response = UrlFetchApp.fetch(url, { method: 'post', contentType: 'application/json', payload: JSON.stringify(payload), muteHttpExceptions: true });
+  } catch (error) {
+    result.outcome = 'FETCH_THREW';
+    result.elapsedMs = Date.now() - started;
+    result.error = String(error && error.message ? error.message : error).substring(0, 500);
+    result.diagnosis = result.elapsedMs > 25000
+      ? 'The endpoint did not respond in time (timeout). This is what leaves real rows ATTEMPTING.'
+      : 'The request failed before any response (DNS / connection / TLS). This leaves real rows ATTEMPTING.';
+    Logger.log(JSON.stringify(result, null, 2));
+    return result;
+  }
+
+  const code = response.getResponseCode();
+  const headers = response.getAllHeaders() || {};
+  result.responseCode = code;
+  result.elapsedMs = Date.now() - started;
+  result.location = headers.Location || headers.location || '';
+  result.bodyPreview = String(response.getContentText() || '').substring(0, 500);
+  if (code >= 200 && code < 300) {
+    result.outcome = 'ACCEPTED_2xx';
+    result.diagnosis = 'Webhook reachable and accepted. A test message should reach ' + self + '. If real sends still go ATTEMPTING, the failure is intermittent (timeout under load) or specific to a larger payload.';
+  } else if (code >= 300 && code < 400) {
+    result.outcome = 'REDIRECT_3xx';
+    result.diagnosis = 'Endpoint redirected (see location). The webhook URL likely moved — re-copy it from Workflow Builder into Admin > Settings.';
+  } else if ([400, 401, 403, 404, 405, 410, 413, 415, 422, 429].indexOf(code) !== -1) {
+    result.outcome = 'CLIENT_ERROR_' + code;
+    result.diagnosis = code === 404
+      ? 'Webhook not found — the workflow was deleted or its trigger regenerated. Re-copy the webhook URL into Admin > Settings. NOTE: a 4xx marks real sends REJECTED, not ATTEMPTING, so this is probably not your current failure.'
+      : 'Slack rejected the request (' + code + '). A 4xx marks real sends REJECTED, not ATTEMPTING.';
+  } else {
+    result.outcome = 'SERVER_ERROR_' + code;
+    result.diagnosis = 'Slack returned a server error. The workflow errored on its side (e.g., it was unpublished, or a step references a variable the payload no longer supplies). This leaves real rows ATTEMPTING. Fix the workflow in Workflow Builder.';
+  }
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
 }
 
 function getUncertainSlackDeliveries() {

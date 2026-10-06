@@ -352,12 +352,27 @@ function applyPlatformOutcome_(actionRecord) {
   }
 }
 
-function runLifecycleAutomation(environment) {
+function runLifecycleAutomation(environment, options) {
   // Time-based triggers have no browser-selected environment. Keep no-argument
   // trigger executions in DEV; explicit/manual calls pass their environment.
+  const manual = Boolean(options && options.manual);
   if (environment) setExecutionEnvironment_(environment, false);
   else setExecutionEnvironment_('DEV', false);
   const profile = assertEnvironmentWritable_();
+  // The scheduled sweep can be paused so notifications are sent only when an admin
+  // manually invokes them (Send reminders / Run automation now). Manual calls bypass
+  // the pause; the master SLACK_NOTIFICATIONS_ENABLED gate still governs delivery.
+  if (!manual && !configBoolean_('LIFECYCLE_AUTOMATION_ENABLED', true)) {
+    return {
+      environment: profile.key, paused: true,
+      initialNoticeAssets: 0, initialNoticeGroups: 0,
+      reminderAssets: 0, reminderGroups: 0,
+      escalationAssets: 0, escalationGroups: 0,
+      purgeNoticeAssets: 0, purgeNoticeGroups: 0,
+      newlyPurgeEligible: 0, autoAccepted: 0, purgeActionsQueued: 0,
+      notificationFailureCount: 0, notificationErrors: []
+    };
+  }
   const cases = readObjects_(APP.sheets.cases);
   const sentNotifications = {};
   readObjects_(APP.sheets.notifications).forEach(function (record) {
@@ -487,7 +502,194 @@ function runLifecycleAutomation(environment) {
 
 function runLifecycleAutomationNow() {
   assertAdmin_();
-  return runLifecycleAutomation(getActiveEnvironment_());
+  return runLifecycleAutomation(getActiveEnvironment_(), { manual: true });
+}
+
+// --- Manual lifecycle reminder sweep (notifications only) -------------------
+// Admin-initiated resend of the two lifecycle reminders — STALE_ASSET_NOTICE for
+// DETECTED cases and CONTESTATION_REMINDER / OWNER_ESCALATION for NOTIFIED cases —
+// WITHOUT the lifecycle state transitions runLifecycleAutomation performs. Two
+// modes: 'DUE' respects the notice/reminder timing exactly as the daily automation
+// does; 'ALL' ignores due dates and sweeps every DETECTED/NOTIFIED case. Both modes
+// stay idempotent: a case that already has the same notice (DRAFT/SENT/FAILED) is
+// skipped, so 'ALL' will not double-message an owner who was already notified.
+//
+// Scale: enumeration reads only the columns it needs via single-column ranges and
+// accumulates asset-id strings, never full-row objects, so it survives the 62k-case
+// scale that OOMs readObjects_. Delivery is bounded to REMINDER_SWEEP_BATCH_ASSETS
+// per call and resumable: the notices sent this call become the idempotency gate
+// that the next call skips, so repeated calls drain the backlog without a cursor.
+
+function lifecycleReminderMaxAssetsPerBatch_() {
+  const configured = configNumber_('REMINDER_SWEEP_BATCH_ASSETS', 500);
+  return Math.max(50, Math.min(1000, Number(configured || 500)));
+}
+
+function collectExistingNotificationCaseTypeKeys_() {
+  const sheet = getSheet_(APP.sheets.notifications);
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+  const keys = {};
+  if (lastRow < 2 || lastColumn < 1) return keys;
+  const headers = sheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0];
+  const caseIdCol = headers.indexOf('CASE_ID');
+  const typeCol = headers.indexOf('TYPE');
+  const statusCol = headers.indexOf('STATUS');
+  if (caseIdCol === -1 || typeCol === -1) return keys;
+  const rowCount = lastRow - 1;
+  const caseIds = sheet.getRange(2, caseIdCol + 1, rowCount, 1).getDisplayValues();
+  const types = sheet.getRange(2, typeCol + 1, rowCount, 1).getDisplayValues();
+  const statuses = statusCol !== -1 ? sheet.getRange(2, statusCol + 1, rowCount, 1).getDisplayValues() : null;
+  for (let i = 0; i < rowCount; i += 1) {
+    const caseId = cleanText_(caseIds[i][0]);
+    if (!caseId) continue;
+    if (statuses) {
+      const status = cleanText_(statuses[i][0]).toUpperCase();
+      if (['DRAFT', 'SENT', 'FAILED'].indexOf(status) === -1) continue;
+    }
+    let type = '';
+    try { type = normalizeSlackMessageType_(types[i][0]); } catch (error) { continue; }
+    keys[caseId + '|' + type] = true;
+  }
+  return keys;
+}
+
+function normalizeLifecycleReminderScope_(value) {
+  const scope = cleanText_(value).toUpperCase();
+  return (scope === 'DETECTED' || scope === 'NOTIFIED') ? scope : 'ALL';
+}
+
+function collectLifecycleReminderTargets_(mode, limit, scope) {
+  const ignoreTiming = cleanText_(mode).toUpperCase() === 'ALL';
+  const scopeValue = normalizeLifecycleReminderScope_(scope);
+  const includeDetected = scopeValue !== 'NOTIFIED';
+  const includeNotified = scopeValue !== 'DETECTED';
+  const now = new Date();
+  const reminderLeadDays = configNumber_('CONTEST_REMINDER_LEAD_DAYS', 2);
+  const cap = Number(limit || 0);
+  const result = { stale: [], reminder: [], escalation: [], total: 0, remaining: 0, truncated: false };
+
+  const sheet = getSheet_(APP.sheets.cases);
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+  if (lastRow < 2 || lastColumn < 1) return result;
+  const headers = sheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0];
+  const caseIdCol = headers.indexOf('CASE_ID');
+  const assetIdCol = headers.indexOf('ASSET_ID');
+  const stateCol = headers.indexOf('STATE');
+  const t0Col = headers.indexOf('T0');
+  const noticeDueCol = headers.indexOf('NOTICE_DUE_AT');
+  const deadlineCol = headers.indexOf('CONTEST_DEADLINE');
+  if (assetIdCol === -1 || stateCol === -1) return result;
+  const rowCount = lastRow - 1;
+
+  const sentOrDrafted = collectExistingNotificationCaseTypeKeys_();
+  const caseIds = caseIdCol !== -1 ? sheet.getRange(2, caseIdCol + 1, rowCount, 1).getDisplayValues() : null;
+  const assetIds = sheet.getRange(2, assetIdCol + 1, rowCount, 1).getDisplayValues();
+  const states = sheet.getRange(2, stateCol + 1, rowCount, 1).getDisplayValues();
+  const t0s = t0Col !== -1 ? sheet.getRange(2, t0Col + 1, rowCount, 1).getDisplayValues() : null;
+  const noticeDues = noticeDueCol !== -1 ? sheet.getRange(2, noticeDueCol + 1, rowCount, 1).getDisplayValues() : null;
+  const deadlines = deadlineCol !== -1 ? sheet.getRange(2, deadlineCol + 1, rowCount, 1).getDisplayValues() : null;
+
+  const selectedSoFar = function () { return result.stale.length + result.reminder.length + result.escalation.length; };
+  const take = function (bucket, assetId) {
+    result.total += 1;
+    if (cap > 0 && selectedSoFar() >= cap) { result.remaining += 1; result.truncated = true; return; }
+    bucket.push(assetId);
+  };
+
+  for (let i = 0; i < rowCount; i += 1) {
+    const assetId = cleanText_(assetIds[i][0]);
+    if (!assetId) continue;
+    const lifecycleState = canonicalLifecycleState_(states[i][0]);
+    const caseId = caseIds ? cleanText_(caseIds[i][0]) : '';
+    const alreadySent = function (type) { return caseId ? Boolean(sentOrDrafted[caseId + '|' + type]) : false; };
+
+    if (lifecycleState === APP.lifecycle.detected) {
+      if (!includeDetected) continue;
+      if (alreadySent('STALE_ASSET_NOTICE')) continue;
+      if (!ignoreTiming) {
+        const dueAt = t0s && cleanText_(t0s[i][0]) ? t0s[i][0] : (noticeDues ? noticeDues[i][0] : '');
+        if (!cleanText_(dueAt) || new Date(dueAt) > now) continue;
+      }
+      take(result.stale, assetId);
+      continue;
+    }
+    if (lifecycleState === APP.lifecycle.notified) {
+      if (!includeNotified) continue;
+      const deadlineText = deadlines ? cleanText_(deadlines[i][0]) : '';
+      if (deadlineText) {
+        const deadline = new Date(deadlineText);
+        if (deadline <= now) {
+          if (!alreadySent('OWNER_ESCALATION')) take(result.escalation, assetId);
+          continue;
+        }
+        if (alreadySent('CONTESTATION_REMINDER')) continue;
+        if (!ignoreTiming) {
+          const reminderAt = new Date(deadline.getTime());
+          reminderAt.setUTCDate(reminderAt.getUTCDate() - reminderLeadDays);
+          if (reminderAt > now) continue;
+        }
+        take(result.reminder, assetId);
+        continue;
+      }
+      // No contest deadline recorded — only actionable in ALL mode, as a reminder.
+      if (ignoreTiming && !alreadySent('CONTESTATION_REMINDER')) take(result.reminder, assetId);
+    }
+  }
+  return result;
+}
+
+function previewLifecycleReminders(input) {
+  assertAdmin_();
+  const mode = cleanText_((input || {}).mode).toUpperCase() === 'ALL' ? 'ALL' : 'DUE';
+  const scope = normalizeLifecycleReminderScope_((input || {}).scope);
+  const targets = collectLifecycleReminderTargets_(mode, 0, scope);
+  return {
+    environment: getActiveEnvironment_(),
+    mode: mode,
+    scope: scope,
+    staleCount: targets.stale.length,
+    reminderCount: targets.reminder.length,
+    escalationCount: targets.escalation.length,
+    total: targets.total
+  };
+}
+
+function sendLifecycleReminderBatch(input) {
+  assertAdmin_();
+  const profile = assertEnvironmentWritable_();
+  const mode = cleanText_((input || {}).mode).toUpperCase() === 'ALL' ? 'ALL' : 'DUE';
+  const scope = normalizeLifecycleReminderScope_((input || {}).scope);
+  const targets = collectLifecycleReminderTargets_(mode, lifecycleReminderMaxAssetsPerBatch_(), scope);
+  const deliveryErrors = [];
+  const deliver = function (assetIds, type) {
+    if (!assetIds.length) return { assetCount: 0, groupCount: 0 };
+    try {
+      const delivery = createAndSendNotificationGroups_(assetIds, type);
+      (delivery.errors || []).forEach(function (error) { deliveryErrors.push(error); });
+      return delivery;
+    } catch (error) {
+      deliveryErrors.push({ messageType: type, error: String(error.message || error).substring(0, 500) });
+      return { assetCount: 0, groupCount: 0 };
+    }
+  };
+  const staleDelivery = deliver(targets.stale, 'STALE_ASSET_NOTICE');
+  const reminderDelivery = deliver(targets.reminder, 'CONTESTATION_REMINDER');
+  const escalationDelivery = deliver(targets.escalation, 'OWNER_ESCALATION');
+  return {
+    environment: profile.key,
+    mode: mode,
+    scope: scope,
+    processed: targets.stale.length + targets.reminder.length + targets.escalation.length,
+    staleAssets: staleDelivery.assetCount, staleGroups: staleDelivery.groupCount,
+    reminderAssets: reminderDelivery.assetCount, reminderGroups: reminderDelivery.groupCount,
+    escalationAssets: escalationDelivery.assetCount, escalationGroups: escalationDelivery.groupCount,
+    remaining: targets.remaining,
+    done: !targets.truncated,
+    notificationFailureCount: deliveryErrors.length,
+    notificationErrors: deliveryErrors
+  };
 }
 
 function notificationExists_(caseId, messageType) {

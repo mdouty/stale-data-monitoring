@@ -77,8 +77,12 @@ for (const sparse of [false, true]) {
       getDisplayValues: () => { if (row > 1 && width === 2) dataReads++; return data.slice(row - 1, row - 1 + count).map(x => x.slice(col - 1, col - 1 + width)); },
       setValues: rows => rows.forEach((value, i) => { data[row - 1 + i] = Array.from(value); })
     }) };
-  const sandbox = load('Repository.js', ['objectToRow_', 'repositoryBulkWindowSize_', 'groupSheetRowsForBulkIo_', 'updateObjectsByKey_'], {
-    cleanText_: x => String(x || '').trim(), getSheet_: () => sheet, configNumber_: () => 100
+  const sandbox = load('Repository.js', [
+    'objectToRow_', 'resolvedSheetCacheName_', 'invalidateSheetKeyIndexCache_', 'getSheetKeyIndex_',
+    'repositoryBulkWindowSize_', 'groupSheetRowsForBulkIo_', 'updateObjectsByKey_'
+  ], {
+    cleanText_: x => String(x || '').trim(), getSheet_: () => sheet, configNumber_: () => 100,
+    resolveSheetName_: name => name
   });
   const updates = Array.from({ length: sparse ? 30 : 3 }, (_, i) => ({ ID: String(sparse ? i * 3 : i), VALUE: 'new-' + i }));
   updates.push({ ID: '0', VALUE: 'last' });
@@ -178,4 +182,74 @@ for (const sparse of [false, true]) {
   sandbox.startUploadProgress_({ name: 'assets.csv', size: 100 });
   assert.strictEqual(views[2].indeterminate, true);
 }
+// Column-scoped event grouping never materializes full event rows.
+{
+  const events = [
+    ['EVENT_ID', 'CASE_ID', 'ASSET_ID', 'EVENT_TYPE', 'FROM', 'TO', 'AT', 'ACTOR', 'RUN_ID', 'DETAILS'],
+    ['e1', 'c1', 'A1', 'INTAKE_REVIEW_CONFIRMED', '', 'DETECTED', 't', 'SYSTEM', 'run-1', '{}'],
+    ['e2', 'c2', 'A2', 'ORPHAN_POLICY_ACCEPTED', '', 'ACCEPTED', 't', 'SYSTEM', 'run-1', '{}'],
+    ['e3', 'c3', 'A3', 'INTAKE_REVIEW_CONFIRMED', '', 'DETECTED', 't', 'SYSTEM', 'run-2', '{}'],
+    ['e4', 'c1', 'A1', 'INTAKE_REVIEW_CONFIRMED', '', 'DETECTED', 't', 'SYSTEM', 'run-1', '{}']
+  ];
+  const source = fs.readFileSync(path.join(root, 'Repository.js'), 'utf8') +
+    '\n' + fs.readFileSync(path.join(root, 'SnowflakeAdapter.js'), 'utf8');
+  const start = source.indexOf('function forEachMatchingSheetRows_');
+  const mid = source.indexOf('function lifecycleEventAssetGroupsForRun_');
+  const stop = source.indexOf('function restrictionTransitionsForRun_');
+  const sandbox = vm.createContext({
+    console,
+    cleanText_: x => String(x || '').trim(),
+    APP: { sheets: { events: 'events' } },
+    getSheet_: () => ({
+      getLastRow: () => events.length,
+      getLastColumn: () => events[0].length,
+      getRange: (row, col, count, width) => ({
+        getDisplayValues: () => events.slice(row - 1, row - 1 + count).map(item => item.slice(col - 1, col - 1 + (width || 1)))
+      })
+    })
+  });
+  vm.runInContext(source.slice(start, source.indexOf('\nfunction readObjectsByField_')), sandbox);
+  vm.runInContext(source.slice(mid, stop), sandbox);
+  const groups = sandbox.lifecycleEventAssetGroupsForRun_('run-1');
+  assert.deepEqual(groups.INTAKE_REVIEW_CONFIRMED, ['A1']);
+  assert.deepEqual(groups.ORPHAN_POLICY_ACCEPTED, ['A2']);
+  assert.strictEqual(groups.INTAKE_REVIEW_CONFIRMED.length, 1);
+}
+
+// Snapshot pruning keeps only the newest run and does not rewrite retained rows.
+{
+  const data = [
+    ['RUN_ID', 'ASSET_ID'],
+    ['old', 'a'],
+    ['old', 'b'],
+    ['new', 'c'],
+    ['new', 'd']
+  ];
+  let cleared = false;
+  const written = [];
+  const sheet = {
+    getLastRow: () => data.length,
+    getLastColumn: () => 2,
+    getMaxRows: () => sheet.maxRows,
+    getRange: (row, col, count, width) => ({
+      getDisplayValues: () => data.slice(row - 1, row - 1 + count).map(item => item.slice(col - 1, col - 1 + (width || 1))),
+      getValues: () => data.slice(row - 1, row - 1 + count).map(item => item.slice(col - 1, col - 1 + (width || 1))),
+      setValues: rows => { written.push(rows); }
+    }),
+    clearContents: () => { cleared = true; },
+    deleteRows: () => { sheet.maxRows = 2004; }
+  };
+  sheet.maxRows = 5000;
+  const sandbox = load('Repository.js', ['pruneEvaluationSnapshots_'], {
+    getSheet_: () => sheet,
+    configNumber_: (key, fallback) => fallback,
+    cleanText_: x => String(x || '').trim(),
+    invalidateSheetKeyIndexCache_: noop,
+    APP: { sheets: { snapshots: 'snapshots' } }
+  });
+  assert.strictEqual(sandbox.pruneEvaluationSnapshots_(1), 2);
+  assert.strictEqual(cleared, true);
+  assert.deepEqual(written[0].map(row => row[0]), ['RUN_ID', 'new', 'new']);
+}
+
 console.log('Import performance and progress regressions passed.');

@@ -23,6 +23,65 @@ function objectToRow_(headers, value) {
   });
 }
 
+// --- Execution-scoped key-index cache --------------------------------------
+// Apps Script clears module globals between executions, so this cache lives for
+// exactly one execution and cannot leak stale state across runs. During import
+// finalization the same large sheets (Assets_Current ~62k rows, Cases, and a
+// growing Notifications) are scanned several times per batch by
+// readObjectsByKeys_ and updateObjectsByKey_, each rebuilding the key->rowNumber
+// map from a full key-column read. That repeated scan is the quadratic hot spot
+// (O(batches x sheetRows)). We memoize {headers, keyIndex, rowsByKey, lastRow,
+// lastColumn} per (resolvedSheetName, keyHeader) so repeated lookups within one
+// execution scan the key column once.
+//
+// Correctness: the cache stores ONLY the key->rowNumber map and headers, never
+// cell data — callers always re-read matched rows fresh, so in-place cell
+// edits are never served stale. The entry is keyed to (lastRow, lastColumn) and
+// rebuilt whenever either changes, so any append/delete auto-invalidates even if
+// it bypasses the helpers below. Explicit invalidation on the mutators covers
+// the one residual case the size guard cannot see: an in-place edit to a key
+// cell that leaves the row count unchanged.
+var SHEET_KEY_INDEX_CACHE_ = {};
+
+function resolvedSheetCacheName_(sheetName) {
+  return typeof resolveSheetName_ === 'function' ? resolveSheetName_(sheetName) : String(sheetName);
+}
+
+function invalidateSheetKeyIndexCache_(sheetName) {
+  if (sheetName === undefined || sheetName === null) {
+    SHEET_KEY_INDEX_CACHE_ = {};
+    return;
+  }
+  const prefix = resolvedSheetCacheName_(sheetName) + ' ';
+  Object.keys(SHEET_KEY_INDEX_CACHE_).forEach(function (cacheKey) {
+    if (cacheKey.indexOf(prefix) === 0) delete SHEET_KEY_INDEX_CACHE_[cacheKey];
+  });
+}
+
+function getSheetKeyIndex_(sheet, sheetName, keyHeader) {
+  const cacheKey = resolvedSheetCacheName_(sheetName) + ' ' + keyHeader;
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+  const cached = SHEET_KEY_INDEX_CACHE_[cacheKey];
+  if (cached && cached.lastRow === lastRow && cached.lastColumn === lastColumn) return cached;
+  const headers = lastColumn ? sheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0] : [];
+  const keyIndex = headers.indexOf(keyHeader);
+  const rowsByKey = {};
+  if (keyIndex !== -1 && lastRow > 1) {
+    sheet.getRange(2, keyIndex + 1, lastRow - 1, 1).getDisplayValues().forEach(function (row, index) {
+      const key = cleanText_(row[0]);
+      if (!key) return;
+      (rowsByKey[key] || (rowsByKey[key] = [])).push(index + 2);
+    });
+  }
+  const entry = {
+    headers: headers, keyIndex: keyIndex, rowsByKey: rowsByKey,
+    lastRow: lastRow, lastColumn: lastColumn
+  };
+  SHEET_KEY_INDEX_CACHE_[cacheKey] = entry;
+  return entry;
+}
+
 function readObjects_(sheetName) {
   const sheet = getSheet_(sheetName);
   const lastRow = sheet.getLastRow();
@@ -33,6 +92,70 @@ function readObjects_(sheetName) {
   return values.filter(function (row) {
     return row.some(function (cell) { return cell !== ''; });
   }).map(function (row) { return rowToObject_(headers, row); });
+}
+
+function sheetHeaderIndex_(sheet, header) {
+  const lastColumn = sheet.getLastColumn();
+  if (lastColumn < 1) return -1;
+  const headers = sheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0];
+  return headers.indexOf(header);
+}
+
+function readColumnValues_(sheetName, header) {
+  const sheet = getSheet_(sheetName);
+  const lastRow = sheet.getLastRow();
+  const column = sheetHeaderIndex_(sheet, header) + 1;
+  if (lastRow < 2 || column < 1) return [];
+  return sheet.getRange(2, column, lastRow - 1, 1).getDisplayValues();
+}
+
+function forEachMatchingSheetRows_(sheetName, matchHeader, matchValue, headers, visitor) {
+  const sheet = getSheet_(sheetName);
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+  if (lastRow < 2 || lastColumn < 1) return 0;
+  const allHeaders = sheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0];
+  const matchIndex = allHeaders.indexOf(matchHeader);
+  if (matchIndex === -1) return 0;
+  const wanted = {};
+  (headers || []).forEach(function (header) {
+    const index = allHeaders.indexOf(header);
+    if (index !== -1) wanted[header] = index;
+  });
+  const target = cleanText_(matchValue);
+  const matchValues = sheet.getRange(2, matchIndex + 1, lastRow - 1, 1).getDisplayValues();
+  const columns = Object.keys(wanted);
+  const columnValues = {};
+  columns.forEach(function (header) {
+    columnValues[header] = sheet.getRange(2, wanted[header] + 1, lastRow - 1, 1).getDisplayValues();
+  });
+  let count = 0;
+  for (let i = 0; i < matchValues.length; i += 1) {
+    if (cleanText_(matchValues[i][0]) !== target) continue;
+    const row = {};
+    columns.forEach(function (header) { row[header] = columnValues[header][i][0]; });
+    visitor(row, i + 2);
+    count += 1;
+  }
+  return count;
+}
+
+function loadKeyedObjectMap_(sheetName, keyHeader) {
+  const sheet = getSheet_(sheetName);
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+  if (lastRow < 2 || lastColumn < 1) return {};
+  const headers = sheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0];
+  const keyIndex = headers.indexOf(keyHeader);
+  if (keyIndex === -1) return {};
+  const values = sheet.getRange(2, 1, lastRow - 1, lastColumn).getDisplayValues();
+  const map = {};
+  values.forEach(function (row) {
+    const key = cleanText_(row[keyIndex]);
+    if (!key) return;
+    map[key] = rowToObject_(headers, row);
+  });
+  return map;
 }
 
 function readObjectsByField_(sheetName, keyHeader, keyValue, limit) {
@@ -82,24 +205,21 @@ function readObjectsByKeys_(sheetName, keyHeader, keyValues) {
   });
   if (!Object.keys(keys).length) return [];
   const sheet = getSheet_(sheetName);
-  const lastRow = sheet.getLastRow();
-  const lastColumn = sheet.getLastColumn();
-  if (lastRow < 2 || lastColumn < 1) return [];
-  const headers = sheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0];
-  const keyIndex = headers.indexOf(keyHeader);
-  if (keyIndex === -1) return [];
-  const keyColumn = sheet.getRange(2, keyIndex + 1, lastRow - 1, 1).getDisplayValues();
+  const index = getSheetKeyIndex_(sheet, sheetName, keyHeader);
+  if (index.keyIndex === -1 || index.lastRow < 2 || index.lastColumn < 1) return [];
   const rowNumbers = [];
-  keyColumn.forEach(function (row, index) {
-    if (keys[cleanText_(row[0])]) rowNumbers.push(index + 2);
+  Object.keys(keys).forEach(function (key) {
+    const rows = index.rowsByKey[key];
+    if (rows) rows.forEach(function (rowNumber) { rowNumbers.push(rowNumber); });
   });
+  if (!rowNumbers.length) return [];
   const groups = groupSheetRowsForBulkIo_(rowNumbers);
   const objects = [];
   groups.forEach(function (group) {
-    const rowCount = Math.min(group.end, lastRow) - group.start + 1;
-    sheet.getRange(group.start, 1, rowCount, lastColumn).getDisplayValues().forEach(function (row, index) {
-      const rowNumber = group.start + index;
-      if (group.selectedRows[rowNumber]) objects.push(rowToObject_(headers, row));
+    const rowCount = Math.min(group.end, index.lastRow) - group.start + 1;
+    sheet.getRange(group.start, 1, rowCount, index.lastColumn).getDisplayValues().forEach(function (row, offset) {
+      const rowNumber = group.start + offset;
+      if (group.selectedRows[rowNumber]) objects.push(rowToObject_(index.headers, row));
     });
   });
   return objects;
@@ -152,21 +272,15 @@ function updateObjectsByKey_(sheetName, keyHeader, objects) {
   const values = (objects || []).filter(function (value) { return cleanText_(value && value[keyHeader]); });
   if (!values.length) return 0;
   const sheet = getSheet_(sheetName);
-  const lastColumn = sheet.getLastColumn();
-  const headers = sheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0];
-  const keyIndex = headers.indexOf(keyHeader);
-  if (keyIndex === -1) throw new Error('Missing key column ' + keyHeader + ' in ' + resolveSheetName_(sheetName) + '.');
-  const rowByKey = {};
-  if (sheet.getLastRow() > 1) {
-    sheet.getRange(2, keyIndex + 1, sheet.getLastRow() - 1, 1).getDisplayValues().forEach(function (row, index) {
-      const key = cleanText_(row[0]);
-      if (key) rowByKey[key] = index + 2;
-    });
-  }
+  const index = getSheetKeyIndex_(sheet, sheetName, keyHeader);
+  if (index.keyIndex === -1) throw new Error('Missing key column ' + keyHeader + ' in ' + resolveSheetName_(sheetName) + '.');
+  const headers = index.headers;
   const updates = [];
   const additions = [];
   values.forEach(function (value) {
-    const rowNumber = rowByKey[cleanText_(value[keyHeader])];
+    // Preserve the prior last-occurrence-wins behavior for duplicate keys.
+    const rows = index.rowsByKey[cleanText_(value[keyHeader])];
+    const rowNumber = rows && rows.length ? rows[rows.length - 1] : 0;
     if (rowNumber) updates.push({ rowNumber: rowNumber, row: objectToRow_(headers, value) });
     else additions.push(objectToRow_(headers, value));
   });
@@ -210,11 +324,20 @@ function ensureSheetCapacity_(sheet, requiredRows, requiredColumns) {
 function reclaimOperationalGridCapacity_() {
   const targets = [
     APP.sheets.assetsCurrent, APP.sheets.assetsStaging, APP.sheets.assetsIndex,
-    APP.sheets.snapshots, APP.sheets.cases, APP.sheets.events,
+    APP.sheets.intakeUpload, APP.sheets.snapshots, APP.sheets.cases, APP.sheets.events,
     APP.sheets.notifications, APP.sheets.platformActions, APP.sheets.jobs,
     APP.sheets.dashboardSummary
   ];
   const results = [];
+  const prefixes = [APP.environments.DEV.sheetPrefix, APP.environments.PRD.sheetPrefix];
+  prefixes.forEach(function (prefix) {
+    const previous = getFoundationSpreadsheet_().getSheetByName(prefix + 'Assets_Previous');
+    if (previous) {
+      previous.clearContents();
+      const maxRows = previous.getMaxRows();
+      if (maxRows > 2) previous.deleteRows(3, maxRows - 2);
+    }
+  });
   targets.forEach(function (sheetName) {
     const sheet = getSheet_(sheetName);
     const usedRows = Math.max(1, sheet.getLastRow());
@@ -224,6 +347,39 @@ function reclaimOperationalGridCapacity_() {
     results.push({ sheet: sheet.getName(), rows: sheet.getMaxRows(), usedRows: usedRows });
   });
   return results;
+}
+
+function pruneEvaluationSnapshots_(keepLatestRuns) {
+  const sheet = getSheet_(APP.sheets.snapshots);
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+  if (lastRow < 2 || lastColumn < 1) return 0;
+  const keep = Math.max(1, Number(keepLatestRuns || configNumber_('SNAPSHOT_RETENTION_RUNS', 1)));
+  const headers = sheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0];
+  const runIndex = headers.indexOf('RUN_ID');
+  if (runIndex === -1) return 0;
+  const runValues = sheet.getRange(2, runIndex + 1, lastRow - 1, 1).getDisplayValues();
+  const uniqueRuns = [];
+  const keepRuns = {};
+  for (let i = runValues.length - 1; i >= 0; i -= 1) {
+    const runId = cleanText_(runValues[i][0]);
+    if (!runId || keepRuns[runId]) continue;
+    uniqueRuns.push(runId);
+    if (uniqueRuns.length <= keep) keepRuns[runId] = true;
+  }
+  if (!uniqueRuns.length || uniqueRuns.length <= keep) return 0;
+  const values = sheet.getRange(2, 1, lastRow - 1, lastColumn).getValues();
+  const retained = [headers];
+  values.forEach(function (row, index) {
+    if (keepRuns[cleanText_(runValues[index][0])]) retained.push(row);
+  });
+  if (retained.length === lastRow) return 0;
+  sheet.clearContents();
+  sheet.getRange(1, 1, retained.length, lastColumn).setValues(retained);
+  const targetRows = Math.max(1000, retained.length + 1000);
+  if (sheet.getMaxRows() > targetRows) sheet.deleteRows(targetRows + 1, sheet.getMaxRows() - targetRows);
+  invalidateSheetKeyIndexCache_(APP.sheets.snapshots);
+  return lastRow - retained.length;
 }
 
 function appendObjectRows_(sheetName, headers, objects) {
@@ -238,6 +394,7 @@ function appendObjectRows_(sheetName, headers, objects) {
   ensureSheetCapacity_(sheet, startRow + objects.length - 1, writeHeaders.length);
   const rows = objects.map(function (value) { return objectToRow_(writeHeaders, value); });
   sheet.getRange(startRow, 1, rows.length, writeHeaders.length).setValues(rows);
+  invalidateSheetKeyIndexCache_(sheetName);
   return rows.length;
 }
 
@@ -248,6 +405,7 @@ function appendRawRows_(sheetName, rows) {
   const startRow = Math.max(2, sheet.getLastRow() + 1);
   ensureSheetCapacity_(sheet, startRow + rows.length - 1, width);
   sheet.getRange(startRow, 1, rows.length, width).setValues(rows);
+  invalidateSheetKeyIndexCache_(sheetName);
   return rows.length;
 }
 
@@ -280,6 +438,7 @@ function clearDataRows_(sheetName) {
   const sheet = getSheet_(sheetName);
   const lastRow = sheet.getLastRow();
   if (lastRow > 1) sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).clearContent();
+  invalidateSheetKeyIndexCache_(sheetName);
 }
 
 function updateConfigValue_(key, value) {

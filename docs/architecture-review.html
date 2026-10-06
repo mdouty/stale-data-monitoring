@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>EDG Stale Data Monitoring — Architecture Review</title>
+<style>
+  :root {
+    --ink: #0b1a2b;
+    --ink-soft: #33475b;
+    --bg: #f4f7fb;
+    --panel: #ffffff;
+    --brand: #0d3d73;
+    --brand-2: #0176d3;
+    --accent: #06a59a;
+    --warn: #b45309;
+    --line: #d9e2ec;
+    --code-bg: #0b1a2b;
+    --code-ink: #e6edf3;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink); background: var(--bg);
+    -webkit-font-smoothing: antialiased;
+  }
+  #deck { height: 100vh; width: 100vw; overflow: hidden; position: relative; }
+  .slide {
+    position: absolute; inset: 0; display: none;
+    padding: 4.5vh 6vw 8vh; flex-direction: column;
+    animation: fade .28s ease;
+  }
+  .slide.active { display: flex; }
+  @keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+  .eyebrow { text-transform: uppercase; letter-spacing: .14em; font-size: 13px; font-weight: 700; color: var(--brand-2); margin: 0 0 10px; }
+  h1 { font-size: clamp(30px, 4.6vw, 60px); line-height: 1.05; margin: 0 0 14px; color: var(--brand); letter-spacing: -.01em; }
+  h2 { font-size: clamp(24px, 3.2vw, 40px); line-height: 1.1; margin: 0 0 18px; color: var(--brand); letter-spacing: -.01em; }
+  h3 { font-size: 18px; margin: 0 0 8px; color: var(--ink); }
+  p  { font-size: clamp(15px, 1.5vw, 19px); line-height: 1.5; color: var(--ink-soft); margin: 0 0 12px; max-width: 60ch; }
+  .sub { font-size: clamp(16px, 1.8vw, 22px); color: var(--ink-soft); font-weight: 500; }
+  .lead { max-width: 70ch; }
+
+  .diagram { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; overflow: auto; padding: 6px; }
+  .diagram .mermaid { width: 100%; }
+  .mermaid svg { max-width: 100%; height: auto !important; display: block; margin: 0 auto; }
+
+  .grid { display: grid; gap: 18px; margin-top: 4px; }
+  .cols-2 { grid-template-columns: 1fr 1fr; }
+  .cols-3 { grid-template-columns: repeat(3, 1fr); }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 18px 20px; box-shadow: 0 1px 2px rgba(11,26,43,.05);
+  }
+  .card h3 { color: var(--brand); font-size: 17px; }
+  .card p { font-size: 15px; margin: 0; }
+  .card .tag { display: inline-block; font-size: 12px; font-weight: 700; letter-spacing: .04em;
+    color: var(--brand-2); background: #e8f2fd; padding: 3px 10px; border-radius: 999px; margin-bottom: 10px; text-transform: uppercase; }
+
+  ul.clean { margin: 6px 0 0; padding-left: 0; list-style: none; }
+  ul.clean li { position: relative; padding: 8px 0 8px 26px; font-size: clamp(15px, 1.5vw, 19px); color: var(--ink-soft); border-bottom: 1px solid var(--line); max-width: 74ch; }
+  ul.clean li:last-child { border-bottom: 0; }
+  ul.clean li::before { content: ""; position: absolute; left: 4px; top: 16px; width: 8px; height: 8px; border-radius: 2px; background: var(--accent); }
+  code { font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace; font-size: .88em; background: #eef2f7; padding: 1px 6px; border-radius: 5px; color: #0b3a67; }
+
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 22px; margin-top: 6px; }
+  .kv dt { font-weight: 700; color: var(--brand); font-size: 15px; }
+  .kv dd { margin: 0; color: var(--ink-soft); font-size: 15px; }
+
+  .note { border-left: 4px solid var(--accent); background: #eafaf8; padding: 10px 16px; border-radius: 0 10px 10px 0; font-size: 15px; color: #0b4f4a; max-width: 78ch; }
+  .warn { border-left-color: var(--warn); background: #fdf4e7; color: #7a4a08; }
+
+  /* chrome */
+  .footer { position: absolute; left: 6vw; right: 6vw; bottom: 2.6vh; display: flex; justify-content: space-between;
+    align-items: center; font-size: 12px; color: #7a8aa0; border-top: 1px solid var(--line); padding-top: 8px; }
+  .brandmark { font-weight: 800; color: var(--brand); letter-spacing: -.01em; }
+  .progress { position: absolute; top: 0; left: 0; height: 4px; background: linear-gradient(90deg, var(--brand-2), var(--accent)); transition: width .28s ease; }
+  .counter { font-variant-numeric: tabular-nums; }
+
+  /* speaker notes */
+  .notes { display: none; position: absolute; left: 6vw; right: 6vw; bottom: 6.5vh;
+    background: #0b1a2b; color: #cfe0f3; padding: 14px 18px; border-radius: 12px; font-size: 14px; line-height: 1.45; max-height: 32vh; overflow: auto; box-shadow: 0 8px 30px rgba(0,0,0,.25); }
+  body.show-notes .notes { display: block; }
+  .notes b { color: #7cc4ff; }
+
+  .hint { position: absolute; top: 14px; right: 18px; font-size: 12px; color: #9aa9bd; }
+
+  /* Cover */
+  .cover { background: linear-gradient(135deg, #0d3d73 0%, #0176d3 60%, #06a59a 130%); color: #fff; }
+  .cover .eyebrow { color: #bfe0ff; }
+  .cover h1 { color: #fff; font-size: clamp(34px, 6vw, 76px); }
+  .cover .sub, .cover p { color: #e6f2ff; }
+  .cover .footer { border-color: rgba(255,255,255,.25); color: #cfe0f3; }
+  .cover .brandmark { color: #fff; }
+  .meta { margin-top: auto; display: flex; gap: 40px; flex-wrap: wrap; }
+  .meta div span { display: block; }
+  .meta .lbl { font-size: 12px; text-transform: uppercase; letter-spacing: .12em; color: #a9d2ff; }
+  .meta .val { font-size: 16px; font-weight: 600; color: #fff; }
+
+  @media print {
+    #deck { height: auto; overflow: visible; }
+    .slide { display: flex !important; position: relative; inset: auto; page-break-after: always; height: 100vh; }
+    .hint, .notes { display: none !important; }
+  }
+</style>
+</head>
+<body>
+<div class="hint">← → navigate · <b>S</b> speaker notes · <b>F</b> fullscreen · <b>P</b> print/PDF</div>
+<div id="deck">
+  <div class="progress" id="progress"></div>
+
+  <!-- 1 · COVER -->
+  <section class="slide cover">
+    <p class="eyebrow">Engineering Design Review</p>
+    <h1>EDG Stale Data<br/>Monitoring</h1>
+    <p class="sub" style="max-width:64ch">Architecture &amp; framework design — how a Google Apps Script app governs the lifecycle of stale Snowflake data assets, crash-safely.</p>
+    <div class="meta">
+      <div><span class="lbl">Platform</span><span class="val">Google Apps Script (V8)</span></div>
+      <div><span class="lbl">Store</span><span class="val">Google Sheets + Script Properties</span></div>
+      <div><span class="lbl">Deployed</span><span class="val">web-app v121 · HEAD 4043420</span></div>
+    </div>
+    <div class="footer"><span class="brandmark">EDG · Stale Data Monitoring</span><span class="counter"></span></div>
+    <div class="notes"><b>Say:</b> This is an internal governance app, not a data pipeline. It ingests Snowflake extracts, flags stale assets, and walks each through a governed lifecycle — notify, contest, quarantine, purge — with consolidated Slack notifications. The interesting engineering is doing all this on Apps Script's 6-minute execution limit without ever losing or duplicating work.</div>
+  </section>
+
+  <!-- 2 · PURPOSE -->
+  <section class="slide">
+    <p class="eyebrow">Context</p>
+    <h2>What problem it solves</h2>
+    <p class="lead">Stale Snowflake tables accumulate cost and risk. This app gives data governance a controlled, auditable way to retire them — with the owners in the loop and platform teams handed clean work.</p>
+    <div class="grid cols-3">
+      <div class="card"><span class="tag">Ingest</span><h3>Review extracts</h3><p>Import complete Snowflake asset extracts; detect assets past the inactivity threshold.</p></div>
+      <div class="card"><span class="tag">Govern</span><h3>Drive lifecycle</h3><p>Notify owners; allow contest / exception / self-purge / restore / admin dismiss.</p></div>
+      <div class="card"><span class="tag">Hand off</span><h3>Quarantine &amp; purge</h3><p>Prepare controlled handoffs for platform teams; record everything in an audit log.</p></div>
+    </div>
+    <div class="note" style="margin-top:18px">Access is scoped by stewardship &amp; managed team; admins see all. Every status change, comment, notification, and partner action is written to an append-only audit history.</div>
+    <div class="footer"><span class="brandmark">EDG · Stale Data Monitoring</span><span class="counter"></span></div>
+    <div class="notes"><b>Say:</b> Emphasize governance + auditability. The app is deliberately conservative: PRD is view-only by default, Slack sends are de-duplicated, and platform handoffs are queued (non-dispatching) rather than fired automatically.</div>
+  </section>
+
+  <!-- 3 · SYSTEM ARCHITECTURE -->
+  <section class="slide">
+    <p class="eyebrow">Architecture</p>
+    <h2>System context</h2>
+    <div class="diagram"><pre class="mermaid">
+flowchart TB
+    subgraph Browser["Browser · Workspace domain user"]
+        UI["Index / Client / Styles.html"]
+    end
+    subgraph GAS["Apps Script web app · executes as deployer"]
+        Entry["Code.js · doGet / doPost"]
+        Services["Service layer (*.js)"]
+        Triggers["Time-based triggers · self-rescheduling workers"]
+    end
+    subgraph Data["Foundation Google Sheet + Script Properties"]
+        Sheets["Operational sheets · DEV_ prefixed + PRD"]
+        Props["Script Properties · state pointers, secrets"]
+    end
+    Source["Snowflake extract · CSV upload / source sheet"]
+    Slack["Slack incoming workflow webhook"]
+    Platform["Platform teams · quarantine / purge queues"]
+
+    UI -->|google.script.run| Entry --> Services
+    Services <--> Sheets
+    Services <--> Props
+    Triggers --> Services
+    Source -->|import| Services
+    Services -->|consolidated messages| Slack
+    Services -->|Platform_Actions rows| Platform
+    </pre></div>
+    <div class="footer"><span class="brandmark">EDG · Stale Data Monitoring</span><span class="counter"></span></div>
+    <div class="notes"><b>Say:</b> No external database — Google Sheets IS the database, and Script Properties hold the state pointers and secrets. Long work runs on self-rescheduling time-based triggers. Two integration edges: Slack (outbound webhook) and platform teams (via a queue sheet, not a live call).</div>
+  </section>
+
+  <!-- 4 · COMPONENT STRUCTURE -->
+  <section class="slide">
+    <p class="eyebrow">Architecture</p>
+    <h2>Component structure</h2>
+    <div class="diagram"><pre class="mermaid">
+flowchart TD
+    Code["Code.js · web entry, onOpen menu"]
+    Config["Config.js · constants, sheet names, states,<br/>env resolution, role/admin auth, config cache"]
+    subgraph Ingest
+        SA["SnowflakeAdapter.js · 3.9k LOC<br/>intake · review · import · reconcile<br/>finalize · dashboard · campaign"]
+    end
+    subgraph Lifecycle
+        Life["LifecycleService.js · transitions"]
+        Excp["ExceptionValidationService.js"]
+        Plat["PlatformActionService.js · handoffs"]
+    end
+    subgraph Presentation
+        Dash["DashboardService.js · reads/exports"]
+        Notif["NotificationService.js · Slack"]
+    end
+    subgraph XCut["Cross-cutting"]
+        Repo["Repository.js · Sheets I/O"]
+        Rel["ReliabilityService.js · durable checkpoints"]
+        Team["TeamService.js · access rules"]
+        Admin["AdminService.js · ops controls"]
+    end
+    Code --> SA & Life & Dash & Notif & Admin
+    SA --> Repo & Rel & Notif & Plat
+    Life --> Repo & Excp & Plat & Notif
+    Dash --> Repo & Team
+    Notif --> Rel & Repo
+    Plat --> Repo
+    Admin --> Repo & Rel
+    Config -.shared.-> SA & Life & Dash & Notif & Plat & Repo & Rel & Team & Admin
+    </pre></div>
+    <div class="footer"><span class="brandmark">EDG · Stale Data Monitoring</span><span class="counter"></span></div>
+    <div class="notes"><b>Say:</b> Flat GAS global scope, but layered logically. SnowflakeAdapter is the hub (2/3 of the codebase). Config.js is a shared foundation used everywhere — constants + the role/admin auth primitives. Reliability + Repository are the cross-cutting backbone every mutating path goes through.</div>
+  </section>
+
+  <!-- 5 · DATA MODEL -->
+  <section class="slide">
+    <p class="eyebrow">Framework · Data</p>
+    <h2>Data model — Sheets as the database</h2>
+    <div class="diagram"><pre class="mermaid">
+erDiagram
+    Assets_Current ||--o| Lifecycle_Cases : "ASSET_ID"
+    Lifecycle_Cases ||--o{ Lifecycle_Events : "audit"
+    Lifecycle_Cases ||--o{ Notifications : "CASE_ID"
+    Lifecycle_Cases ||--o{ Platform_Actions : "handoff"
+    Assets_Current ||--o{ Evaluation_Snapshots : "per run"
+    Lifecycle_Cases ||--o| Exceptions : "EXCEPTION_ID"
+    Job_Runs ||--o{ Lifecycle_Events : "run id"
+    Lifecycle_Cases ||--o{ Slack_Delivery_Receipts : "delivery ledger"
+    </pre></div>
+    <div class="note" style="margin-top:6px"><code>Assets_Current</code> (57 cols) is promoted from <code>Assets_Staging</code> by an atomic rename swap. <code>Lifecycle_Events</code> is append-only audit. <code>Slack_Delivery_Receipts</code> + <code>Recovery_*</code> sheets must be preserved — deleting them breaks in-flight recovery.</div>
+    <div class="footer"><span class="brandmark">EDG · Stale Data Monitoring</span><span class="counter"></span></div>
+    <div class="notes"><b>Say:</b> One foundation workbook. Import writes to staging then renames staging→current (old current→previous) so readers never see a half-built table. Cases carry the governance state and deadlines; events are the immutable audit trail.</div>
+  </section>
+
+  <!-- 6 · LIFECYCLE STATE MACHINE -->
+  <section class="slide">
+    <p class="eyebrow">Framework · Domain</p>
+    <h2>Lifecycle state machine</h2>
+    <div class="diagram"><pre class="mermaid">
+stateDiagram-v2
+    [*] --> DETECTED: import flags stale
+    DETECTED --> NOTIFIED: owner Slack notice
+    NOTIFIED --> CONTESTED: owner contests
+    NOTIFIED --> ACCEPTED: confirm deprecation
+    NOTIFIED --> EXEMPT: approved exception
+    NOTIFIED --> SELF_PURGE_PENDING: owner self-purge
+    NOTIFIED --> DISMISSED: admin dismiss
+    CONTESTED --> ACCEPTED: resolved
+    CONTESTED --> EXEMPT: exception approved
+    ACCEPTED --> QUARANTINED: contest window elapsed
+    QUARANTINED --> PURGE_ELIGIBLE: expiry reached
+    QUARANTINED --> RESTORED: access restored
+    PURGE_ELIGIBLE --> PURGED: platform purge
+    SELF_PURGE_PENDING --> PURGED
+    RESTORED --> ACTIVE
+    EXEMPT --> ACTIVE
+    DISMISSED --> [*]
+    PURGED --> [*]
+    </pre></div>
+    <div class="footer"><span class="brandmark">EDG · Stale Data Monitoring</span><span class="counter"></span></div>
+    <div class="notes"><b>Say:</b> Owner-driven transitions (contest/self-purge/restore/exempt) vs admin overrides (dismiss is admin-only). Timers are config-driven: stale 180d, contest window 9d, quarantine 181d, purge notice 30d. Every arrow writes an audit event.</div>
+  </section>
+
+  <!-- 7 · IMPORT PIPELINE -->
+  <section class="slide">
+    <p class="eyebrow">Flow</p>
+    <h2>Import pipeline — checkpointed, 6-min-limit safe</h2>
+    <div class="diagram"><pre class="mermaid">
+sequenceDiagram
+    participant U as User
+    participant SA as SnowflakeAdapter
+    participant T as Trigger worker
+    participant S as Sheets + Props
+    U->>SA: stageSnowflakeCsvUpload
+    SA->>S: Intake_Upload + review prop (QUEUED)
+    SA->>T: schedule review worker
+    loop Review — 3 batches / 30s budget
+        T->>SA: continueSnowflakeIntakeReview
+        SA->>S: save 'ReviewPartial', advance cursor
+    end
+    U->>SA: confirmSnowflakeIntake (idempotent)
+    loop Import — 3 batches / 30s budget
+        T->>SA: continueSnowflakeImport
+        SA->>S: save 'SourceBatch' (key runId|cursor)
+    end
+    Note over SA,S: Finalization state machine →<br/>APPROVE · ORPHANS · RECONCILE ·<br/>LIFECYCLE · DASHBOARD · NOTIFY · COMPLETE
+    </pre></div>
+    <div class="footer"><span class="brandmark">EDG · Stale Data Monitoring</span><span class="counter"></span></div>
+    <div class="notes"><b>Say:</b> Each worker does ~3 batches, stops at 30s, persists its cursor, and reschedules itself. Batch payloads are keyed by runId|cursor, so a re-run replays the saved plan instead of recomputing. After 3 failures it pauses for explicit resume. There's even auto-recovery from Google's 10M-cell limit.</div>
+  </section>
+
+  <!-- 8 · SLACK RELIABILITY -->
+  <section class="slide">
+    <p class="eyebrow">Flow · Reliability</p>
+    <h2>Slack delivery — no duplicate sends</h2>
+    <div class="diagram"><pre class="mermaid">
+sequenceDiagram
+    participant N as NotificationService
+    participant R as ReliabilityService
+    participant L as Slack_Delivery_Receipts
+    participant W as Slack webhook
+    N->>R: deliverSlackPayloadOnce_
+    R->>L: read entries for recipient/type/ids
+    alt existing ATTEMPTING
+        R-->>N: throw DELIVERY_UNCERTAIN (block dup)
+    else existing ACCEPTED
+        R-->>N: return saved receipt (no resend)
+    else new
+        R->>L: write ATTEMPTING + flush() BEFORE fetch
+        R->>W: UrlFetchApp.fetch(payload)
+        alt HTTP 2xx
+            R->>L: mark ACCEPTED → notifications SENT
+        else client-reject 4xx
+            R->>L: mark REJECTED (safe retry)
+        else other / thrown
+            R-->>N: leave ATTEMPTING, throw UNCERTAIN
+        end
+    end
+    </pre></div>
+    <div class="note" style="margin-top:4px"><b>Admin “Verify uncertain deliveries”</b> resolves stuck rows: <b>RECEIVED</b> → mark ACCEPTED (no resend); <b>NOT_RECEIVED</b> → RETRY_APPROVED (retry allowed).</div>
+    <div class="footer"><span class="brandmark">EDG · Stale Data Monitoring</span><span class="counter"></span></div>
+    <div class="notes"><b>Say:</b> This is the cleverest part. Delivery intent is written and flushed BEFORE the webhook call. An ambiguous webhook result is never auto-retried (would risk a duplicate) and never dropped — it's parked as ATTEMPTING for a human to verify. This is exactly the "Run next Slack checkpoint" banner behavior.</div>
+  </section>
+
+  <!-- 9 · RELIABILITY DESIGN -->
+  <section class="slide">
+    <p class="eyebrow">Framework · Reliability</p>
+    <h2>Why it survives crashes</h2>
+    <div class="grid cols-2">
+      <div class="card"><span class="tag">Write-ahead</span><h3>Durable write plans</h3><p>Every mutation is saved as a keyed plan before it's applied, then replayed idempotently on resume.</p></div>
+      <div class="card"><span class="tag">Double buffer</span><h3>Recovery sheets</h3><p>Payloads alternate across <code>Recovery_*</code> slots with a committed pointer — an interrupted write leaves the prior payload readable.</p></div>
+      <div class="card"><span class="tag">Triggers</span><h3>Watchdog + replacement</h3><p>The new trigger is created <em>before</em> the old one is deleted, so a worker never loses its wake-up.</p></div>
+      <div class="card"><span class="tag">Ledger</span><h3>Slack delivery receipts</h3><p>Intent recorded before the side effect; ambiguous results held for human verification, not blind retry.</p></div>
+    </div>
+    <div class="note warn" style="margin-top:18px">Operational guardrail: never delete the <code>Recovery_*</code> or <code>Slack_Delivery_Receipts</code> sheets or their Script Properties — they carry in-flight recovery state.</div>
+    <div class="footer"><span class="brandmark">EDG · Stale Data Monitoring</span><span class="counter"></span></div>
+    <div class="notes"><b>Say:</b> The unifying principle across the whole app: durable intent before side effect. This is what lets multi-minute, multi-sheet workflows run safely under a 6-minute runtime that can be killed at any moment.</div>
+  </section>
+
+  <!-- 10 · SECURITY & ENVIRONMENTS -->
+  <section class="slide">
+    <p class="eyebrow">Framework · Safety</p>
+    <h2>Environments &amp; security</h2>
+    <div class="grid cols-2">
+      <div class="card"><span class="tag">Environments</span><h3>DEV &amp; PRD, one workbook</h3>
+        <p>DEV sheets are <code>DEV_</code>-prefixed; PRD is <b>view-only by default</b>. Config/roles/teams shared; lifecycle records isolated. Non-admins are forced to PRD.</p></div>
+      <div class="card"><span class="tag">Access</span><h3>Three-tier auth</h3>
+        <p>ADMIN / role user / VIEWER, resolved from shared sheets. Every mutating entry point re-checks server-side; per-record visibility via team rules.</p></div>
+      <div class="card"><span class="tag">Secrets</span><h3>Script Properties only</h3>
+        <p>Webhook + action endpoints live in Script Properties, never in source. DEV Slack locked to approved recipients.</p></div>
+      <div class="card"><span class="tag">Surface</span><h3>Hardened entry</h3>
+        <p><code>executeAs: USER_DEPLOYING</code>, domain access; <code>doGet</code> sanitizes deep-link params and escapes template injection.</p></div>
+    </div>
+    <div class="footer"><span class="brandmark">EDG · Stale Data Monitoring</span><span class="counter"></span></div>
+    <div class="notes"><b>Say:</b> Safety is layered: read-only PRD, server-side re-auth on every write, recipient locking for Slack, secrets out of source. The blast radius of a mistake is deliberately small.</div>
+  </section>
+
+  <!-- 11 · CLOSER / NEXT STEPS -->
+  <section class="slide cover">
+    <p class="eyebrow">Discussion</p>
+    <h1>Review &amp; next steps</h1>
+    <ul class="clean" style="max-width:74ch">
+      <li style="color:#eaf4ff;border-color:rgba(255,255,255,.2)">Confirm the reliability model holds for the largest expected PRD extract (latency + cell limits).</li>
+      <li style="color:#eaf4ff;border-color:rgba(255,255,255,.2)">Agree ownership of the operational guardrails (Recovery / receipts sheets, Script Properties).</li>
+      <li style="color:#eaf4ff;border-color:rgba(255,255,255,.2)">Decide platform-handoff dispatch: keep queue-only, or wire live Snowflake / Data360 endpoints.</li>
+      <li style="color:#eaf4ff;border-color:rgba(255,255,255,.2)">Open questions on lifecycle timers, exception validation, and team access mapping.</li>
+    </ul>
+    <div class="meta">
+      <div><span class="lbl">Full design doc</span><span class="val">docs/DESIGN.md</span></div>
+      <div><span class="lbl">Tests</span><span class="val">production-rollout · import-performance · import-reliability</span></div>
+    </div>
+    <div class="footer"><span class="brandmark">EDG · Stale Data Monitoring</span><span class="counter"></span></div>
+    <div class="notes"><b>Say:</b> Point the team to docs/DESIGN.md for the line-anchored detail. Invite discussion on the four decision points. Note the Node regression suite is green today.</div>
+  </section>
+
+</div>
+
+<script type="module">
+  import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+  mermaid.initialize({
+    startOnLoad: false,
+    theme: "base",
+    themeVariables: {
+      primaryColor: "#e8f2fd", primaryBorderColor: "#0176d3", primaryTextColor: "#0b1a2b",
+      lineColor: "#33475b", fontSize: "15px",
+      fontFamily: "-apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif"
+    },
+    flowchart: { htmlLabels: true, curve: "basis" },
+    sequence: { useMaxWidth: true, wrap: true }
+  });
+
+  async function boot() {
+    // Render all diagrams while everything is briefly visible, then start deck.
+    document.querySelectorAll(".slide").forEach(s => s.style.display = "flex");
+    try { await mermaid.run({ querySelector: ".mermaid" }); }
+    catch (e) { console.error("mermaid render error", e); }
+    document.querySelectorAll(".slide").forEach(s => s.style.display = "");
+    initDeck();
+  }
+
+  function initDeck() {
+    const slides = Array.from(document.querySelectorAll(".slide"));
+    const progress = document.getElementById("progress");
+    const counters = document.querySelectorAll(".counter");
+    let i = 0;
+
+    // deep-link / restore via hash
+    const fromHash = parseInt(location.hash.replace("#", ""), 10);
+    if (!isNaN(fromHash) && fromHash >= 1 && fromHash <= slides.length) i = fromHash - 1;
+
+    function show(n) {
+      i = Math.max(0, Math.min(slides.length - 1, n));
+      slides.forEach((s, idx) => s.classList.toggle("active", idx === i));
+      progress.style.width = ((i + 1) / slides.length * 100) + "%";
+      counters.forEach(c => c.textContent = (i + 1) + " / " + slides.length);
+      history.replaceState(null, "", "#" + (i + 1));
+    }
+
+    document.addEventListener("keydown", (e) => {
+      if (["ArrowRight", "PageDown", " "].includes(e.key)) { e.preventDefault(); show(i + 1); }
+      else if (["ArrowLeft", "PageUp"].includes(e.key)) { e.preventDefault(); show(i - 1); }
+      else if (e.key === "Home") show(0);
+      else if (e.key === "End") show(slides.length - 1);
+      else if (e.key.toLowerCase() === "s") document.body.classList.toggle("show-notes");
+      else if (e.key.toLowerCase() === "f") { if (!document.fullscreenElement) document.documentElement.requestFullscreen(); else document.exitFullscreen(); }
+      else if (e.key.toLowerCase() === "p") window.print();
+    });
+
+    // click right/left half to navigate
+    document.getElementById("deck").addEventListener("click", (e) => {
+      if (e.target.closest("a, button")) return;
+      show(e.clientX > window.innerWidth / 2 ? i + 1 : i - 1);
+    });
+
+    show(i);
+  }
+
+  boot();
+</script>
+</body>
+</html>

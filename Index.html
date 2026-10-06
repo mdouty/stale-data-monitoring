@@ -80,9 +80,9 @@
         </div>
         <div class="table-wrap">
           <table>
-            <colgroup><col class="asset-col-select"><col class="asset-col-object"><col class="asset-col-type"><col class="asset-col-domain"><col class="asset-col-rows"><col class="asset-col-last-read"><col class="asset-col-inactivity"><col class="asset-col-notification"><col class="asset-col-stewardship"><col class="asset-col-status"><col class="asset-col-lifecycle"></colgroup>
-            <thead><tr><th class="select-column"><input id="selectAllAssets" type="checkbox" aria-label="Select all visible assets" onchange="toggleSelectAll(this.checked)"></th><th class="object-column">Object</th><th>Asset type</th><th>Domain / subject</th><th class="numeric-column">Rows</th><th>Last read</th><th>Read inactivity</th><th>Notification date</th><th>Stewardship</th><th>Asset status</th><th>Lifecycle</th></tr></thead>
-            <tbody id="assetRows"><tr><td colspan="11" class="empty">Loading assets…</td></tr></tbody>
+            <colgroup><col class="asset-col-select"><col class="asset-col-object"><col class="asset-col-type"><col class="asset-col-domain"><col class="asset-col-rows"><col class="asset-col-last-read"><col class="asset-col-inactivity"><col class="asset-col-notification"><col class="asset-col-stewardship"><col class="asset-col-tech-steward"><col class="asset-col-schema-owner"><col class="asset-col-status"><col class="asset-col-lifecycle"></colgroup>
+            <thead><tr><th class="select-column"><input id="selectAllAssets" type="checkbox" aria-label="Select all visible assets" onchange="toggleSelectAll(this.checked)"></th><th class="object-column">Object</th><th>Asset type</th><th>Domain / subject</th><th class="numeric-column">Rows</th><th>Last read</th><th>Read inactivity</th><th>Notification date</th><th>Stewardship</th><th>Technical Data Steward</th><th>Schema owner</th><th>Asset status</th><th>Lifecycle</th></tr></thead>
+            <tbody id="assetRows"><tr><td colspan="13" class="empty">Loading assets…</td></tr></tbody>
           </table>
         </div>
         <div class="pagination"><button class="button subtle" onclick="changePage(-1)">Previous</button><span id="pageLabel">Page 1</span><button class="button subtle" onclick="changePage(1)">Next</button></div>
@@ -112,6 +112,7 @@
               <div><h3>Data intake</h3><span>Import a reviewed Snowflake CSV and advance lifecycle operations.</span></div>
               <div class="top-actions">
                 <button class="button subtle" onclick="reviewUncertainDeliveries_()">Verify uncertain Slack deliveries</button>
+                <button id="sendRemindersButton" class="button subtle hidden" onclick="openReminderSweep()">Send reminders</button>
                 <button id="runAutomationButton" class="button subtle hidden" onclick="runAutomationNow()">Run lifecycle automation</button>
                 <button id="importButton" class="button primary hidden" onclick="startImport()">Import &amp; Refresh Data</button>
               </div>
@@ -158,6 +159,7 @@
               <label class="check"><input id="importEnabled" type="checkbox"> Enable reviewed imports</label>
               <label class="check"><input id="includeViews" type="checkbox"> Include views</label>
               <label class="check"><input id="slackEnabled" type="checkbox"> Enable Slack delivery</label>
+              <label class="check"><input id="lifecycleAutomationEnabled" type="checkbox"> Enable scheduled lifecycle automation</label>
               <label class="check"><input id="purgeActionsEnabled" type="checkbox"> Enable purge dispatch safety gate</label>
               <button class="button primary" onclick="saveAdminConfiguration()">Save configurations</button>
             </div>
@@ -313,7 +315,7 @@
       </section>
     </div>
     <div id="uncertainDeliveryModal" class="confirmation-backdrop hidden" role="presentation">
-      <section class="confirmation-dialog" role="dialog" aria-modal="true" aria-labelledby="uncertainDeliveryTitle">
+      <section class="confirmation-dialog uncertain-delivery-dialog" role="dialog" aria-modal="true" aria-labelledby="uncertainDeliveryTitle">
         <h2 id="uncertainDeliveryTitle">Verify uncertain Slack deliveries</h2>
         <p>Check Slack or its workflow history before confirming a result. Messages are held to prevent duplicate delivery.</p>
         <div id="uncertainDeliveryList"></div>

@@ -99,6 +99,7 @@ function getAdminConfiguration_() {
     includeViews: configBoolean_('INCLUDE_VIEWS', true),
     importEnabled: profile.importEnabled,
     slackEnabled: configBoolean_('SLACK_NOTIFICATIONS_ENABLED', false),
+    lifecycleAutomationEnabled: configBoolean_('LIFECYCLE_AUTOMATION_ENABLED', true),
     purgeActionsEnabled: configBoolean_('PURGE_ACTIONS_ENABLED', false),
     recipientLock: profile.recipientLock,
     allowedRecipients: profile.recipientAllowlist.join(', '),
@@ -150,6 +151,11 @@ function saveAdminConfiguration(settings) {
   updateEnvironmentConfigValue_('INCLUDE_VIEWS', Boolean(input.includeViews), profile.key);
   updateEnvironmentConfigValue_('IMPORT_ENABLED', Boolean(input.importEnabled), profile.key);
   updateEnvironmentConfigValue_('SLACK_NOTIFICATIONS_ENABLED', Boolean(input.slackEnabled), profile.key);
+  // Only overwrite the automation switch when the caller actually supplied it, so an
+  // older client payload that omits the field cannot silently pause automation.
+  if (input.lifecycleAutomationEnabled !== undefined) {
+    updateEnvironmentConfigValue_('LIFECYCLE_AUTOMATION_ENABLED', Boolean(input.lifecycleAutomationEnabled), profile.key);
+  }
   updateEnvironmentConfigValue_('PURGE_ACTIONS_ENABLED', Boolean(input.purgeActionsEnabled), profile.key);
   updateEnvironmentConfigValue_('PRIMARY_RECIPIENT_LOCK', recipientLock, profile.key);
   updateEnvironmentConfigValue_('ALLOWED_RECIPIENTS', allowedRecipients.join(','), profile.key);

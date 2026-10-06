@@ -186,7 +186,11 @@ function getImportNotificationCampaignStatus_(environment) {
     startedAt: state.startedAt || '',
     updatedAt: updatedAt,
     completedAt: state.completedAt || '',
-    lastError: state.lastError || ''
+    lastError: state.lastError || '',
+    // A paused campaign that reached the delivery phase can be advanced without a Slack
+    // send: any pending durable finalization is replayed and, if no owner group still
+    // needs a message, the campaign is completed. Resumable while Slack is disabled.
+    deliveryResumable: Boolean(!running && state.phase === 'DELIVERING')
   };
 }
 
@@ -296,6 +300,81 @@ function getImportStatus() {
     recoverable: recoverable,
     notificationCampaign: getSelfHealingImportNotificationCampaignStatus_()
   };
+}
+
+// Read-only diagnostic: run from the editor to print the current import notification
+// campaign status (owner-message delivery progress) to the execution log. The editor
+// never displays a function's return value, so this Logger.log wrapper exists purely to
+// make getImportStatus().notificationCampaign visible while a campaign is draining.
+function logImportStatus() {
+  const status = getImportStatus();
+  Logger.log(JSON.stringify(status.notificationCampaign, null, 2));
+  return status.notificationCampaign;
+}
+
+// Manual accelerator: drain the running import notification campaign within a single editor
+// execution instead of waiting on the ~60s trigger cadence (each trigger run delivers only
+// one owner message + 1-2 record batches). Run from the editor (SnowflakeAdapter.gs) AFTER
+// restricting web-app access to "Only myself" so poll traffic can't compete for the script
+// lock. Loops continueImportNotificationCampaign until the campaign reaches a terminal status,
+// stops making progress across 3 consecutive runs, or the execution nears the Apps Script
+// 6-minute limit (the pending self-scheduled trigger then continues where this left off).
+// Re-run it as many times as needed until logImportStatus shows SUCCEEDED.
+function drainImportNotificationCampaign() {
+  const deadline = Date.now() + 5 * 60 * 1000; // leave headroom under the 6-min execution cap
+  const terminal = { SUCCEEDED: true, COMPLETED_WITH_ERRORS: true, PAUSED: true, NOT_QUEUED: true };
+  let status = getImportNotificationCampaignStatus_();
+  let iterations = 0;
+  let lastSignature = '';
+  let stalls = 0;
+  while (Date.now() < deadline && iterations < 500) {
+    if (terminal[cleanText_(status.status).toUpperCase()]) break;
+    status = continueImportNotificationCampaign() || getImportNotificationCampaignStatus_();
+    iterations += 1;
+    const signature = [status.status, status.phase, status.ownerMessagesDelivered,
+      status.ownerMessagesFailed, status.delivered, status.failed].join('|');
+    if (signature === lastSignature) {
+      stalls += 1;
+      if (stalls >= 3) break; // no forward progress across 3 consecutive runs — stop and report
+    } else {
+      stalls = 0;
+      lastSignature = signature;
+    }
+  }
+  Logger.log('drainImportNotificationCampaign stopped after ' + iterations + ' run(s):\n'
+    + JSON.stringify(status, null, 2));
+  return status;
+}
+
+// One-time throughput tuning for the import notification campaign's delivery/finalization.
+// Now that the DELIVERING loop reads the Notifications sheet ONCE per execution (execution-scoped
+// snapshot) instead of once per batch, the old 2-batch cap — tuned for the read-per-batch cost —
+// is the limiter, not the read. This raises: batch size to 1000 (finalizing a STALE_ASSET_NOTICE
+// record writes 4 sheets + 2 flushes per batch, so a bigger batch amortizes the per-batch flush
+// overhead — ceiling in continueImportNotificationCampaignLocked_/resumePaused is 2000); the
+// per-execution DELIVERING batch cap to 40 (bounded by the execution budget); and the execution
+// budget to 170s. It leaves the DRAFTING cap (IMPORT_NOTIFICATION_BATCHES_PER_EXECUTION) at 2 since
+// drafting is not the bottleneck. Config-only; batchSize is kept so one batch stays well under the
+// GAS ~360s hard limit (a batch that starts before the deadline runs to completion past it).
+// Targets the running campaign's environment. Run once from the editor (SnowflakeAdapter.gs),
+// then continue drainImportNotificationCampaign (or click Resume for resumePausedImportNotificationDelivery).
+function tuneImportNotificationCampaignThroughput() {
+  const running = getAnyRunningImportNotificationCampaign_();
+  const environment = running ? normalizeEnvironment_(running.environment) : getActiveEnvironment_();
+  updateEnvironmentConfigValue_('IMPORT_NOTIFICATION_CAMPAIGN_BATCH_SIZE', 500, environment);
+  updateEnvironmentConfigValue_('IMPORT_NOTIFICATION_BATCHES_PER_EXECUTION', 2, environment);
+  updateEnvironmentConfigValue_('IMPORT_NOTIFICATION_DELIVERING_BATCHES_PER_EXECUTION', 40, environment);
+  updateEnvironmentConfigValue_('IMPORT_NOTIFICATION_EXECUTION_BUDGET_MS', 170000, environment);
+  const applied = {
+    environment: environment,
+    batchSize: 500,
+    draftingBatchesPerExecution: 2,
+    deliveringBatchesPerExecution: 40,
+    executionBudgetMs: 170000,
+    note: 'batchSize reverted 1000->500: a 1000-row batch triggered "Service Spreadsheets timed out" (single Sheets op too large on this big/contended doc). 500 is the proven-safe value. Re-run tuneImportNotificationCampaignThroughput then drainImportNotificationCampaign.'
+  };
+  Logger.log('tuneImportNotificationCampaignThroughput applied:\n' + JSON.stringify(applied, null, 2));
+  return applied;
 }
 
 function isRecoverableFailedFinalization_(job) {
@@ -596,6 +675,40 @@ function reconcileIntakeReviewChunk_(review, cursorRow, batchSize) {
   return { nextRow: nextRow, done: nextRow > lastRow };
 }
 
+// Mirrors the SNOWFLAKE|UPPER(FQN) identity used by calculateIntakeReview_ so
+// the up-front upload check flags exactly the duplicates the merge stage would.
+// Returns groups of the original-case FQN variants that collapse to one key.
+function duplicateIntakeFqnGroups_(headerMap, rows) {
+  const firstByKey = {};
+  const collisions = {};
+  (rows || []).forEach(function (row) {
+    const database = sourceValue_(row, headerMap, 'DATABASE_NAME');
+    const schema = sourceValue_(row, headerMap, 'SCHEMA_NAME');
+    const table = sourceValue_(row, headerMap, 'TABLE_NAME');
+    const rawFqn = sourceValue_(row, headerMap, 'TABLE_FQN') || [database, schema, table].filter(Boolean).join('.');
+    if (!rawFqn) return;
+    const key = 'SNOWFLAKE|' + rawFqn.toUpperCase();
+    if (firstByKey[key] === undefined) {
+      firstByKey[key] = rawFqn;
+      return;
+    }
+    const variants = collisions[key] || (collisions[key] = {});
+    variants[firstByKey[key]] = true;
+    variants[rawFqn] = true;
+  });
+  return Object.keys(collisions).map(function (key) { return Object.keys(collisions[key]).sort(); });
+}
+
+function assertNoDuplicateIntakeFqns_(headerMap, rows) {
+  const groups = duplicateIntakeFqnGroups_(headerMap, rows);
+  if (!groups.length) return;
+  const examples = groups.slice(0, 5).map(function (variants) { return variants.join(' / '); });
+  throw new Error('The intake contains ' + groups.length + ' duplicate FQN value' +
+    (groups.length === 1 ? '' : 's') + ' (matched case-insensitively). Correct the file before uploading. ' +
+    'Example' + (examples.length === 1 ? '' : 's') + ': ' + examples.join('; ') +
+    (groups.length > examples.length ? '; …' : '') + '.');
+}
+
 function stageSnowflakeCsvUpload(formObject) {
   assertAdmin_();
   const lock = LockService.getScriptLock();
@@ -619,15 +732,24 @@ function stageSnowflakeCsvUploadLocked_(formObject) {
   const fileName = cleanText_(blob.getName && blob.getName()) || 'Snowflake intake.csv';
   if (!/\.csv$/i.test(fileName)) throw new Error('The intake must be a .csv file.');
   const bytes = blob.getBytes();
-  const maximumBytes = 15 * 1024 * 1024;
+  const maximumMb = Math.max(30, configNumber_('MAX_INTAKE_FILE_SIZE_MB', 100));
+  const maximumBytes = maximumMb * 1024 * 1024;
   if (!bytes.length) throw new Error('The selected CSV file is empty.');
-  if (bytes.length > maximumBytes) throw new Error('The CSV is larger than the 15 MB intake limit.');
+  if (bytes.length > maximumBytes) throw new Error('The CSV is larger than the ' + maximumMb + ' MB intake limit.');
   const csvText = blob.getDataAsString('UTF-8').replace(/^\uFEFF/, '');
   const parsed = Utilities.parseCsv(csvText);
   if (parsed.length < 2) throw new Error('The CSV must contain a header row and at least one data row.');
   const headers = parsed.shift().map(function (value) { return cleanText_(value).toUpperCase(); });
-  validateSnowflakeV2Headers_(headers);
-  const rows = parsed.filter(function (row) { return row.some(function (value) { return cleanText_(value); }); });
+  const headerMap = validateSnowflakeV2Headers_(headers);
+  const rows = [];
+  parsed.forEach(function (row) {
+    if (row.some(function (value) { return cleanText_(value); })) rows.push(row);
+  });
+  // Fail fast on duplicate asset keys at upload rather than after the ~2-hour
+  // review prep. Two rows collide when their SNOWFLAKE|UPPER(FQN) identity is
+  // equal (e.g. case-variant table names), which mergeIntakeReviewPartials_
+  // would otherwise reject only at the merge stage. See asset-identity re-key.
+  assertNoDuplicateIntakeFqns_(headerMap, rows);
   const sheet = writeIntakeUploadSheet_(headers, rows, profile.key);
   clearIntakeReviewCache_(profile.key);
   const staged = {
@@ -648,7 +770,11 @@ function stageSnowflakeCsvUploadLocked_(formObject) {
     uploadedAt: nowIso_()
   };
   setPendingIntakeReview_(staged);
-  scheduleIntakeReviewPreparation_();
+  // Best-effort watchdog trigger; client polling (continueSnowflakeIntakeReview)
+  // drains the review synchronously, so a trigger-service outage or a missing
+  // script.scriptapp grant must not fail the staging call. Matches the guarded
+  // call sites in prepareSnowflakeIntakeReview/resumeSnowflakeIntakeReview.
+  try { scheduleIntakeReviewPreparation_(); } catch (scheduleError) {}
   return staged;
 }
 
@@ -668,19 +794,35 @@ function resumeSnowflakeIntakeReview(input) {
   const profile = assertEnvironmentWritable_();
   const lock = LockService.getScriptLock();
   lock.waitLock(20000);
+  let token;
   try {
     const pending = getPendingIntakeReview_(profile.key);
     if (!pending || pending.token !== cleanText_(input && input.token)) throw new Error('The staged review is no longer current.');
-    if (pending.preparationStatus === 'FAILED') {
-      pending.preparationStatus = pending.failedPreparationStatus || 'QUEUED';
-      pending.lastError = '';
-      pending.retryCount = 0;
-      pending.retryAfter = 0;
-      setPendingIntakeReview_(pending);
-    }
-    scheduleIntakeReviewPreparation_();
-    return getIntakeReviewPreparationStatus({ token: pending.token });
+    // A user-initiated resume clears backoff so the next checkpoint runs immediately,
+    // and restores the phase a failed run was in so it continues from its saved cursor.
+    if (pending.preparationStatus === 'FAILED') pending.preparationStatus = pending.failedPreparationStatus || 'QUEUED';
+    pending.lastError = '';
+    pending.retryCount = 0;
+    pending.retryAfter = 0;
+    setPendingIntakeReview_(pending);
+    token = pending.token;
+    // Best-effort watchdog; ignored when triggers are unavailable (trigger-service outage
+    // or a missing script.scriptapp grant). The synchronous drain below still progresses.
+    try { scheduleIntakeReviewPreparation_(); } catch (scheduleError) {}
   } finally { lock.releaseLock(); }
+  // Advance checkpoints synchronously so a paused review still completes without depending
+  // on the trigger service. continueSnowflakeIntakeReview takes its own lock per call and
+  // processes one bounded chunk; loop until it is no longer running or the budget elapses.
+  const deadline = Date.now() + 240000;
+  let status = getIntakeReviewPreparationStatus({ token: token });
+  while (status.running && Date.now() < deadline) {
+    const progressBefore = cleanText_(status.status) + '|' + Number(status.processedRows || 0);
+    status = continueSnowflakeIntakeReview({ token: token }) || getIntakeReviewPreparationStatus({ token: token });
+    // Stop if a checkpoint made no progress (e.g. it hit an error and set a retry delay),
+    // rather than spinning; the persisted lastError is surfaced to the caller.
+    if (cleanText_(status.status) + '|' + Number(status.processedRows || 0) === progressBefore) break;
+  }
+  return status;
 }
 
 function prepareSnowflakeIntakeReview(input) {
@@ -716,7 +858,10 @@ function continueSnowflakeIntakeReview(input) {
     if (!staged) return requestedToken ? getIntakeReviewPreparationStatus(input) : null;
     setExecutionEnvironment_(staged.environment, false);
     if (Number(staged.retryAfter || 0) > Date.now()) return getIntakeReviewPreparationStatus({ token: staged.token });
-    scheduleIntakeReviewPreparation_(7 * 60 * 1000);
+    // Best-effort watchdog. A trigger-service outage or a missing script.scriptapp grant
+    // must not abort the checkpoint before it does useful work; a synchronous resume can
+    // still drain the review without it.
+    try { scheduleIntakeReviewPreparation_(7 * 60 * 1000); } catch (watchdogError) {}
     const source = SpreadsheetApp.openById(staged.sourceSpreadsheetId).getSheetByName(staged.sourceSheetName);
     if (!source) throw new Error('The staged intake data was not found. Upload the CSV again.');
     const width = source.getLastColumn();
@@ -820,7 +965,9 @@ function continueSnowflakeIntakeReview(input) {
     const summary = pendingIntakeReviewSummary_(review);
     summary.preparationCompletedAt = nowIso_();
     setPendingIntakeReview_(summary);
-    deleteIntakeReviewPreparationTriggers_();
+    // The review is READY and persisted above; a trigger-cleanup failure (e.g. missing
+    // scriptapp grant) must not flip a completed review back into an error state.
+    try { deleteIntakeReviewPreparationTriggers_(); } catch (cleanupError) {}
     return getIntakeReviewPreparationStatus({ token: staged.token });
   } catch (error) {
     if (staged) {
@@ -1785,27 +1932,43 @@ function applyIntakeReviewDecisions_(review, dismissedAssetIds) {
     source.getRange(1, decisionIndex + 1).setValue('EDG_REVIEW_DECISION');
   }
   const rowCount = Math.max(0, source.getLastRow() - 1);
-  const rows = rowCount ? source.getRange(2, 1, rowCount, headers.length).getDisplayValues() : [];
   const cases = loadCaseMap_();
   const accepted = {};
-  const decisionValues = rows.map(function (row) {
-    const database = sourceValue_(row, headerMap, 'DATABASE_NAME');
-    const schema = sourceValue_(row, headerMap, 'SCHEMA_NAME');
-    const table = sourceValue_(row, headerMap, 'TABLE_NAME');
-    const fqn = (sourceValue_(row, headerMap, 'TABLE_FQN') || [database, schema, table].filter(Boolean).join('.')).toUpperCase();
-    const assetId = fqn ? 'SNOWFLAKE|' + fqn : '';
-    if (!selected[assetId]) return [''];
-    const snapshot = sourceValue_(row, headerMap, 'SOURCE_SNAPSHOT_AT') || review.sourceSnapshotAt || nowIso_();
-    const activity = deriveSourceActivity_(row, headerMap, snapshot, configNumber_('STALE_THRESHOLD_DAYS', 180));
-    const restricted = normalizedSnowflakeDataStatus_(sourceValue_(row, headerMap, 'SNOWFLAKE_DATA_STATUS')) === APP.lifecycle.restricted;
-    const currentState = canonicalLifecycleState_(cases[assetId] && cases[assetId].STATE);
-    if (!activity.isStale || restricted || !isIntakeDismissibleState_(currentState)) return [''];
-    accepted[assetId] = true;
-    return [APP.lifecycle.dismissed];
-  });
+  const decisionValues = [];
+  const writeChunk = Math.max(200, Math.min(2000, configNumber_('INTAKE_DECISION_WRITE_CHUNK', 1000)));
+  for (let offset = 0; offset < rowCount; offset += writeChunk) {
+    const count = Math.min(writeChunk, rowCount - offset);
+    const rows = source.getRange(offset + 2, 1, count, headers.length).getDisplayValues();
+    rows.forEach(function (row) {
+      const database = sourceValue_(row, headerMap, 'DATABASE_NAME');
+      const schema = sourceValue_(row, headerMap, 'SCHEMA_NAME');
+      const table = sourceValue_(row, headerMap, 'TABLE_NAME');
+      const fqn = (sourceValue_(row, headerMap, 'TABLE_FQN') || [database, schema, table].filter(Boolean).join('.')).toUpperCase();
+      const assetId = fqn ? 'SNOWFLAKE|' + fqn : '';
+      if (!selected[assetId]) {
+        decisionValues.push(['']);
+        return;
+      }
+      const snapshot = sourceValue_(row, headerMap, 'SOURCE_SNAPSHOT_AT') || review.sourceSnapshotAt || nowIso_();
+      const activity = deriveSourceActivity_(row, headerMap, snapshot, configNumber_('STALE_THRESHOLD_DAYS', 180));
+      const restricted = normalizedSnowflakeDataStatus_(sourceValue_(row, headerMap, 'SNOWFLAKE_DATA_STATUS')) === APP.lifecycle.restricted;
+      const currentState = canonicalLifecycleState_(cases[assetId] && cases[assetId].STATE);
+      if (!activity.isStale || restricted || !isIntakeDismissibleState_(currentState)) {
+        decisionValues.push(['']);
+        return;
+      }
+      accepted[assetId] = true;
+      decisionValues.push([APP.lifecycle.dismissed]);
+    });
+  }
   const rejected = ids.filter(function (assetId) { return !accepted[assetId]; });
   if (rejected.length) throw new Error(rejected.length + ' selected record' + (rejected.length === 1 ? ' is' : 's are') + ' no longer eligible for dismissal. Refresh the intake review and try again.');
-  if (decisionValues.length) source.getRange(2, decisionIndex + 1, decisionValues.length, 1).setValues(decisionValues);
+  if (decisionValues.length) {
+    for (let offset = 0; offset < decisionValues.length; offset += writeChunk) {
+      const chunk = decisionValues.slice(offset, offset + writeChunk);
+      source.getRange(offset + 2, decisionIndex + 1, chunk.length, 1).setValues(chunk);
+    }
+  }
   SpreadsheetApp.flush();
   review.sourceColumns = headers.length;
   review.headerSignature = headers.join('|');
@@ -1867,7 +2030,10 @@ function startSnowflakeImportInternal_(actor, reviewToken, lockHeld) {
       message: 'Publishing reviewed ' + profile.label + ' Snowflake intake'
     };
     setImportState_(state);
-    scheduleImportContinuation_(7 * 60 * 1000);
+    // Best-effort watchdog. When triggers are unavailable (missing script.scriptapp grant
+    // or a trigger-service outage) the open browser drives continuation via the status poll,
+    // so a failed schedule must not abort the import before it starts.
+    try { scheduleImportContinuation_(7 * 60 * 1000); } catch (watchdogError) {}
     PropertiesService.getScriptProperties().setProperty(reliabilityProperty_('ApprovedReview'), JSON.stringify({ token: review.token, runId: runId }));
     const chunkSize = Math.max(100, configNumber_('IMPORT_CHUNK_SIZE', APP.defaultImportChunkSize));
     const configuredInlineLimit = Math.max(0, configNumber_('INLINE_IMPORT_MAX_ROWS', APP.defaultInlineImportMaxRows));
@@ -1901,7 +2067,10 @@ function continueSnowflakeImport() {
     if (!state) return getImportStatus();
     setExecutionEnvironment_(state.environment, false);
     if (/_PAUSED$/.test(state.progressStage || '') || Number(state.retryAfter || 0) > Date.now()) return getImportStatus();
-    scheduleImportContinuation_(7 * 60 * 1000);
+    // Best-effort watchdog. This call previously threw here when the trigger scope was
+    // missing, driving the job into FINALIZATION_PAUSED and blocking the browser-driven
+    // finalization below. Guard it so a paused review still finalizes with the tab open.
+    try { scheduleImportContinuation_(7 * 60 * 1000); } catch (watchdogError) {}
     if (state.phase === 'IMPORT') {
       const batchStartedAt = Date.now();
       let completedBatches = 0;
@@ -1948,13 +2117,13 @@ function failSnowflakeImport_(state, error) {
       String(error && error.message ? error.message : error).substring(0, 500);
     state.lastError = String(error && error.message ? error.message : error).substring(0, 500);
     setImportState_(state);
-    deleteImportContinuationTriggers_();
+    try { deleteImportContinuationTriggers_(); } catch (cleanupError) {}
   } else {
     state.progressStage = 'IMPORT_PAUSED';
     state.message = 'Source import paused; saved batch writes can be resumed safely: ' + String(error.message || error).substring(0, 500);
     state.lastError = String(error.message || error).substring(0, 500);
     setImportState_(state);
-    deleteImportContinuationTriggers_();
+    try { deleteImportContinuationTriggers_(); } catch (cleanupError) {}
   }
 }
 
@@ -1967,7 +2136,7 @@ function importSourceChunk_(state, inlineExecution, deferScheduling) {
   if (!source) throw new Error('The staged intake source is no longer available.');
   const headerMap = validateSnowflakeV2Headers_(state.sourceHeaders);
   const configuredChunkSize = Math.max(50, configNumber_('IMPORT_CHUNK_SIZE', APP.defaultImportChunkSize));
-  const safeBatchSize = Math.max(50, Math.min(250,
+  const safeBatchSize = Math.max(50, Math.min(400,
     configNumber_('SAFE_IMPORT_BATCH_SIZE', APP.defaultSafeImportBatchSize)));
   const chunkSize = Math.min(configuredChunkSize, safeBatchSize);
   const finalSourceRow = state.sourceRows + 1;
@@ -2530,11 +2699,11 @@ function lifecycleEventRow_(caseId, assetId, eventType, fromState, toState, even
 }
 
 function loadCaseMap_() {
-  return readObjects_(APP.sheets.cases).reduce(function (map, item) {
-    item.STATE = canonicalLifecycleState_(item.STATE);
-    map[item.ASSET_ID] = item;
-    return map;
-  }, {});
+  const map = loadKeyedObjectMap_(APP.sheets.cases, 'ASSET_ID');
+  Object.keys(map).forEach(function (assetId) {
+    map[assetId].STATE = canonicalLifecycleState_(map[assetId].STATE);
+  });
+  return map;
 }
 
 function incrementCount_(map, key) {
@@ -2581,6 +2750,11 @@ function swapAssetBuffers_(ids) {
   if (current.getName() !== stagingName) current.setName(stagingName);
   staging.showSheet();
   current.hideSheet();
+  const usedRows = Math.max(1, current.getLastRow());
+  const leftoverRows = current.getMaxRows();
+  if (leftoverRows > usedRows + 1000) current.deleteRows(usedRows + 1001, leftoverRows - usedRows - 1000);
+  invalidateSheetKeyIndexCache_(APP.sheets.assetsCurrent);
+  invalidateSheetKeyIndexCache_(APP.sheets.assetsStaging);
 }
 
 function finalizeImport_(state) {
@@ -2671,6 +2845,7 @@ function finalizeImport_(state) {
       });
     });
     appendRawRows_(APP.sheets.dashboardSummary, summaryRows);
+    try { pruneEvaluationSnapshots_(configNumber_('SNAPSHOT_RETENTION_RUNS', APP.defaultSnapshotRetentionRuns)); } catch (pruneError) {}
     checkpoint.stage = 'NOTIFICATIONS';
     checkpointImportFinalization_(state, 'QUEUING_NOTIFICATIONS', 'Dashboard checkpointed; preparing retryable notification delivery');
     return;
@@ -2703,7 +2878,8 @@ function finalizeImport_(state) {
   clearIntakeReviewCache_(state.environment);
   clearPendingIntakeReview_(state.environment);
   clearImportState_(state.environment);
-  deleteImportContinuationTriggers_();
+  // Publication already succeeded; a missing trigger scope must not turn completion into a failure.
+  try { deleteImportContinuationTriggers_(); } catch (cleanupError) {}
 }
 
 function checkpointImportFinalization_(state, progressStage, message) {
@@ -2742,7 +2918,7 @@ function finalizeImportNotifications_(state) {
   const orphanAssetIds = lifecycleAssets.ORPHAN_POLICY_ACCEPTED || [];
   const restrictionAssetIds = uniqueAssetIds_((lifecycleAssets.SNOWFLAKE_RESTRICTION_CONFIRMED || [])
     .concat(lifecycleAssets.SNOWFLAKE_INITIAL_RESTRICTION || []));
-  const caseMap = loadCaseMap_();
+  const caseMap = indexObjectsBy_(readObjectsByKeys_(APP.sheets.cases, 'ASSET_ID', restrictionAssetIds), 'ASSET_ID');
   const standardRestrictionAssetIds = restrictionAssetIds.filter(function (assetId) {
     const ownerStatus = cleanText_(caseMap[assetId] && caseMap[assetId].OWNER_STATUS).toUpperCase();
     return ['ORPHANED', 'UNKNOWN'].indexOf(ownerStatus) === -1;
@@ -2787,25 +2963,46 @@ function finalizeImportNotifications_(state) {
 }
 
 function importNotificationCampaignCaseGroups_(runId) {
+  // Read only the four columns we need as single-column ranges and keep just the
+  // matching ASSET_ID strings. A full-extract run tags every Cases row with the
+  // same LAST_EVALUATION_RUN_ID, so materializing whole row objects for all of
+  // them (the previous readObjectsByField_ path) exhausted memory at 62k scale.
+  const sheet = getSheet_(APP.sheets.cases);
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
   const seen = {};
   const staleAssetIds = [];
   const orphanAssetIds = [];
-  readObjectsByField_(APP.sheets.cases, 'LAST_EVALUATION_RUN_ID', runId).forEach(function (caseRecord) {
-    const assetId = cleanText_(caseRecord.ASSET_ID);
-    if (!assetId || seen[assetId]) return;
-    const state = canonicalLifecycleState_(caseRecord.STATE);
-    const ownerStatus = cleanText_(caseRecord.OWNER_STATUS).toUpperCase();
+  if (lastRow < 2 || lastColumn < 1) return [];
+  const headers = sheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0];
+  const runIdCol = headers.indexOf('LAST_EVALUATION_RUN_ID');
+  const assetIdCol = headers.indexOf('ASSET_ID');
+  const stateCol = headers.indexOf('STATE');
+  const ownerCol = headers.indexOf('OWNER_STATUS');
+  if ([runIdCol, assetIdCol, stateCol, ownerCol].indexOf(-1) !== -1) return [];
+  const rowCount = lastRow - 1;
+  const targetRunId = cleanText_(runId);
+  const runIds = sheet.getRange(2, runIdCol + 1, rowCount, 1).getDisplayValues();
+  const assetIds = sheet.getRange(2, assetIdCol + 1, rowCount, 1).getDisplayValues();
+  const states = sheet.getRange(2, stateCol + 1, rowCount, 1).getDisplayValues();
+  const owners = sheet.getRange(2, ownerCol + 1, rowCount, 1).getDisplayValues();
+  for (let i = 0; i < rowCount; i += 1) {
+    if (cleanText_(runIds[i][0]) !== targetRunId) continue;
+    const assetId = cleanText_(assetIds[i][0]);
+    if (!assetId || seen[assetId]) continue;
+    const state = canonicalLifecycleState_(states[i][0]);
+    const ownerStatus = cleanText_(owners[i][0]).toUpperCase();
     const orphan = ['ORPHANED', 'UNKNOWN'].indexOf(ownerStatus) !== -1;
     if (orphan && [APP.lifecycle.accepted, APP.lifecycle.quarantined].indexOf(state) !== -1) {
       orphanAssetIds.push(assetId);
       seen[assetId] = true;
-      return;
+      continue;
     }
     if (!orphan && [APP.lifecycle.detected, APP.lifecycle.notified].indexOf(state) !== -1) {
       staleAssetIds.push(assetId);
       seen[assetId] = true;
     }
-  });
+  }
   return [
     { messageType: 'STALE_ASSET_NOTICE', assetIds: staleAssetIds.sort() },
     { messageType: 'ORPHAN_QUARANTINE_NOTICE', assetIds: orphanAssetIds.sort() }
@@ -2830,7 +3027,9 @@ function importNotificationCampaignGroups_(runId, expectedTotal) {
       restrictionSeen[assetId] = true;
       return true;
     });
-  const cases = loadCaseMap_();
+  const cases = restrictionIds.length && typeof readObjectsByKeys_ === 'function'
+    ? indexObjectsBy_(readObjectsByKeys_(APP.sheets.cases, 'ASSET_ID', restrictionIds), 'ASSET_ID')
+    : loadCaseMap_();
   const standardRestrictionIds = restrictionIds.filter(function (assetId) {
     const ownerStatus = cleanText_(cases[assetId] && cases[assetId].OWNER_STATUS).toUpperCase();
     return ['ORPHANED', 'UNKNOWN'].indexOf(ownerStatus) === -1;
@@ -2917,7 +3116,9 @@ function queueImportNotificationCampaign_(runId, environment) {
   if (existing && cleanText_(existing.runId) === cleanText_(runId)) {
     if (['QUEUED', 'RUNNING', 'RETRYING', 'PAUSED', 'COMPLETED_WITH_ERRORS', 'SUCCEEDED'].indexOf(cleanText_(existing.status).toUpperCase()) !== -1) {
       if (['QUEUED', 'RUNNING', 'RETRYING'].indexOf(cleanText_(existing.status).toUpperCase()) !== -1) {
-        scheduleImportNotificationCampaign_(60000);
+        // The browser poll drives the campaign forward while a tab is open; a missing
+        // trigger scope must not throw and block the caller from getting the queued state.
+        try { scheduleImportNotificationCampaign_(60000); } catch (scheduleError) {}
       }
       return existing;
     }
@@ -2971,7 +3172,7 @@ function continueImportNotificationCampaignLocked_(environment) {
       : getAnyRunningImportNotificationCampaign_();
   }
   if (!state) {
-    deleteImportNotificationCampaignTriggers_();
+    try { deleteImportNotificationCampaignTriggers_(); } catch (cleanupError) {}
     return getImportNotificationCampaignStatus_();
   }
   setExecutionEnvironment_(state.environment, false);
@@ -2982,7 +3183,9 @@ function continueImportNotificationCampaignLocked_(environment) {
       state.status = 'PAUSED';
       state.lastError = profile.label + ' Slack notifications are disabled.';
       setImportNotificationCampaignState_(state);
-      deleteImportNotificationCampaignTriggers_();
+      // Report the true reason (Slack disabled). A missing trigger scope here must not
+      // mask it by throwing into the outer catch as a confusing getProjectTriggers error.
+      try { deleteImportNotificationCampaignTriggers_(); } catch (cleanupError) {}
       return getImportNotificationCampaignStatus_(state.environment);
     }
 
@@ -2996,7 +3199,12 @@ function continueImportNotificationCampaignLocked_(environment) {
       setImportNotificationCampaignState_(state);
     }
   const groups = importNotificationCampaignGroups_(state.runId, state.total);
-    const batchSize = Math.max(25, Math.min(500, configNumber_('IMPORT_NOTIFICATION_CAMPAIGN_BATCH_SIZE', 250)));
+    // Ceiling raised 500 -> 2000 (2026-09-30): finalizing a STALE_ASSET_NOTICE record writes to
+    // 4 sheets + 2 flushes per batch, so bigger batches amortize the per-batch flush/overhead.
+    // Keep the applied value (set by tuneImportNotificationCampaignThroughput) such that one batch
+    // stays well under the GAS ~360s hard limit — a batch that starts before the execution deadline
+    // runs to completion past it, so very large batches risk timing out mid-write.
+    const batchSize = Math.max(25, Math.min(2000, configNumber_('IMPORT_NOTIFICATION_CAMPAIGN_BATCH_SIZE', 250)));
     const maxBatchesPerExecution = Math.max(1, Math.min(2, configNumber_('IMPORT_NOTIFICATION_BATCHES_PER_EXECUTION', 1)));
     const executionDeadline = Date.now() + Math.max(30000, Math.min(180000,
       configNumber_('IMPORT_NOTIFICATION_EXECUTION_BUDGET_MS', 150000)));
@@ -3044,11 +3252,20 @@ function continueImportNotificationCampaignLocked_(environment) {
     }
 
     if (state.phase === 'DELIVERING' && state.currentOwnerDelivery) {
+      // With the execution-scoped Notifications snapshot, the per-batch owner re-derivation no
+      // longer re-reads the whole sheet, so one execution can safely finalize many batches for a
+      // record-heavy owner instead of the 2-batch cap tuned for the read-per-batch cost. Governed
+      // by the execution deadline and a separate (tunable) cap.
+      const deliveringMaxBatches = Math.max(1, Math.min(60,
+        configNumber_('IMPORT_NOTIFICATION_DELIVERING_BATCHES_PER_EXECUTION', maxBatchesPerExecution)));
       let batchesProcessed = 0;
-      while (state.currentOwnerDelivery && batchesProcessed < maxBatchesPerExecution && Date.now() < executionDeadline) {
+      importNotificationCampaignBeginRecordsSnapshot_();
+      try {
+      while (state.currentOwnerDelivery && batchesProcessed < deliveringMaxBatches && Date.now() < executionDeadline) {
         const receipt = state.currentOwnerDelivery;
         const key = state.runId + '|' + receipt.batchId + '|' + Number(state.delivered || 0);
         let saved = readDurablePayload_('NotificationBatch', key);
+        const replayed = Boolean(saved);
         if (!saved) {
           const remaining = importNotificationCampaignOwnerRecords_(groups, receipt.messageType, receipt.recipient);
           const plan = newDurableWritePlan_();
@@ -3062,10 +3279,28 @@ function continueImportNotificationCampaignLocked_(environment) {
           saved = { writes: plan.writes, nextState: nextState };
           saveDurablePayload_('NotificationBatch', key, saved);
         }
-        applyDurableWrites_(saved.writes);
+        try {
+          applyDurableWrites_(saved.writes);
+        } catch (conflictError) {
+          if (!/conflicting row/.test(String((conflictError && conflictError.message) || conflictError))) throw conflictError;
+          // Another writer claimed our reserved append rows between planning and replay.
+          // Relocate our own appends to the current sheet end (never overwriting the
+          // foreign row) and persist the rebased plan before applying, so the exact same
+          // rows — including audit events — are written once. Without this the delivery
+          // replays the same occupied position on every retry and the campaign wedges.
+          saved = { writes: rebaseDurableAppendWrites_(saved.writes), nextState: saved.nextState };
+          saveDurablePayload_('NotificationBatch', key, saved);
+          applyDurableWrites_(saved.writes);
+        }
         state = saved.nextState;
         setImportNotificationCampaignState_(state);
+        // A durable-payload replay applied SENT rows without the in-place record mutation the
+        // snapshot relies on; refresh it so the next owner re-derivation reflects the sheet.
+        if (replayed) importNotificationCampaignInvalidateRecordsSnapshot_();
         batchesProcessed += 1;
+      }
+      } finally {
+        importNotificationCampaignEndRecordsSnapshot_();
       }
       try { scheduleImportNotificationCampaign_(60000); } catch (scheduleError) {}
       return getImportNotificationCampaignStatus_(state.environment);
@@ -3081,7 +3316,9 @@ function continueImportNotificationCampaignLocked_(environment) {
       state.completedAt = nowIso_();
       state.messageType = '';
       setImportNotificationCampaignState_(state);
-      deleteImportNotificationCampaignTriggers_();
+      // The campaign already reached a terminal state; a missing trigger scope must not
+      // turn successful completion into a failure.
+      try { deleteImportNotificationCampaignTriggers_(); } catch (cleanupError) {}
       return getImportNotificationCampaignStatus_(state.environment);
     }
 
@@ -3126,6 +3363,37 @@ function importNotificationCampaignEligibility_(groups) {
   return eligible;
 }
 
+// Execution-scoped snapshot of the Notifications sheet for the delivery finalize loop.
+// The finalize path re-derives an owner's remaining DRAFT/FAILED records before EVERY batch;
+// reading all ~41k rows from the sheet each time is the O(n^2) drag that stalls a record-heavy
+// owner (each batch peels off only batchSize rows but pays a full-sheet read). Because
+// prepareNotificationBatchItems_/finalizeNotificationOwnerGroupChunk_ mutate the very record
+// objects this snapshot holds in place (STATUS -> SENT/SKIPPED), re-filtering the cached array
+// yields exactly what re-reading the sheet would — so one read per execution replaces one per
+// batch. Enabled ONLY inside the lock-held delivery loops (begin/end bracket them, cleared in a
+// finally); a durable-payload REPLAY applies SENT rows WITHOUT that in-place mutation, so those
+// paths invalidate the snapshot to force a fresh read on the next re-derivation.
+var IMPORT_NOTIFICATION_RECORDS_SNAPSHOT_ = null;
+
+function importNotificationCampaignBeginRecordsSnapshot_() {
+  IMPORT_NOTIFICATION_RECORDS_SNAPSHOT_ = { active: true, records: null };
+}
+
+function importNotificationCampaignEndRecordsSnapshot_() {
+  IMPORT_NOTIFICATION_RECORDS_SNAPSHOT_ = null;
+}
+
+function importNotificationCampaignInvalidateRecordsSnapshot_() {
+  if (IMPORT_NOTIFICATION_RECORDS_SNAPSHOT_) IMPORT_NOTIFICATION_RECORDS_SNAPSHOT_.records = null;
+}
+
+function importNotificationCampaignReadRecords_() {
+  const snapshot = IMPORT_NOTIFICATION_RECORDS_SNAPSHOT_;
+  if (!snapshot || !snapshot.active) return readObjects_(APP.sheets.notifications);
+  if (!snapshot.records) snapshot.records = readObjects_(APP.sheets.notifications);
+  return snapshot.records;
+}
+
 function importNotificationCampaignRecipientGroups_(groups, excludedKeys) {
   const eligible = importNotificationCampaignEligibility_(groups);
   const excluded = (excludedKeys || []).reduce(function (index, key) {
@@ -3133,7 +3401,7 @@ function importNotificationCampaignRecipientGroups_(groups, excludedKeys) {
     return index;
   }, {});
   const recipientGroups = {};
-  readObjects_(APP.sheets.notifications).forEach(function (record) {
+  importNotificationCampaignReadRecords_().forEach(function (record) {
     const status = cleanText_(record.STATUS).toUpperCase();
     if (['DRAFT', 'FAILED'].indexOf(status) === -1) return;
     let messageType = '';
@@ -3205,7 +3473,9 @@ function retryImportNotificationCampaignLocked_() {
   state.lastError = '';
   state.retryStartedAt = nowIso_();
   setImportNotificationCampaignState_(state);
-  scheduleImportNotificationCampaign_(60000);
+  // The browser poll re-runs the worker while a tab is open; a missing trigger scope
+  // must not throw and abort the resume the admin just requested.
+  try { scheduleImportNotificationCampaign_(60000); } catch (scheduleError) {}
   return getImportNotificationCampaignStatus_(profile.key);
 }
 
@@ -3236,6 +3506,123 @@ function resumeStalledImportNotificationCampaignLocked_() {
   // Execute the first resumed checkpoint immediately so recovery does not depend on
   // Apps Script deciding when to service the replacement time trigger.
   return continueImportNotificationCampaignLocked_(profile.key);
+}
+
+function resumePausedImportNotificationDelivery() {
+  assertAdmin_();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try { return resumePausedImportNotificationDeliveryLocked_(); }
+  finally { lock.releaseLock(); }
+}
+
+// Drains only the pending durable finalization for an already-delivered owner group:
+// it applies the saved Notifications->SENT updates and Lifecycle_Events audit appends
+// (rebasing any append whose reserved row was taken by another writer) and performs no
+// Slack send, so it clears an append-conflict pause while Slack notifications are
+// disabled. If other owner groups still need a real send it stops and reports that,
+// rather than sending. Runs synchronously and touches no triggers, so it does not
+// depend on the trigger service that can itself fail during a paused campaign.
+function resumePausedImportNotificationDeliveryLocked_() {
+  assertAdmin_();
+  const profile = assertEnvironmentWritable_();
+  let state = getImportNotificationCampaignState_(profile.key);
+  if (!state) throw new Error('No import notification campaign is available to resume.');
+  const status = cleanText_(state.status).toUpperCase();
+  if (['RUNNING', 'QUEUED', 'RETRYING'].indexOf(status) !== -1) throw new Error('Slack delivery is already running.');
+  if (state.phase !== 'DELIVERING') {
+    throw new Error('This campaign still needs Slack drafting or sending. Enable Slack notifications and retry to continue.');
+  }
+  setExecutionEnvironment_(state.environment, false);
+  const groups = importNotificationCampaignGroups_(state.runId, state.total);
+  const batchSize = Math.max(25, Math.min(2000, configNumber_('IMPORT_NOTIFICATION_CAMPAIGN_BATCH_SIZE', 250)));
+  const executionDeadline = Date.now() + Math.max(30000, Math.min(180000,
+    configNumber_('IMPORT_NOTIFICATION_EXECUTION_BUDGET_MS', 150000)));
+  state.status = 'RUNNING';
+  setImportNotificationCampaignState_(state);
+  importNotificationCampaignBeginRecordsSnapshot_();
+  try {
+    while (state.currentOwnerDelivery && Date.now() < executionDeadline) {
+      const receipt = state.currentOwnerDelivery;
+      const key = state.runId + '|' + receipt.batchId + '|' + Number(state.delivered || 0);
+      let saved = readDurablePayload_('NotificationBatch', key);
+      const replayed = Boolean(saved);
+      if (!saved) {
+        const remaining = importNotificationCampaignOwnerRecords_(groups, receipt.messageType, receipt.recipient);
+        const plan = newDurableWritePlan_();
+        const finalized = finalizeNotificationOwnerGroupChunk_(remaining.slice(0, batchSize), receipt, plan);
+        const nextState = JSON.parse(JSON.stringify(state));
+        nextState.delivered += finalized;
+        if (remaining.length <= batchSize) {
+          nextState.currentOwnerDelivery = null;
+          nextState.ownerMessagesDelivered += 1;
+        }
+        saved = { writes: plan.writes, nextState: nextState };
+        saveDurablePayload_('NotificationBatch', key, saved);
+      }
+      try {
+        applyDurableWrites_(saved.writes);
+      } catch (conflictError) {
+        if (!/conflicting row/.test(String((conflictError && conflictError.message) || conflictError))) throw conflictError;
+        saved = { writes: rebaseDurableAppendWrites_(saved.writes), nextState: saved.nextState };
+        saveDurablePayload_('NotificationBatch', key, saved);
+        applyDurableWrites_(saved.writes);
+      }
+      state = saved.nextState;
+      setImportNotificationCampaignState_(state);
+      // A durable-payload replay applied SENT rows without the in-place record mutation the
+      // snapshot relies on; refresh it so the next owner re-derivation reflects the sheet.
+      if (replayed) importNotificationCampaignInvalidateRecordsSnapshot_();
+    }
+  } catch (error) {
+    state.status = 'PAUSED';
+    state.lastError = 'Finalization resume failed: ' + String(error.message || error).substring(0, 400);
+    setImportNotificationCampaignState_(state);
+    throw error;
+  } finally {
+    importNotificationCampaignEndRecordsSnapshot_();
+  }
+
+  if (state.currentOwnerDelivery) {
+    // Execution budget elapsed before the current group finished finalizing; leave it
+    // paused so another resume click continues from the same saved checkpoint.
+    state.status = 'PAUSED';
+    state.lastError = 'Delivery finalization is partially applied. Run resume again to finish.';
+    setImportNotificationCampaignState_(state);
+    return getImportNotificationCampaignStatus_(state.environment);
+  }
+
+  const attemptedKeys = state.attemptedOwnerGroupKeys || [];
+  const remainingOwnerGroups = importNotificationCampaignRecipientGroups_(groups, attemptedKeys);
+  if (!remainingOwnerGroups.length) {
+    state.status = state.failed ? 'COMPLETED_WITH_ERRORS' : 'SUCCEEDED';
+    state.phase = 'COMPLETE';
+    state.completedAt = nowIso_();
+    state.messageType = '';
+    state.lastError = '';
+    setImportNotificationCampaignState_(state);
+    // Campaign reached a terminal SUCCEEDED/COMPLETED_WITH_ERRORS state; a missing trigger
+    // scope during cleanup must not turn completion into a failure.
+    try { deleteImportNotificationCampaignTriggers_(); } catch (cleanupError) {}
+  } else {
+    // The wedged batch is finalized, but undelivered owner groups remain. Those require
+    // an actual Slack send, which we will not perform here.
+    state.status = 'PAUSED';
+    state.messageType = '';
+    state.lastError = 'Delivery finalization complete. ' + remainingOwnerGroups.length +
+      ' owner message(s) still need sending — enable Slack notifications and retry to deliver them.';
+    setImportNotificationCampaignState_(state);
+  }
+  return getImportNotificationCampaignStatus_(state.environment);
+}
+
+// One-time diagnostic: run this from the Apps Script editor AS THE DEPLOYING ACCOUNT to
+// force the OAuth consent screen for the script.scriptapp (trigger) scope. It only reads
+// the project trigger list — it creates nothing and changes no data. A clean numeric
+// return means the scope is now granted for the account that runs the web app.
+function grantTriggerScope() {
+  const triggers = ScriptApp.getProjectTriggers();
+  return { grantedFor: Session.getEffectiveUser().getEmail(), existingTriggers: triggers.length };
 }
 
 function scheduleImportNotificationCampaign_(delayMs) {
@@ -3293,7 +3680,7 @@ function simulateDevInitialNotifications_(assetIds, runId, lockedRecipient) {
   (assetIds || []).forEach(function (assetId) { targets[assetId] = true; });
   if (!Object.keys(targets).length) return 0;
   const simulatedAt = nowIso_();
-  const caseUpdates = readObjects_(APP.sheets.cases).filter(function (caseRecord) {
+  const caseUpdates = readObjectsByKeys_(APP.sheets.cases, 'ASSET_ID', Object.keys(targets)).filter(function (caseRecord) {
     return targets[caseRecord.ASSET_ID] && canonicalLifecycleState_(caseRecord.STATE) === APP.lifecycle.detected;
   }).map(function (caseRecord) {
     caseRecord.STATE = APP.lifecycle.notified;
@@ -3366,7 +3753,10 @@ function queueImportOrphanQuarantineActions_(assetIds, runId) {
   const ids = Array.from(new Set((assetIds || []).map(cleanText_).filter(Boolean)));
   if (!ids.length) return 0;
   const assets = indexObjectsBy_(readObjectsByKeys_(APP.sheets.assetsCurrent, 'ASSET_ID', ids), 'ASSET_ID');
-  const cases = loadCaseMap_();
+  const cases = indexObjectsBy_(readObjectsByKeys_(APP.sheets.cases, 'ASSET_ID', ids), 'ASSET_ID');
+  Object.keys(cases).forEach(function (assetId) {
+    cases[assetId].STATE = canonicalLifecycleState_(cases[assetId].STATE);
+  });
   const existingByKey = {};
   readObjects_(APP.sheets.platformActions).forEach(function (action) {
     const key = cleanText_(action.IDEMPOTENCY_KEY);
@@ -3425,8 +3815,7 @@ function queueImportOrphanQuarantineActions_(assetIds, runId) {
 function lifecycleEventAssetGroupsForRun_(runId) {
   const groups = {};
   const seen = {};
-  readObjects_(APP.sheets.events).forEach(function (event) {
-    if (event.RUN_ID !== runId) return;
+  forEachMatchingSheetRows_(APP.sheets.events, 'RUN_ID', runId, ['EVENT_TYPE', 'ASSET_ID'], function (event) {
     const eventType = cleanText_(event.EVENT_TYPE).toUpperCase();
     const assetId = cleanText_(event.ASSET_ID);
     if (!eventType || !assetId) return;
@@ -3454,15 +3843,16 @@ function restrictionTransitionsForRun_(runId) {
 
 function lifecycleEventAssetsForRun_(runId, eventType) {
   const seen = {};
-  return readObjects_(APP.sheets.events).filter(function (event) {
-    return event.RUN_ID === runId && cleanText_(event.EVENT_TYPE).toUpperCase() === cleanText_(eventType).toUpperCase();
-  }).map(function (event) {
-    return cleanText_(event.ASSET_ID);
-  }).filter(function (assetId) {
-    if (!assetId || seen[assetId]) return false;
+  const targetType = cleanText_(eventType).toUpperCase();
+  const assetIds = [];
+  forEachMatchingSheetRows_(APP.sheets.events, 'RUN_ID', runId, ['EVENT_TYPE', 'ASSET_ID'], function (event) {
+    if (cleanText_(event.EVENT_TYPE).toUpperCase() !== targetType) return;
+    const assetId = cleanText_(event.ASSET_ID);
+    if (!assetId || seen[assetId]) return;
     seen[assetId] = true;
-    return true;
+    assetIds.push(assetId);
   });
+  return assetIds;
 }
 
 function completeQuarantineActionsFromImport_(assetIds, completedAt, runId, plan) {
@@ -3813,7 +4203,7 @@ function cancelSnowflakeImportLocked_() {
   assertAdmin_();
   assertEnvironmentWritable_();
   const state = getImportState_();
-  deleteImportContinuationTriggers_();
+  try { deleteImportContinuationTriggers_(); } catch (cleanupError) {}
   if (state) updateJobRun_(state.runId, { STATUS: 'CANCELLED', COMPLETED_AT: nowIso_(), MESSAGE: 'Cancelled by user.' });
   clearImportState_(getActiveEnvironment_());
   return getImportStatus();
@@ -3843,7 +4233,10 @@ function resumeSnowflakeImportLocked_() {
   updateJobRun_(state.runId, {
     STATUS: 'RUNNING', COMPLETED_AT: '', ERROR_COUNT: Number(state.errors || 0), MESSAGE: state.message
   });
-  scheduleImportContinuation_(10000);
+  // State is already cleared of the pause above, so the browser status poll can drive
+  // continuation even if the trigger cannot be scheduled. Never let a missing scope make
+  // the resume itself throw and leave the job looking stuck.
+  try { scheduleImportContinuation_(10000); } catch (scheduleError) {}
   return getImportStatus();
 }
 
