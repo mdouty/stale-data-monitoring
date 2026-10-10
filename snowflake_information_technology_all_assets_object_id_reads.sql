@@ -304,4 +304,10 @@ SELECT
     evidence.last_altered,
     parameter_row.source_snapshot_at
 FROM raw_evidence evidence
-CROSS JOIN params parameter_row;
+CROSS JOIN params parameter_row
+QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY UPPER(evidence.database_name), UPPER(evidence.schema_name), UPPER(evidence.table_name)
+    ORDER BY evidence.last_read DESC NULLS LAST,
+             evidence.last_altered DESC NULLS LAST,
+             evidence.table_id DESC
+) = 1;

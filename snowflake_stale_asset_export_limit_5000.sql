@@ -310,5 +310,10 @@ SELECT
 
     CURRENT_TIMESTAMP() AS source_snapshot_at
 FROM joined
+QUALIFY ROW_NUMBER() OVER (
+    PARTITION BY UPPER(database_name), UPPER(schema_name), UPPER(table_name)
+    ORDER BY last_read DESC NULLS LAST,
+             last_altered DESC NULLS LAST
+) = 1
 ORDER BY days_since_activity DESC NULLS FIRST
 LIMIT 5000;
