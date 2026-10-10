@@ -252,4 +252,97 @@ for (const sparse of [false, true]) {
   assert.deepEqual(written[0].map(row => row[0]), ['RUN_ID', 'new', 'new']);
 }
 
+// IMPORT_APPEND_ONLY: the run skips the buffer swap and the carry-forward/reconcile scan;
+// the default (switch off) path still swaps and reconciles.
+for (const appendMode of [true, false]) {
+  let swapped = 0, reconciled = 0, checkpointed = null;
+  const state = { runId: 'run', appendMode, phase: 'PREPARE_FINALIZE', finalization: { stage: 'RECONCILE' } };
+  const sandbox = load('SnowflakeAdapter.js', ['beginImportFinalization_', 'finalizeImport_'], {
+    setImportState_: noop, getSheet_: () => ({ getSheetId: () => 1 }), APP: { sheets: {} },
+    swapAssetBuffers_: () => swapped++, scheduleImportContinuation_: noop, setFinalizationProgress_: noop,
+    configNumber_: (key, fallback) => fallback,
+    carryForwardAndReconcileChunk_: () => {
+      reconciled++;
+      return { nextRow: 2, done: true, carriedForward: 0, purgedAssets: 0, selfPurgedAssets: 0 };
+    },
+    checkpointImportFinalization_: (value, stage) => { checkpointed = stage; }
+  });
+  sandbox.beginImportFinalization_(state, false);
+  assert.strictEqual(swapped, appendMode ? 0 : 1);
+  assert.strictEqual(state.assetBuffersPublished, true);
+  assert.strictEqual(state.phase, 'FINALIZE');
+  sandbox.finalizeImport_(state);
+  assert.strictEqual(reconciled, appendMode ? 0 : 1);
+  assert.strictEqual(state.finalization.stage, 'APPLY_LIFECYCLE');
+  assert.strictEqual(checkpointed, 'APPLYING_LIFECYCLE_CHANGES');
+}
+
+// Append-only source batches go to Assets_Current; default batches go to Assets_Staging.
+for (const appendMode of [true, false]) {
+  const appended = [];
+  const state = { runId: 'run', appendMode, environment: 'DEV', cursorRow: 2, processedRows: 0, writtenRows: 0, errors: 0,
+    sourceRows: 1, sourceColumnCount: 1, sourceHeaders: ['A'], counts: { state: {}, evaluation: {}, environment: {}, ownership: {}, domain: {} } };
+  const sandbox = load('SnowflakeAdapter.js', ['importSourceChunk_'], {
+    setExecutionEnvironment_: noop, readDurablePayload_: () => null, saveDurablePayload_: noop,
+    SpreadsheetApp: { openById: () => ({ getSheetByName: () => ({ getRange: () => ({ getDisplayValues: () => [['x']] }) }) }) },
+    validateSnowflakeV2Headers_: () => ({}), configNumber_: (key, fallback) => fallback,
+    APP: { defaultImportChunkSize: 100, defaultSafeImportBatchSize: 100,
+      sheets: { cases: 'cases', assetsStaging: 'staging', assetsCurrent: 'current', snapshots: 'snap', events: 'events' } },
+    setImportState_: noop, sourceValue_: () => '', indexObjectsBy_: () => ({}), readObjectsByKeys_: () => [],
+    loadSchemaOwnerLookup_: () => ({}), incrementCount_: noop,
+    normalizeSnowflakeRowV2_: () => ({ asset: { ASSET_ID: 'a', LIFECYCLE_STATE: 'ACTIVE' }, snapshot: [] }),
+    newDurableWritePlan_: () => ({ writes: [] }), planAppendObjects_: (plan, sheet, rows) => { if (rows.length) appended.push(sheet); },
+    planAppendRows_: noop, planUpdateObjects_: noop, completeSourceBatch_: noop
+  });
+  sandbox.importSourceChunk_(state, true);
+  assert.deepEqual(appended.filter(sheet => sheet === 'current' || sheet === 'staging'), [appendMode ? 'current' : 'staging']);
+}
+
+// FINALIZE/RECONCILE loops: multiple batches per execution with cache reuse, respecting
+// batch cap, time budget, and stage transition; stages other than RECONCILE still run once.
+for (const scenario of [{ duration: 1, limit: 99, batchCap: 3, expected: 3 }, { duration: 200001, limit: 99, batchCap: 99, expected: 1 }, { duration: 1, limit: 2, batchCap: 99, expected: 2 }]) {
+  let clock = 0, reconcileBatches = 0, scheduled = 0, released = 0;
+  const state = { environment: 'DEV', phase: 'FINALIZE', runId: 'run', finalization: { stage: 'RECONCILE', reconcileCursorRow: 2 } };
+  const sandbox = load('SnowflakeAdapter.js', ['continueSnowflakeImport'], {
+    Date: { now: () => clock }, LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => released++ }) },
+    deleteImportContinuationTriggers_: noop, getAnyImportState_: () => state,
+    normalizeEnvironment_: x => x, setExecutionEnvironment_: noop,
+    finalizeImport_: (value, deferScheduling) => {
+      assert.strictEqual(typeof deferScheduling, 'boolean');
+      const checkpoint = value.finalization;
+      if (checkpoint.stage === 'RECONCILE') {
+        reconcileBatches++; clock += scenario.duration;
+        if (reconcileBatches === scenario.limit) checkpoint.stage = 'APPLY_LIFECYCLE';
+      }
+    }, getImportState_: () => state, scheduleImportContinuation_: () => scheduled++, getImportStatus: () => state,
+    failSnowflakeImport_: () => assert.fail('Unexpected import failure'), configNumber_: (key, fallback) => {
+      if (key === 'FINALIZATION_BATCHES_PER_EXECUTION') return scenario.batchCap;
+      return fallback;
+    }
+  });
+  sandbox.continueSnowflakeImport();
+  assert.strictEqual(reconcileBatches, scenario.expected);
+  // The top-of-function watchdog (scheduleImportContinuation_(7*60*1000)) plus the single
+  // post-loop schedule call = 2, matching the existing IMPORT-phase loop test's expectation.
+  assert.strictEqual(scheduled, 2);
+  assert.strictEqual(released, 1);
+}
+
+// Non-RECONCILE finalization stages run once per execution (no looping).
+{
+  let approveBatches = 0, scheduled = 0;
+  const state = { environment: 'DEV', phase: 'FINALIZE', runId: 'run', finalization: { stage: 'APPROVE_CANDIDATES', approvalCursorRow: 2 }, counts: { state: {}, evaluation: {}, environment: {}, ownership: {}, domain: {} } };
+  const sandbox = load('SnowflakeAdapter.js', ['continueSnowflakeImport'], {
+    Date: { now: () => 0 }, LockService: { getScriptLock: () => ({ tryLock: () => true, releaseLock: () => {} }) },
+    deleteImportContinuationTriggers_: noop, getAnyImportState_: () => state,
+    normalizeEnvironment_: x => x, setExecutionEnvironment_: noop,
+    finalizeImport_: (value) => { if (value.finalization.stage === 'APPROVE_CANDIDATES') approveBatches++; },
+    getImportState_: () => state, scheduleImportContinuation_: () => scheduled++, getImportStatus: () => state,
+    failSnowflakeImport_: () => assert.fail('Unexpected import failure'), configNumber_: () => 99
+  });
+  sandbox.continueSnowflakeImport();
+  assert.strictEqual(approveBatches, 1);
+  assert.strictEqual(scheduled, 1);
+}
+
 console.log('Import performance and progress regressions passed.');

@@ -2002,7 +2002,10 @@ function startSnowflakeImportInternal_(actor, reviewToken, lockHeld) {
       throw new Error('The source changed after review. Review the intake again before publishing.');
     }
     const runId = uuid_();
-    clearDataRows_(APP.sheets.assetsStaging);
+    // Append-only mode is captured once per run so a config change mid-import cannot
+    // leave a run half staged (swap + reconcile) and half appended.
+    const appendMode = configBoolean_('IMPORT_APPEND_ONLY', false);
+    if (!appendMode) clearDataRows_(APP.sheets.assetsStaging);
     appendRawRows_(APP.sheets.jobs, [[
       runId, 'SNOWFLAKE_SHEET_IMPORT_V2', 'RUNNING', nowIso_(), '', 2,
       sourceRows, 0, 0, 0, 'Intake approved by ' + actor.email
@@ -2010,6 +2013,7 @@ function startSnowflakeImportInternal_(actor, reviewToken, lockHeld) {
     const state = {
       environment: profile.key,
       runId: runId,
+      appendMode: appendMode,
       reviewToken: review.token,
       sourceSpreadsheetId: review.sourceSpreadsheetId,
       sourceSheetName: review.sourceSheetName,
@@ -2027,7 +2031,8 @@ function startSnowflakeImportInternal_(actor, reviewToken, lockHeld) {
       intakeApprovedAt: nowIso_(),
       snapshotAt: review.sourceSnapshotAt || nowIso_(),
       counts: { state: {}, evaluation: {}, environment: {}, ownership: {}, domain: {} },
-      message: 'Publishing reviewed ' + profile.label + ' Snowflake intake'
+      message: 'Publishing reviewed ' + profile.label + ' Snowflake intake' +
+        (appendMode ? ' (append-only: existing assets are not compared or carried forward)' : '')
     };
     setImportState_(state);
     // Best-effort watchdog. When triggers are unavailable (missing script.scriptapp grant
@@ -2083,7 +2088,26 @@ function continueSnowflakeImport() {
         try { scheduleImportContinuation_(); } catch (scheduleError) {}
       }
     } else if (state.phase === 'PREPARE_FINALIZE' || (state.phase === 'FINALIZE' && !state.assetBuffersPublished && state.assetBufferIds)) beginImportFinalization_(state, false);
-    else if (state.phase === 'FINALIZE') finalizeImport_(state);
+    else if (state.phase === 'FINALIZE') {
+      // Loop multiple RECONCILE batches per execution to warm the key-index cache.
+      if (state.finalization && state.finalization.stage === 'RECONCILE') {
+        const batchStartedAt = Date.now();
+        let completedBatches = 0;
+        const batchCap = Math.max(1, Math.min(60, configNumber_('FINALIZATION_BATCHES_PER_EXECUTION', 20)));
+        const executionBudgetMs = Math.max(30000, configNumber_('FINALIZATION_EXECUTION_BUDGET_MS', 200000));
+        do {
+          finalizeImport_(state, true);
+          completedBatches += 1;
+        } while (state.finalization && state.finalization.stage === 'RECONCILE' && completedBatches < batchCap && Date.now() - batchStartedAt < executionBudgetMs);
+        // Schedule the next execution once, outside the loop.
+        const current = getImportState_(state.environment);
+        if (current && ['FINALIZE'].indexOf(current.phase) !== -1) {
+          try { scheduleImportContinuation_(); } catch (scheduleError) {}
+        }
+      } else {
+        finalizeImport_(state, false);
+      }
+    }
     return getImportStatus();
   } catch (error) {
     const state = getAnyImportState_();
@@ -2197,7 +2221,9 @@ function importSourceChunk_(state, inlineExecution, deferScheduling) {
   });
 
   const plan = newDurableWritePlan_();
-  planAppendObjects_(plan, APP.sheets.assetsStaging, assetRows);
+  // Append-only runs write straight to the live sheet; otherwise rows build up in the
+  // staging buffer that is swapped in at finalization.
+  planAppendObjects_(plan, state.appendMode ? APP.sheets.assetsCurrent : APP.sheets.assetsStaging, assetRows);
   planAppendRows_(plan, APP.sheets.snapshots, snapshots);
   planAppendObjects_(plan, APP.sheets.cases, newCases);
   planUpdateObjects_(plan, APP.sheets.cases, 'CASE_ID', updatedCases);
@@ -2247,11 +2273,16 @@ function beginImportFinalization_(state, inlineExecution) {
   state.progressStage = 'PUBLISHING_ASSET_BUFFER';
   state.message = 'Publishing the evaluated asset dataset';
   setImportState_(state);
-  if (!state.assetBufferIds) {
-    state.assetBufferIds = { current: getSheet_(APP.sheets.assetsCurrent).getSheetId(), staging: getSheet_(APP.sheets.assetsStaging).getSheetId() };
-    setImportState_(state);
+  if (state.appendMode) {
+    // Rows were already appended to Assets_Current; there is no staging buffer to publish.
+    state.message = 'Appended assets are already published; skipping the buffer swap';
+  } else {
+    if (!state.assetBufferIds) {
+      state.assetBufferIds = { current: getSheet_(APP.sheets.assetsCurrent).getSheetId(), staging: getSheet_(APP.sheets.assetsStaging).getSheetId() };
+      setImportState_(state);
+    }
+    swapAssetBuffers_(state.assetBufferIds);
   }
-  swapAssetBuffers_(state.assetBufferIds);
   state.assetBuffersPublished = true;
   state.phase = 'FINALIZE';
   state.progressStage = 'RECONCILING_LIFECYCLE';
@@ -2757,9 +2788,12 @@ function swapAssetBuffers_(ids) {
   invalidateSheetKeyIndexCache_(APP.sheets.assetsStaging);
 }
 
-function finalizeImport_(state) {
+function finalizeImport_(state, deferScheduling) {
   // Browser-driven checkpoints are primary; the trigger is only a background backup.
-  try { scheduleImportContinuation_(7 * 60 * 1000); } catch (watchdogError) {}
+  // When deferScheduling is true (batch loop), skip scheduling until the loop completes.
+  if (!deferScheduling) {
+    try { scheduleImportContinuation_(7 * 60 * 1000); } catch (watchdogError) {}
+  }
   const checkpoint = state.finalization || {
     stage: 'APPROVE_CANDIDATES', carriedForward: 0, orphanQuarantineActions: 0,
     cancelledRecoveryActions: 0, cancelledDismissalActions: 0,
@@ -2778,7 +2812,7 @@ function finalizeImport_(state) {
     if (approval.done) checkpoint.stage = 'PREPARE_ORPHAN_HANDOFFS';
     checkpointImportFinalization_(state, 'APPLYING_LIFECYCLE_CHANGES', approval.done
       ? 'Candidate approvals and notification drafts checkpointed; preparing orphan handoffs'
-      : 'Approved and staged notifications for ' + checkpoint.approvalCursorRow + ' lifecycle rows');
+      : 'Approved and staged notifications for ' + checkpoint.approvalCursorRow + ' lifecycle rows', deferScheduling);
     return;
   }
 
@@ -2786,7 +2820,16 @@ function finalizeImport_(state) {
     const lifecycleAssets = lifecycleEventAssetGroupsForRun_(state.runId);
     checkpoint.orphanQuarantineActions = queueImportOrphanQuarantineActions_(lifecycleAssets.ORPHAN_POLICY_ACCEPTED || [], state.runId);
     checkpoint.stage = 'RECONCILE';
-    checkpointImportFinalization_(state, 'RECONCILING_LIFECYCLE', 'Orphan handoffs checkpointed; reconciling retained lifecycle records');
+    checkpointImportFinalization_(state, 'RECONCILING_LIFECYCLE', 'Orphan handoffs checkpointed; reconciling retained lifecycle records', deferScheduling);
+    return;
+  }
+
+  if (checkpoint.stage === 'RECONCILE' && state.appendMode) {
+    // Append-only: nothing was swapped out, so there are no missing assets to carry
+    // forward or purge-verify. Skip the full lifecycle-case scan entirely.
+    checkpoint.stage = 'APPLY_LIFECYCLE';
+    checkpointImportFinalization_(state, 'APPLYING_LIFECYCLE_CHANGES',
+      'Append-only import: skipped carry-forward reconciliation; applying lifecycle changes', deferScheduling);
     return;
   }
 
@@ -2801,7 +2844,7 @@ function finalizeImport_(state) {
     if (reconciliation.done) checkpoint.stage = 'APPLY_LIFECYCLE';
     checkpointImportFinalization_(state, reconciliation.done ? 'APPLYING_LIFECYCLE_CHANGES' : 'RECONCILING_LIFECYCLE',
       reconciliation.done ? 'Lifecycle reconciliation checkpointed; applying lifecycle changes' :
-        'Reconciled lifecycle rows through ' + checkpoint.reconcileCursorRow);
+        'Reconciled lifecycle rows through ' + checkpoint.reconcileCursorRow, deferScheduling);
     return;
   }
 
@@ -2829,7 +2872,7 @@ function finalizeImport_(state) {
     }
     applyDurableWrites_(saved.writes);
     Object.assign(checkpoint, saved.result);
-    checkpointImportFinalization_(state, 'REFRESHING_DASHBOARD', 'Lifecycle changes checkpointed; refreshing dashboard summaries');
+    checkpointImportFinalization_(state, 'REFRESHING_DASHBOARD', 'Lifecycle changes checkpointed; refreshing dashboard summaries', deferScheduling);
     return;
   }
 
@@ -2838,8 +2881,11 @@ function finalizeImport_(state) {
     refreshDashboardIndex_();
     clearDataRows_(APP.sheets.dashboardSummary);
     const summaryRows = [];
+    // Append-only runs only counted the appended rows, so recount the whole live sheet.
+    // A recount (unlike adding to existing summary rows) is safe to repeat on retry.
+    const summaryCounts = state.appendMode ? countCurrentAssetDimensions_() : state.counts;
     ['state', 'evaluation', 'environment', 'ownership', 'domain'].forEach(function (dimension) {
-      const values = state.counts[dimension] || {};
+      const values = summaryCounts[dimension] || {};
       Object.keys(values).sort().forEach(function (key, index) {
         summaryRows.push([state.snapshotAt, dimension.toUpperCase(), key, 'ASSET_COUNT', values[key], index + 1, state.runId]);
       });
@@ -2847,14 +2893,14 @@ function finalizeImport_(state) {
     appendRawRows_(APP.sheets.dashboardSummary, summaryRows);
     try { pruneEvaluationSnapshots_(configNumber_('SNAPSHOT_RETENTION_RUNS', APP.defaultSnapshotRetentionRuns)); } catch (pruneError) {}
     checkpoint.stage = 'NOTIFICATIONS';
-    checkpointImportFinalization_(state, 'QUEUING_NOTIFICATIONS', 'Dashboard checkpointed; preparing retryable notification delivery');
+    checkpointImportFinalization_(state, 'QUEUING_NOTIFICATIONS', 'Dashboard checkpointed; preparing retryable notification delivery', deferScheduling);
     return;
   }
 
   if (checkpoint.stage === 'NOTIFICATIONS') {
     checkpoint.notificationMessage = finalizeImportNotifications_(state);
     checkpoint.stage = 'COMPLETE';
-    checkpointImportFinalization_(state, 'COMPLETING_PUBLICATION', 'Notification handoff checkpointed; completing publication');
+    checkpointImportFinalization_(state, 'COMPLETING_PUBLICATION', 'Notification handoff checkpointed; completing publication', deferScheduling);
     return;
   }
 
@@ -2882,12 +2928,31 @@ function finalizeImport_(state) {
   try { deleteImportContinuationTriggers_(); } catch (cleanupError) {}
 }
 
-function checkpointImportFinalization_(state, progressStage, message) {
+function countCurrentAssetDimensions_() {
+  const counts = { state: {}, evaluation: {}, environment: {}, ownership: {}, domain: {} };
+  const columns = {
+    state: 'LIFECYCLE_STATE', evaluation: 'EVALUATION_STATUS', environment: 'ENVIRONMENT',
+    ownership: 'OWNERSHIP_STATUS', domain: 'DOMAIN'
+  };
+  Object.keys(columns).forEach(function (dimension) {
+    readColumnValues_(APP.sheets.assetsCurrent, columns[dimension]).forEach(function (row) {
+      const value = cleanText_(row[0]);
+      if (dimension !== 'domain' && !value) return;
+      incrementCount_(counts[dimension], value || 'UNASSIGNED');
+    });
+  });
+  return counts;
+}
+
+function checkpointImportFinalization_(state, progressStage, message, deferScheduling) {
   state.retryCount = 0;
   state.retryAfter = 0;
   state.finalization.updatedAt = nowIso_();
   setFinalizationProgress_(state, progressStage, message);
-  try { scheduleImportContinuation_(10000); } catch (scheduleError) {}
+  // When deferScheduling is true (batch loop), save state but skip scheduling; the loop schedules once at the end.
+  if (!deferScheduling) {
+    try { scheduleImportContinuation_(10000); } catch (scheduleError) {}
+  }
 }
 
 function uniqueAssetIds_(assetIds) {
