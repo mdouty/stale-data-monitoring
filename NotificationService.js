@@ -162,6 +162,7 @@ function createAndSendNotificationGroupsLocked_(assetIds, notificationType, opti
 function createNotificationDraftBatch_(assetIds, messageType, options) {
   const ids = Array.from(new Set((assetIds || []).map(cleanText_).filter(Boolean)));
   const ownerChangeMap = (options && options.ownerChange) || {};
+  const delegateMap = (options && options.delegate) || {};
   const assets = indexObjectsBy_(readObjectsByKeys_(APP.sheets.assetsCurrent, 'ASSET_ID', ids), 'ASSET_ID');
   const cases = {};
   readObjectsByKeys_(APP.sheets.cases, 'ASSET_ID', ids).forEach(function (caseRecord) {
@@ -205,17 +206,29 @@ function createNotificationDraftBatch_(assetIds, messageType, options) {
         events: eventsByAsset[assetId] || [],
         exceptionUrl: buildExceptionUrl_(assetId, caseRecord.CASE_ID)
       };
-      const routing = resolvePrimaryRecipient_(detail, messageType);
+      const delegation = delegateMap[assetId];
+      let routing;
+      if (delegation) {
+        // Admin-delegated sends target an explicit recipient and are limited to NOTIFIED cases.
+        if (canonicalLifecycleState_(caseRecord.STATE) !== APP.lifecycle.notified) {
+          throw new Error('Only NOTIFIED assets can be delegated to a new owner.');
+        }
+        if (!isSlackEmail_(delegation.recipient)) throw new Error('The delegated owner is not a valid email address.');
+        routing = { primaryRecipient: cleanText_(delegation.recipient).toLowerCase(), primaryRecipientSource: 'DELEGATED_OWNER' };
+      } else {
+        routing = resolvePrimaryRecipient_(detail, messageType);
+      }
       if (!routing.primaryRecipient) {
         throw new Error('No primary recipient could be resolved for ' + messageType + '. Add an owner or configure the applicable routing recipient.');
       }
-      // For owner-change resends, include the recipient in the idempotency key to bypass the SENT check.
+      // Owner-change and delegated resends include the recipient (and sweep, for delegation) in the key to bypass the SENT check.
       const isOwnerChange = ownerChangeMap[assetId];
-      const idempotencyKey = isOwnerChange
-        ? [caseRecord.CASE_ID, messageType, caseRecord.STATE, 'OWNER_CHANGE', routing.primaryRecipient].join('|')
-        : [caseRecord.CASE_ID, messageType, caseRecord.STATE].join('|');
-      // For owner-change, only look up by the exact key; skip the existingByCaseType fallback.
-      let record = existingByKey[idempotencyKey] || (!isOwnerChange && existingByCaseType[cleanText_(caseRecord.CASE_ID) + '|' + messageType]);
+      const isSpecialSend = Boolean(isOwnerChange || delegation);
+      let idempotencyKey = [caseRecord.CASE_ID, messageType, caseRecord.STATE].join('|');
+      if (delegation) idempotencyKey += '|DELEGATED|' + routing.primaryRecipient + '|' + cleanText_(delegation.sweepId);
+      else if (isOwnerChange) idempotencyKey += '|OWNER_CHANGE|' + routing.primaryRecipient;
+      // Special sends look up only the exact key; skip the existingByCaseType fallback.
+      let record = existingByKey[idempotencyKey] || (!isSpecialSend && existingByCaseType[cleanText_(caseRecord.CASE_ID) + '|' + messageType]);
       if (!record) {
         record = {
           NOTIFICATION_ID: uuid_(),
@@ -234,20 +247,9 @@ function createNotificationDraftBatch_(assetIds, messageType, options) {
           ERROR: ''
         };
         existingByKey[idempotencyKey] = record;
-        if (!isOwnerChange) existingByCaseType[cleanText_(caseRecord.CASE_ID) + '|' + messageType] = record;
+        if (!isSpecialSend) existingByCaseType[cleanText_(caseRecord.CASE_ID) + '|' + messageType] = record;
         additions.push(record);
-        const eventDetails = {
-          notificationId: record.NOTIFICATION_ID,
-          messageType: messageType,
-          primaryRecipient: routing.primaryRecipient,
-          primaryRecipientSource: routing.primaryRecipientSource
-        };
-        if (isOwnerChange) {
-          eventDetails.reason = 'OWNERSHIP_CHANGE';
-          eventDetails.sweepId = ownerChangeMap[assetId].sweepId;
-          eventDetails.previousRecipient = ownerChangeMap[assetId].previousRecipient;
-          eventDetails.newRecipient = ownerChangeMap[assetId].recipient;
-        }
+        const eventDetails = draftEventDetails_(record, messageType, routing, ownerChangeMap[assetId], delegation);
         events.push(notificationEventRow_(record, 'NOTIFICATION_DRAFTED', caseRecord.STATE, caseRecord.STATE, '', eventDetails));
       } else if (['DRAFT', 'FAILED'].indexOf(cleanText_(record.STATUS).toUpperCase()) !== -1) {
         const needsRefresh = cleanText_(record.STATUS).toUpperCase() === 'FAILED' ||
@@ -266,18 +268,7 @@ function createNotificationDraftBatch_(assetIds, messageType, options) {
           record.MESSAGE_PREVIEW = buildNotificationPreview_(buildSlackMessage_(detail, messageType));
           record.ERROR = '';
           updates.push(record);
-          const eventDetails = {
-            notificationId: record.NOTIFICATION_ID,
-            messageType: messageType,
-            primaryRecipient: routing.primaryRecipient,
-            primaryRecipientSource: routing.primaryRecipientSource
-          };
-          if (isOwnerChange) {
-            eventDetails.reason = 'OWNERSHIP_CHANGE';
-            eventDetails.sweepId = ownerChangeMap[assetId].sweepId;
-            eventDetails.previousRecipient = ownerChangeMap[assetId].previousRecipient;
-            eventDetails.newRecipient = ownerChangeMap[assetId].recipient;
-          }
+          const eventDetails = draftEventDetails_(record, messageType, routing, ownerChangeMap[assetId], delegation);
           events.push(notificationEventRow_(record, 'NOTIFICATION_DRAFT_REFRESHED', caseRecord.STATE, caseRecord.STATE, '', eventDetails));
         }
       }
@@ -294,6 +285,33 @@ function createNotificationDraftBatch_(assetIds, messageType, options) {
   if (updates.length) updateObjectsByKey_(APP.sheets.notifications, 'NOTIFICATION_ID', updates);
   if (events.length) appendRawRows_(APP.sheets.events, events);
   return { records: records, errors: errors };
+}
+
+function draftEventDetails_(record, messageType, routing, ownerChange, delegation) {
+  const details = {
+    notificationId: record.NOTIFICATION_ID,
+    messageType: messageType,
+    primaryRecipient: routing.primaryRecipient,
+    primaryRecipientSource: routing.primaryRecipientSource
+  };
+  if (ownerChange) {
+    details.reason = 'OWNERSHIP_CHANGE';
+    details.sweepId = ownerChange.sweepId;
+    details.previousRecipient = ownerChange.previousRecipient;
+    details.newRecipient = ownerChange.recipient;
+  }
+  if (delegation) {
+    details.reason = 'OWNER_DELEGATION';
+    details.sweepId = delegation.sweepId;
+    details.previousRecipient = delegation.previousRecipient || '';
+    details.newRecipient = routing.primaryRecipient;
+    details.delegatedBy = delegation.delegatedBy || '';
+  }
+  return details;
+}
+
+function isDelegatedNotificationRecord_(record) {
+  return cleanText_(record && record.IDEMPOTENCY_KEY).indexOf('|DELEGATED|') !== -1;
 }
 
 function sendPreparedNotificationOwnerGroup_(records, messageType, recipient) {
@@ -427,10 +445,12 @@ function sendNotificationBatchInternal_(notificationId, profile, actorContext, a
   if (!batchItems.length) throw new Error('No eligible notification drafts remain in this consolidated group.');
 
   const payload = normalizeSlackWorkflowPayload_(buildSlackBatchMessage_(batchItems, messageType, recipient));
-  if (profile.recipientLock && cleanText_(payload.primaryRecipient).toLowerCase() !== profile.recipientLock) {
+  // Admin-delegated sends deliberately target an explicit recipient, so the DEV recipient lock/allowlist is bypassed.
+  const delegatedGroup = batchItems.every(function (item) { return isDelegatedNotificationRecord_(item.record); });
+  if (!delegatedGroup && profile.recipientLock && cleanText_(payload.primaryRecipient).toLowerCase() !== profile.recipientLock) {
     throw new Error('DEV recipient safety lock blocked this notification. Expected ' + profile.recipientLock + '.');
   }
-  if (profile.key === 'DEV' && profile.recipientAllowlist.length && profile.recipientAllowlist.indexOf(cleanText_(payload.primaryRecipient).toLowerCase()) === -1) {
+  if (!delegatedGroup && profile.key === 'DEV' && profile.recipientAllowlist.length && profile.recipientAllowlist.indexOf(cleanText_(payload.primaryRecipient).toLowerCase()) === -1) {
     throw new Error('DEV recipient allowlist blocked this notification. Allowed recipients: ' + profile.recipientAllowlist.join(', ') + '.');
   }
   let receipt;

@@ -340,6 +340,20 @@ When an asset's Technical Steward or Schema Owner changes and the asset is alrea
 
 ---
 
+### 9b. Delegate assignment (on-demand send to a named owner)
+
+An admin selects one or more assets in the asset table and clicks **DELEGATE TO NEW OWNER** (bulk action bar), enters the new owner (email, or a Salesforce username expanded to `@salesforce.com`), reviews a preview, and confirms. The stale-asset notice is then sent to that owner immediately.
+
+- **Entry points** (`PlatformActionService.js`): `previewDelegateAssignment({assetIds, newOwner})` (admin only) and `sendDelegatedAssignmentNotifications({assetIds, newOwner, sweepId})` (admin + writable environment). Limit: 200 assets per request.
+- **Eligibility:** NOTIFIED cases only. Skipped with a reason: not NOTIFIED, asset gone, or the new owner is already the asset's resolved recipient (compared with `ignoreRecipientLock: true`).
+- **Message:** reuses `STALE_ASSET_NOTICE`; no new catalog type. One consolidated message per recipient.
+- **Drafting:** `createAndSendNotificationGroups_(..., {delegate: map})`, where map is `assetId -> {recipient, previousRecipient, sweepId, delegatedBy}`. The recipient comes from the admin input, not the asset's owner fields.
+- **Idempotency:** key is `CASE_ID|TYPE|STATE|DELEGATED|<recipient>|<sweepId>`. The sweepId is generated per click, so a retry to the same recipient is a deliberate resend; a repeated call with the same sweepId is deduplicated.
+- **DEV lock:** `PRIMARY_RECIPIENT_LOCK` / `ALLOWED_RECIPIENTS` are bypassed for delegated notification groups (drafting and in `sendNotificationBatchInternal_`), because the admin explicitly chose the recipient. Non-delegated sends are unaffected.
+- **Audit:** `NOTIFICATION_DRAFTED` / `NOTIFICATION_DRAFT_REFRESHED` events carry `reason: 'OWNER_DELEGATION'`, `sweepId`, `previousRecipient`, `newRecipient`, `delegatedBy`. The asset's owner columns are not modified, so the next import does not revert anything and does not itself trigger an owner-change event for the delegate.
+
+---
+
 ## 10. Reliability & recovery design (cross-cutting)
 
 `ReliabilityService.js` is the backbone that makes long, mutating workflows crash-safe on GAS:

@@ -559,4 +559,56 @@ function context(values) {
   assert(source.includes('OWNERSHIP_CHANGED'), 'SlackMessageCatalog should reference OWNERSHIP_CHANGED events');
 }
 
+// ---- Delegate assignment ----
+{
+  const platform = fs.readFileSync(path.join(root, 'PlatformActionService.js'), 'utf8');
+  const notif = fs.readFileSync(path.join(root, 'NotificationService.js'), 'utf8');
+  const client = fs.readFileSync(path.join(root, 'Client.html'), 'utf8');
+  const index = fs.readFileSync(path.join(root, 'Index.html'), 'utf8');
+
+  // Behavioral: owner normalization.
+  const sandbox = {
+    cleanText_: function (v) { return v === null || v === undefined ? '' : String(v).trim(); },
+    isSlackEmail_: function (v) { return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(v).trim()); },
+    isSalesforceUserId_: function (v) { return /^[a-z][a-z0-9.-]*$/i.test(v) && !/^(sysadmin|accountadmin|securityadmin|useradmin|orgadmin|public)$/i.test(v); }
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(extractFunction('PlatformActionService.js', 'normalizeDelegateOwner_'), sandbox);
+  assert.strictEqual(sandbox.normalizeDelegateOwner_('New.Owner@Salesforce.com'), 'new.owner@salesforce.com');
+  assert.strictEqual(sandbox.normalizeDelegateOwner_('jdoe'), 'jdoe@salesforce.com');
+  ['', 'a@b.com, c@d.com', 'two words', 'sysadmin', 'a@b'].forEach(function (bad) {
+    assert.throws(function () { sandbox.normalizeDelegateOwner_(bad); }, bad + ' should be rejected');
+  });
+
+  // Server entry points are admin-only; send also needs a writable environment.
+  const preview = extractFunction('PlatformActionService.js', 'previewDelegateAssignment');
+  const send = extractFunction('PlatformActionService.js', 'sendDelegatedAssignmentNotifications');
+  assert(preview.includes('assertAdmin_()'));
+  assert(send.includes('assertAdmin_()') && send.includes('assertEnvironmentWritable_()'));
+  assert(send.includes("'STALE_ASSET_NOTICE'") && send.includes('delegate:'));
+  const collect = extractFunction('PlatformActionService.js', 'collectDelegationTargets_');
+  assert(collect.includes('APP.lifecycle.notified'), 'delegation must be limited to NOTIFIED');
+  assert(collect.includes('ignoreRecipientLock'), 'already-owner check must use the true recipient');
+
+  // Draft batch: distinct DELEGATED key with sweepId; lock bypass at draft and send time.
+  const draft = extractFunction('NotificationService.js', 'createNotificationDraftBatch_');
+  assert(draft.includes('options.delegate') && draft.includes("'|DELEGATED|'") && draft.includes('delegation.sweepId'));
+  assert(draft.includes('!isSpecialSend'), 'delegated keys must skip the case/type fallback');
+  assert(draft.includes('if (delegation)') && draft.includes("'DELEGATED_OWNER'"), 'delegated recipient must replace resolvePrimaryRecipient_');
+  const batchSend = extractFunction('NotificationService.js', 'sendNotificationBatchInternal_');
+  assert(batchSend.includes('isDelegatedNotificationRecord_') && batchSend.includes('!delegatedGroup'));
+  assert(notif.includes("'OWNER_DELEGATION'"), 'audit reason missing');
+
+  // UI wiring, and no reference to a non-existent client-side uuid_.
+  assert(index.includes('bulkDelegateButton') && index.includes('requestDelegateAssignment_()'));
+  ['requestDelegateAssignment_', 'previewDelegateAssignment_', 'runDelegateAssignment_', 'clientUuid_'].forEach(function (fn) {
+    assert(client.includes('function ' + fn + '('), 'Missing client function ' + fn);
+  });
+  assert(client.includes('.previewDelegateAssignment({') && client.includes('.sendDelegatedAssignmentNotifications({'));
+  assert(!/[^a-zA-Z]uuid_\(/.test(client), 'Client.html must not call server-only uuid_()');
+
+  const design = fs.readFileSync(path.join(root, 'docs/DESIGN.md'), 'utf8');
+  assert(design.includes('Delegate assignment') && design.includes('OWNER_DELEGATION'));
+}
+
 console.log('Production rollout safeguards passed.');

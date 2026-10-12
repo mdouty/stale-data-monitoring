@@ -492,7 +492,8 @@
       contest: document.getElementById('bulkContestButton'),
       selfPurge: document.getElementById('bulkSelfPurgeButton'),
       restore: document.getElementById('bulkRestoreButton'),
-      dismiss: document.getElementById('bulkDismissButton')
+      dismiss: document.getElementById('bulkDismissButton'),
+      delegate: document.getElementById('bulkDelegateButton')
     };
     Object.keys(buttons).forEach(function (action) {
       if (!buttons[action]) return;
@@ -590,7 +591,8 @@
       contest: canRespond && stale && ['NOTIFIED', 'ACCEPTED'].indexOf(lifecycle) !== -1,
       selfPurge: canRespond && stale && ['DETECTED', 'NOTIFIED', 'CONTESTED', 'ACCEPTED'].indexOf(lifecycle) !== -1,
       restore: canRespond && quarantined && ['QUARANTINED', 'PURGE_ELIGIBLE', 'SELF_PURGE_PENDING'].indexOf(lifecycle) !== -1,
-      dismiss: canAdmin && stale && ['DETECTED', 'NOTIFIED', 'CONTESTED', 'ACCEPTED', 'SELF_PURGE_PENDING'].indexOf(lifecycle) !== -1
+      dismiss: canAdmin && stale && ['DETECTED', 'NOTIFIED', 'CONTESTED', 'ACCEPTED', 'SELF_PURGE_PENDING'].indexOf(lifecycle) !== -1,
+      delegate: canAdmin && stale && lifecycle === 'NOTIFIED'
     };
   }
 
@@ -1999,6 +2001,75 @@
     step();
   }
 
+  function clientUuid_() {
+    if (window.crypto && window.crypto.randomUUID) return window.crypto.randomUUID();
+    return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  }
+
+  function requestDelegateAssignment_() {
+    const assetIds = Object.keys(state.selectedAssets);
+    if (!assetIds.length) return;
+    const count = assetIds.length;
+    showConfirmation({
+      title: 'Delegate to new owner',
+      message: 'Send the stale-data notice for ' + formatNumber(count) + ' selected asset' + (count === 1 ? '' : 's') + ' to a new owner.',
+      detail: 'Only NOTIFIED assets are eligible. The asset record is not changed; the delegation is logged and the notice is sent on demand. In DEV, the recipient safety lock is bypassed for this action.',
+      reviewHtml: '<label for="delegateOwnerInput"><strong>New owner</strong></label><input id="delegateOwnerInput" type="text" autocomplete="off" placeholder="name@salesforce.com or username" aria-label="New owner email or username" style="width:100%;margin-top:6px">',
+      confirmLabel: 'Preview',
+      confirmClass: 'primary'
+    }, function () {
+      const input = document.getElementById('delegateOwnerInput');
+      previewDelegateAssignment_(assetIds, input ? input.value : '');
+    });
+  }
+
+  function previewDelegateAssignment_(assetIds, newOwner) {
+    const loadingToken = beginServerLoading_('Preparing delegation', 'Validating the new owner and selected assets…', false);
+    google.script.run.withSuccessHandler(function (preview) {
+      endServerLoading_(loadingToken);
+      const total = preview.total || 0;
+      const skipped = preview.skipped || {};
+      const skips = [];
+      if (skipped.notNotified > 0) skips.push(formatNumber(skipped.notNotified) + ' not NOTIFIED');
+      if (skipped.alreadyOwner > 0) skips.push(formatNumber(skipped.alreadyOwner) + ' already owned by this recipient');
+      if (skipped.assetGone > 0) skips.push(formatNumber(skipped.assetGone) + ' no longer exist');
+      if (!total) {
+        showToast('No eligible assets to delegate.' + (skips.length ? ' Skipped: ' + skips.join(', ') + '.' : ''), true);
+        return;
+      }
+      const sample = (preview.sample || []).map(function (item) { return item.objectFqn; }).join(', ');
+      showConfirmation({
+        title: 'Send to ' + preview.newOwner + '?',
+        message: formatNumber(total) + ' asset' + (total === 1 ? '' : 's') + ' will be delegated and one consolidated Slack notice sent now.',
+        detail: (sample ? 'Includes: ' + sample + (total > 10 ? ', …' : '') + '. ' : '') + (skips.length ? 'Skipped: ' + skips.join(', ') + '.' : ''),
+        confirmLabel: 'Send notice',
+        confirmClass: 'primary'
+      }, function () { runDelegateAssignment_(assetIds, newOwner); });
+    }).withFailureHandler(function (error) {
+      endServerLoading_(loadingToken);
+      showToast(error.message || String(error), true);
+    }).previewDelegateAssignment({ assetIds: assetIds, newOwner: newOwner });
+  }
+
+  function runDelegateAssignment_(assetIds, newOwner) {
+    setBulkBusy(true);
+    const loadingToken = beginServerLoading_('Sending delegated notice', 'Delivering the Slack notice to the new owner…', true);
+    google.script.run.withSuccessHandler(function (result) {
+      endServerLoading_(loadingToken);
+      setBulkBusy(false);
+      const failures = result.notificationFailureCount || 0;
+      if (!failures) clearBulkSelection();
+      loadDashboard(state.page);
+      const detail = failures && result.notificationErrors && result.notificationErrors[0] ? ' ' + result.notificationErrors[0].error : '';
+      showToast('Delegated ' + formatNumber(result.processed || 0) + ' asset(s) to ' + result.newOwner + '.' +
+        (failures ? ' ' + formatNumber(failures) + ' delivery failure(s).' + detail : ''), Boolean(failures));
+    }).withFailureHandler(function (error) {
+      endServerLoading_(loadingToken);
+      setBulkBusy(false);
+      showToast(error.message || String(error), true);
+    }).sendDelegatedAssignmentNotifications({ assetIds: assetIds, newOwner: newOwner, sweepId: clientUuid_() });
+  }
+
   function openOwnerChangeResend() {
     showConfirmation({
       title: 'Notify new owners',
@@ -2051,7 +2122,7 @@
     const loadingToken = beginServerLoading_('Sending owner-change notices', 'Delivering consolidated Slack messages…', true);
     let iterations = 0;
     let lastRemaining = -1;
-    const sweepId = uuid_();
+    const sweepId = clientUuid_();
     const excludeAssetIds = [];
     const finish = function () {
       endServerLoading_(loadingToken);

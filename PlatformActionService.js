@@ -917,3 +917,117 @@ function sendOwnerChangeNotificationBatch(input) {
     notificationErrors: deliveryErrors
   };
 }
+
+// ---------------------------------------------------------------------------
+// Delegate assignment: admin selects NOTIFIED assets and names a new owner who
+// receives the stale-asset notice on demand. The asset's own owner fields are
+// not modified; the delegation is audited in Lifecycle_Events.
+// ---------------------------------------------------------------------------
+
+function delegateAssignmentMaxAssets_() {
+  return 200;
+}
+
+function normalizeDelegateOwner_(value) {
+  const text = cleanText_(value).toLowerCase();
+  if (!text) throw new Error('Enter the new owner as an email address or Salesforce username.');
+  if (/[;,\s]/.test(text)) throw new Error('Enter exactly one new owner.');
+  if (isSlackEmail_(text)) return text;
+  if (text.indexOf('@') === -1 && isSalesforceUserId_(text)) return text + '@salesforce.com';
+  throw new Error('"' + cleanText_(value) + '" is not a valid email address or Salesforce username.');
+}
+
+function collectDelegationTargets_(assetIds, newOwner) {
+  const ids = Array.from(new Set((assetIds || []).map(cleanText_).filter(Boolean)));
+  if (!ids.length) throw new Error('Select at least one asset.');
+  if (ids.length > delegateAssignmentMaxAssets_()) {
+    throw new Error('Delegation is limited to ' + delegateAssignmentMaxAssets_() + ' assets at a time.');
+  }
+  const recipient = normalizeDelegateOwner_(newOwner);
+  const assets = indexObjectsBy_(readObjectsByKeys_(APP.sheets.assetsCurrent, 'ASSET_ID', ids), 'ASSET_ID');
+  const cases = {};
+  readObjectsByKeys_(APP.sheets.cases, 'ASSET_ID', ids).forEach(function (caseRecord) {
+    if (assets[caseRecord.ASSET_ID]) cases[caseRecord.ASSET_ID] = caseRecord;
+  });
+  const result = { recipient: recipient, targets: [], skipped: { notNotified: 0, assetGone: 0, alreadyOwner: 0 }, skippedAssets: [] };
+  ids.forEach(function (assetId) {
+    const asset = assets[assetId];
+    const caseRecord = cases[assetId];
+    if (!asset || !caseRecord) {
+      result.skipped.assetGone += 1;
+      return;
+    }
+    if (canonicalLifecycleState_(caseRecord.STATE) !== APP.lifecycle.notified) {
+      result.skipped.notNotified += 1;
+      result.skippedAssets.push({ assetId: assetId, objectFqn: asset.OBJECT_FQN || '', reason: 'Not NOTIFIED (' + cleanText_(caseRecord.STATE) + ')' });
+      return;
+    }
+    const current = resolvePrimaryRecipient_({ asset: asset, caseRecord: caseRecord, events: [] }, 'STALE_ASSET_NOTICE', { ignoreRecipientLock: true });
+    const previous = cleanText_(current.primaryRecipient).toLowerCase();
+    if (previous && previous === recipient) {
+      result.skipped.alreadyOwner += 1;
+      result.skippedAssets.push({ assetId: assetId, objectFqn: asset.OBJECT_FQN || '', reason: 'Already the resolved owner' });
+      return;
+    }
+    result.targets.push({ assetId: assetId, caseId: caseRecord.CASE_ID, objectFqn: asset.OBJECT_FQN || '', previousRecipient: previous });
+  });
+  return result;
+}
+
+function previewDelegateAssignment(input) {
+  assertAdmin_();
+  const targets = collectDelegationTargets_(input && input.assetIds, input && input.newOwner);
+  return {
+    environment: getActiveEnvironment_(),
+    newOwner: targets.recipient,
+    total: targets.targets.length,
+    skipped: targets.skipped,
+    skippedSample: targets.skippedAssets.slice(0, 5),
+    sample: targets.targets.slice(0, 10).map(function (target) {
+      return { objectFqn: target.objectFqn, previousRecipient: target.previousRecipient };
+    })
+  };
+}
+
+function sendDelegatedAssignmentNotifications(input) {
+  const admin = assertAdmin_();
+  assertEnvironmentWritable_();
+  const sweepId = cleanText_(input && input.sweepId) || uuid_();
+  const targets = collectDelegationTargets_(input && input.assetIds, input && input.newOwner);
+  const base = {
+    environment: getActiveEnvironment_(),
+    newOwner: targets.recipient,
+    sweepId: sweepId,
+    skipped: targets.skipped
+  };
+  if (!targets.targets.length) {
+    return Object.assign(base, { processed: 0, groups: 0, failedAssetIds: [], notificationFailureCount: 0, notificationErrors: [] });
+  }
+  const delegateMap = {};
+  targets.targets.forEach(function (target) {
+    delegateMap[target.assetId] = {
+      recipient: targets.recipient,
+      previousRecipient: target.previousRecipient,
+      sweepId: sweepId,
+      delegatedBy: admin.email
+    };
+  });
+  const errors = [];
+  let delivery = { assetCount: 0, groupCount: 0, errors: [] };
+  try {
+    delivery = createAndSendNotificationGroups_(
+      targets.targets.map(function (target) { return target.assetId; }),
+      'STALE_ASSET_NOTICE', false, { delegate: delegateMap }
+    );
+    (delivery.errors || []).forEach(function (error) { errors.push(error); });
+  } catch (error) {
+    errors.push({ error: String(error.message || error).substring(0, 500) });
+  }
+  return Object.assign(base, {
+    processed: delivery.assetCount || 0,
+    groups: delivery.groupCount || 0,
+    failedAssetIds: errors.map(function (error) { return error.assetId; }).filter(Boolean),
+    notificationFailureCount: errors.length,
+    notificationErrors: errors
+  });
+}

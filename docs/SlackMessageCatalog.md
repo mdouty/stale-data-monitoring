@@ -4,23 +4,27 @@ This document catalogs all Slack message types sent by the EDG Stale Data Monito
 
 ---
 
-## Message Types (15 total)
+## Message Types (15 total, from `SLACK_MESSAGE_CATALOG` in `NotificationService.js`)
 
-| Type | Trigger | Recipient | Frequency | Notes |
+| Type | Label | Audience | Timing | Severity |
 |---|---|---|---|---|
-| `STALE_ASSET_NOTICE` | Asset transitions to NOTIFIED (import) or ownership changes on NOTIFIED asset (admin resend) | Technical Steward, Schema Owner, or fallback | Once per owner per import; resent if ownership changes | Consolidated per recipient. Contains asset FQN, inactivity threshold, contest deadline. Also used for **owner-change resends** — when ownership changes on an already-NOTIFIED asset, the new owner receives the same notice. |
-| `CONTESTATION_REMINDER` | Owner contests and exception window is open | Applicant of the exception | Periodically during contest window | Reminder to complete their exception case. |
-| `CONTEST_RESOLUTION_NOTICE` | Contest resolved (exception approved or rejected) | Original asset owner | Once per resolution | Outcome confirmation. |
-| `QUARANTINE_NOTICE` | Asset transitioned to QUARANTINED (contest window elapsed) | Technical Steward, Schema Owner, or fallback | Once per quarantine | Contains quarantine duration and restoration instructions. |
-| `PURGE_ELIGIBLE_NOTICE` | Asset transitioned to PURGE_ELIGIBLE (quarantine expiry reached) | Technical Steward, Schema Owner, or fallback | Once per purge-eligible transition | Final notice before purge; includes deadline and override/restore links. |
-| `PURGE_COMPLETION_NOTICE` | Asset purged by platform team | Technical Steward, Schema Owner, or fallback | Once per purge | Confirmation of completion. |
-| `RESTORED_NOTICE` | Asset restored from quarantine or purge | Technical Steward, Schema Owner, or fallback | Once per restoration | Confirms access restored and case dismissed. |
-| `SELF_PURGE_CONFIRMATION` | Owner requests self-purge | Requesting owner | Once per self-purge request | Confirmation that asset will be purged; no further action needed. |
-| `EXEMPT_APPROVAL_NOTICE` | Exception approved and asset marked EXEMPT | Original asset owner | Once per exemption | Confirms asset moved to ACTIVE and removed from stale tracking. |
-| `LIFECYCLE_REMINDER` | Admin-triggered bulk reminder campaign | Asset owners | On-demand (admin sweep) | Generic reminder of open cases with contest/quarantine/purge deadlines. |
-| `IMPORT_SUMMARY` | Import completes successfully | Configured recipients (admin only in DEV/PRD) | Once per import | Counts of assets added, removed, state changes. |
-| `ADMIN_ESCALATION` | Admin escalates a case for partner action | Platform team / stakeholders | On-demand | Handoff notification for out-of-app actions (quarantine, purge, restore). |
-| (Internal tracking) | (Build-time tracking) | (N/A) | (N/A) | `NOTIFICATION_DRAFTED`, `NOTIFICATION_FAILED`, `NOTIFICATION_SENT` are lifecycle events logged to `Lifecycle_Events`, not Slack messages. |
+| `STALE_ASSET_NOTICE` | Action required: review stale data asset | DPMT accountable owner or BDST validation partner | T+2 after EDG intake approval | ACTION_REQUIRED |
+| `CONTESTATION_REMINDER` | Reminder: stale-data review window is closing | DPMT accountable owner or BDST validation partner | T+7 | ACTION_REQUIRED |
+| `OWNER_ESCALATION` | Escalation: stale asset has no owner response | DPMT, BDST, and EDG | T+9 contest deadline | ESCALATION |
+| `CONTESTATION_RECEIVED` | Contestation received | Requester and EDG | Immediately after contestation | INFORMATIONAL |
+| `DEPRECATION_ACCEPTED` | Deprecation accepted | Asset owner and stewards | Immediately after owner acceptance | INFORMATIONAL |
+| `RESTRICTION_NOTICE` | Access restricted | Business or technical steward | Legacy compatibility only | WARNING |
+| `QUARANTINE_NOTICE` | Asset quarantined | Business or technical steward | After Snowflake confirms RESTRICTED | WARNING |
+| `PURGE_NOTICE_30_DAY` | Final 30-day purge notice | Business or technical steward | 30 days before purge eligibility | URGENT |
+| `PURGE_COMPLETED` | Purge completed | Business or technical steward and EDG | After completion and next-extract verification | INFORMATIONAL |
+| `RESTORATION_CONFIRMED` | Restoration confirmed | Requester, asset owner, and stewards | Immediately after restoration | INFORMATIONAL |
+| `ORPHAN_QUARANTINE_NOTICE` | Orphan quarantine handoff initiated | EDG-coordinated outreach | T0 for an asset without DPMT or BDST ownership | ESCALATION |
+| `SANDBOX_PURGE_NOTICE_7_DAY` | Sandbox purge notice | Sandbox owner | 7 days before sandbox purge | WARNING |
+| `SANDBOX_PURGE_COMPLETED` | Sandbox purge completed | Sandbox owner and EDG | After verified sandbox deletion | INFORMATIONAL |
+| `PURGE_BLOCKED` | Purge blocked | EDG and platform operators | When a hold or control prevents purge | ESCALATION |
+| `LIFECYCLE_SLA_ALERT` | Lifecycle SLA alert | EDG operations | When a milestone is overdue | ESCALATION |
+
+`STALE_ASSET_NOTICE` is also used, unchanged, for **owner-change resends** and **delegated assignments** (below); neither adds a catalog type. Aliases: `STALE_NOTICE` -> `STALE_ASSET_NOTICE`, `PURGE_NOTICE` -> `PURGE_NOTICE_30_DAY`.
 
 ---
 
@@ -41,6 +45,20 @@ This document catalogs all Slack message types sent by the EDG Stale Data Monito
 - "Informed set" rule: new owner is skipped if they already received the original notice or were already informed by a prior owner-change sweep.
 
 **Consolidation:** One Slack message per new owner, grouping all their assets with changed ownership (same as the import notification campaign).
+
+---
+
+## Delegated Assignment Detail
+
+**Feature:** An admin selects NOTIFIED assets, enters a new owner, and the stale-asset notice is sent to that owner on demand.
+
+**Message type:** `STALE_ASSET_NOTICE` (reused).
+
+**Idempotency key:** `CASE_ID|STALE_ASSET_NOTICE|STATE|DELEGATED|<recipient>|<sweepId>` (new sweepId per click, so retries resend).
+
+**DEV safety:** the DEV recipient lock/allowlist is bypassed for delegated groups only.
+
+**Audit:** draft events carry `reason: OWNER_DELEGATION`, `previousRecipient`, `newRecipient`, `delegatedBy`. See DESIGN.md section 9b.
 
 ---
 
@@ -67,12 +85,9 @@ All Slack sends are **consolidated one message per unique owner** across the set
 
 - **DEV environment:** `PRIMARY_RECIPIENT_LOCK` restricts Slack sends to a list of test recipients (e.g., `test-owner@domain.com`). Prevents live-data testing from sending to real owners.
 - **PRD environment:** `ALLOWED_RECIPIENTS` may further restrict if needed; default is to send to resolved owner.
-- **Message type branching:** Some message types have tenant/environment-specific variations (e.g., different wording for internal vs. external stakeholders); these are parameterized in `getSlackMessagePayload_` (`NotificationService.js`).
 
 ---
 
 ## Testing & Validation
 
 - Manual testing in DEV verifies message formatting and recipient resolution before PRD deploy.
-- Regression suite (`tests/`) includes snapshot tests of message payloads per type.
-- Slack webhook URL is validated at app startup (`AdminService.js:onInstall`).
