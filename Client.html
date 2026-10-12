@@ -58,6 +58,7 @@
     document.getElementById('importButton').classList.toggle('hidden', !canImport);
     document.getElementById('runAutomationButton').classList.toggle('hidden', !canRunManualAutomation);
     document.getElementById('sendRemindersButton').classList.toggle('hidden', !canImport);
+    document.getElementById('sendOwnerChangeButton').classList.toggle('hidden', !canImport);
     document.getElementById('importButton').textContent = 'Import & Refresh Data';
     document.getElementById('adminTab').classList.toggle('hidden', !config.user.isAdmin);
     document.getElementById('adminPanel').classList.toggle('hidden', !config.user.isAdmin);
@@ -1193,6 +1194,7 @@
       document.getElementById('importButton').classList.toggle('hidden', !canImport);
       document.getElementById('runAutomationButton').classList.toggle('hidden', !canImport);
       document.getElementById('sendRemindersButton').classList.toggle('hidden', !canImport);
+      document.getElementById('sendOwnerChangeButton').classList.toggle('hidden', !canImport);
       showToast('Admin configurations saved.');
     });
   }
@@ -1993,6 +1995,94 @@
         finish();
         showToast(error.message || String(error), true);
       }).sendLifecycleReminderBatch({ mode: selection.mode, scope: selection.scope });
+    };
+    step();
+  }
+
+  function openOwnerChangeResend() {
+    showConfirmation({
+      title: 'Notify new owners',
+      message: 'Resend stale-data notices to assets where the Technical Data Steward or Schema owner changed.',
+      detail: 'Only NOTIFIED assets with a new recipient are included. Consolidated Slack messages are grouped by recipient.',
+      confirmLabel: 'Preview recipients',
+      confirmClass: 'primary'
+    }, function () {
+      previewOwnerChangeResend_();
+    });
+  }
+
+  function previewOwnerChangeResend_() {
+    const loadingToken = beginServerLoading_('Preparing owner-change resends', 'Scanning for ownership changes…', false);
+    google.script.run.withSuccessHandler(function (preview) {
+      endServerLoading_(loadingToken);
+      const total = preview.total || 0;
+      if (!total) {
+        showToast('No ownership changes detected since the last notification.');
+        return;
+      }
+      const skipped = preview.skipped || {};
+      let detailText = formatNumber(total) + ' asset(s) with new recipient(s).';
+      if (skipped.alreadyInformed > 0 || skipped.notNotified > 0 || skipped.noRecipient > 0 || skipped.assetGone > 0) {
+        detailText += ' Skipped: ';
+        const skips = [];
+        if (skipped.alreadyInformed > 0) skips.push(formatNumber(skipped.alreadyInformed) + ' already informed');
+        if (skipped.notNotified > 0) skips.push(formatNumber(skipped.notNotified) + ' not notified');
+        if (skipped.noRecipient > 0) skips.push(formatNumber(skipped.noRecipient) + ' no recipient');
+        if (skipped.assetGone > 0) skips.push(formatNumber(skipped.assetGone) + ' asset gone');
+        detailText += skips.join(', ') + '.';
+      }
+      showConfirmation({
+        title: 'Send to ' + formatNumber(total) + ' asset' + (total === 1 ? '' : 's') + '?',
+        message: 'Consolidated Slack messages will be grouped by recipient and sent now.',
+        detail: detailText,
+        confirmLabel: 'Send notices',
+        confirmClass: 'primary'
+      }, function () { runOwnerChangeResend_(); });
+    }).withFailureHandler(function (error) {
+      endServerLoading_(loadingToken);
+      showToast(error.message || String(error), true);
+    }).previewOwnerChangeNotifications();
+  }
+
+  function runOwnerChangeResend_() {
+    const button = document.getElementById('sendOwnerChangeButton');
+    if (button) button.disabled = true;
+    const totals = { processed: 0, groups: 0, failures: 0 };
+    const loadingToken = beginServerLoading_('Sending owner-change notices', 'Delivering consolidated Slack messages…', true);
+    let iterations = 0;
+    let lastRemaining = -1;
+    const sweepId = uuid_();
+    const excludeAssetIds = [];
+    const finish = function () {
+      endServerLoading_(loadingToken);
+      if (button) button.disabled = false;
+      loadAdminOperations();
+    };
+    const step = function () {
+      iterations += 1;
+      google.script.run.withSuccessHandler(function (result) {
+        totals.processed += result.processed || 0;
+        totals.groups += result.groups || 0;
+        totals.failures += result.notificationFailureCount || 0;
+        if (result.failedAssetIds && result.failedAssetIds.length > 0) {
+          excludeAssetIds.push.apply(excludeAssetIds, result.failedAssetIds);
+        }
+        const noProgress = result.remaining === lastRemaining && (result.processed || 0) === 0;
+        lastRemaining = result.remaining;
+        if (!result.done && iterations < 200 && !noProgress) {
+          renderWorkflowLoading_('Sending owner-change notices', 'Delivered ' + formatNumber(totals.processed) +
+            ' notice(s); ' + formatNumber(result.remaining || 0) + ' remaining…', true);
+          step();
+          return;
+        }
+        finish();
+        const suffix = totals.failures ? ' ' + formatNumber(totals.failures) + ' delivery failure(s) — see execution logs.' : '';
+        showToast('Owner-change delivery complete: ' + formatNumber(totals.processed) + ' asset(s) in ' +
+          formatNumber(totals.groups) + ' message group(s).' + suffix, Boolean(totals.failures));
+      }).withFailureHandler(function (error) {
+        finish();
+        showToast(error.message || String(error), true);
+      }).sendOwnerChangeNotificationBatch({ sweepId: sweepId, excludeAssetIds: excludeAssetIds });
     };
     step();
   }

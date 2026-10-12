@@ -298,6 +298,20 @@ for (const appendMode of [true, false]) {
   assert.deepEqual(appended.filter(sheet => sheet === 'current' || sheet === 'staging'), [appendMode ? 'current' : 'staging']);
 }
 
+// Verify source code: owner-change detection in import; append-only mode behavior.
+{
+  const source = fs.readFileSync(path.join(root, 'SnowflakeAdapter.js'), 'utf8');
+
+  // importSourceChunk_ should read existing NOTIFIED assets only in normal mode
+  assert(source.includes('readObjectsByKeys_(APP.sheets.assetsCurrent'), 'importSourceChunk_ should read Assets_Current');
+  assert(source.includes('state.appendMode'), 'Should check append-only mode');
+  assert(source.includes('buildOwnershipChangeEvent_'), 'Should call buildOwnershipChangeEvent_');
+  assert(source.includes('existingAssets'), 'Should use existingAssets map for ownership change detection');
+
+  // buildOwnershipChangeEvent_ function signature
+  assert(source.includes('function buildOwnershipChangeEvent_(previousAsset, nextAsset, caseRecord, snapshotAt, runId)'), 'buildOwnershipChangeEvent_ should have correct signature');
+}
+
 // FINALIZE/RECONCILE loops: multiple batches per execution with cache reuse, respecting
 // batch cap, time budget, and stage transition; stages other than RECONCILE still run once.
 for (const scenario of [{ duration: 1, limit: 99, batchCap: 3, expected: 3 }, { duration: 200001, limit: 99, batchCap: 99, expected: 1 }, { duration: 1, limit: 2, batchCap: 99, expected: 2 }]) {

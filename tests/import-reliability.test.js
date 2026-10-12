@@ -318,4 +318,31 @@ for (const decision of ['RECEIVED', 'NOT_RECEIVED']) {
   assert.deepStrictEqual(delays, [60000, 120000]);
   assert.strictEqual(state.progressStage, 'IMPORT_PAUSED');
 }
+
+// Replaying a saved batch with ownership-change events writes them once.
+// OWNERSHIP_CHANGED events are added to the append-only Lifecycle_Events sheet.
+// Replaying the same batch again must not duplicate the event rows.
+{
+  const h = harness(), s = h.sandbox;
+  h.makeSheet('events', [['EVENT_ID', 'CASE_ID', 'ASSET_ID', 'EVENT_TYPE', 'FROM', 'TO', 'AT', 'ACTOR', 'RUN_ID', 'DETAILS']]);
+  h.makeSheet('notifications', [['NOTIFICATION_ID', 'STATUS']]);
+  const plan = s.newDurableWritePlan_();
+  s.planAppendRows_(plan, 'events', [
+    ['e1', 'case-1', 'asset-1', 'OWNERSHIP_CHANGED', 'NOTIFIED', 'NOTIFIED', '2026-09-14T12:00:00Z', 'SYSTEM', 'run-1', '{}'],
+    ['e2', 'case-2', 'asset-2', 'OWNERSHIP_CHANGED', 'NOTIFIED', 'NOTIFIED', '2026-09-14T12:00:00Z', 'SYSTEM', 'run-1', '{}']
+  ]);
+  s.saveDurablePayload_('SourceBatch', 'run-1|2', { writes: plan.writes, result: { processedRows: 2 } });
+
+  // First apply: writes the two ownership-change events
+  s.applyDurableWrites_(plan.writes);
+  assert.strictEqual(h.sheets.get('events').getLastRow(), 3); // header + 2 events
+
+  // Replay (same batch): must be idempotent and not duplicate the event rows
+  const saved = s.readDurablePayload_('SourceBatch', 'run-1|2');
+  s.applyDurableWrites_(saved.writes);
+  assert.strictEqual(h.sheets.get('events').getLastRow(), 3, 'Replay must not duplicate OWNERSHIP_CHANGED events');
+  assert.strictEqual(h.sheets.get('events').data[1][3], 'OWNERSHIP_CHANGED');
+  assert.strictEqual(h.sheets.get('events').data[2][3], 'OWNERSHIP_CHANGED');
+}
+
 console.log('Import reliability fault-injection checks passed.');

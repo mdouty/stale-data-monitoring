@@ -464,4 +464,99 @@ function context(values) {
   assert(source.includes("loadDashboard(1, { tableOnlyLoading: true })"));
 }
 
+{
+  const source = fs.readFileSync(path.join(root, 'Index.html'), 'utf8');
+  const client = fs.readFileSync(path.join(root, 'Client.html'), 'utf8');
+  assert(source.includes('id="sendOwnerChangeButton"'), 'Index.html missing sendOwnerChangeButton');
+  assert(source.includes('onclick="openOwnerChangeResend()"'), 'Index.html missing onclick handler');
+  assert(client.includes('function openOwnerChangeResend()'), 'Client.html missing openOwnerChangeResend function');
+  assert(client.includes('function previewOwnerChangeResend_()'), 'Client.html missing previewOwnerChangeResend_ function');
+  assert(client.includes('function runOwnerChangeResend_()'), 'Client.html missing runOwnerChangeResend_ function');
+  assert(client.includes("document.getElementById('sendOwnerChangeButton').classList.toggle('hidden', !canImport)"));
+  assert(client.includes('.previewOwnerChangeNotifications()'));
+  assert(client.includes('.sendOwnerChangeNotificationBatch({ sweepId: sweepId'));
+}
+
+{
+  const source = fs.readFileSync(path.join(root, 'SnowflakeAdapter.js'), 'utf8');
+  const buildOwnership = extractFunction('SnowflakeAdapter.js', 'lifecycleEventRow_');
+  assert(source.includes('function buildOwnershipChangeEvent_'), 'SnowflakeAdapter missing buildOwnershipChangeEvent_ function');
+  assert(source.includes('OWNERSHIP_CHANGED'), 'buildOwnershipChangeEvent_ should reference OWNERSHIP_CHANGED');
+  assert(source.includes('previousRecipient'), 'buildOwnershipChangeEvent_ should track previousRecipient');
+  assert(source.includes('newRecipient'), 'buildOwnershipChangeEvent_ should track newRecipient');
+  assert(source.includes('ignoreRecipientLock'), 'buildOwnershipChangeEvent_ should call resolvePrimaryRecipient_ with ignoreRecipientLock');
+  assert(source.includes('changedFields'), 'buildOwnershipChangeEvent_ should track changed fields');
+}
+
+{
+  const source = fs.readFileSync(path.join(root, 'NotificationService.js'), 'utf8');
+  // Verify createNotificationDraftBatch_ accepts options parameter with ownerChange
+  const draftFunc = extractFunction('NotificationService.js', 'createNotificationDraftBatch_');
+  assert(draftFunc.includes('options'), 'createNotificationDraftBatch_ should accept options parameter');
+  assert(draftFunc.includes('ownerChange'), 'createNotificationDraftBatch_ should handle ownerChange option');
+  assert(draftFunc.includes('OWNER_CHANGE'), 'createNotificationDraftBatch_ should construct OWNER_CHANGE idempotency key');
+  assert(draftFunc.includes('existingByCaseType'), 'createNotificationDraftBatch_ should have fallback logic');
+}
+
+{
+  const source = fs.readFileSync(path.join(root, 'PlatformActionService.js'), 'utf8');
+  // Verify collectOwnerChangeTargets_ exists and has the right structure
+  assert(source.includes('function collectOwnerChangeTargets_(limit, excludeAssetIds)'), 'collectOwnerChangeTargets_ function missing');
+  assert(source.includes('OWNERSHIP_CHANGED'), 'collectOwnerChangeTargets_ should scan for OWNERSHIP_CHANGED events');
+  assert(source.includes('targets'), 'collectOwnerChangeTargets_ should return targets');
+  assert(source.includes('skipped'), 'collectOwnerChangeTargets_ should track skipped counts');
+  assert(source.includes('remaining'), 'collectOwnerChangeTargets_ should return remaining count');
+  assert(source.includes('total'), 'collectOwnerChangeTargets_ should return total count');
+}
+
+{
+  const source = fs.readFileSync(path.join(root, 'PlatformActionService.js'), 'utf8');
+  assert(source.includes('function previewOwnerChangeNotifications()'), 'Missing previewOwnerChangeNotifications');
+  assert(source.includes('function sendOwnerChangeNotificationBatch(input)'), 'Missing sendOwnerChangeNotificationBatch');
+  assert(source.includes('function collectOwnerChangeTargets_(limit, excludeAssetIds)'), 'Missing collectOwnerChangeTargets_');
+  assert(source.includes('OWNERSHIP_CHANGED'), 'Should reference OWNERSHIP_CHANGED events');
+  assert(source.includes('assertAdmin_()'), 'Should check admin authorization');
+  assert(source.includes('assertEnvironmentWritable_()'), 'Should check environment writability');
+  assert(source.includes('createAndSendNotificationGroups_'), 'Should call createAndSendNotificationGroups_');
+  assert(source.includes('ownerChange:'), 'Should pass ownerChange option to notification creator');
+}
+
+{
+  const source = fs.readFileSync(path.join(root, 'NotificationService.js'), 'utf8');
+  // Verify resolvePrimaryRecipient_ supports ignoreRecipientLock parameter
+  const resolveFunc = extractFunction('NotificationService.js', 'resolvePrimaryRecipient_');
+  assert(resolveFunc.includes('options'), 'resolvePrimaryRecipient_ should accept options parameter');
+  assert(resolveFunc.includes('ignoreRecipientLock'), 'resolvePrimaryRecipient_ should support ignoreRecipientLock');
+
+  // Verify createNotificationDraftBatch_ supports ownerChange option
+  const draftFunc = extractFunction('NotificationService.js', 'createNotificationDraftBatch_');
+  assert(draftFunc.includes('options'), 'createNotificationDraftBatch_ should accept options parameter');
+  assert(draftFunc.includes('ownerChange'), 'createNotificationDraftBatch_ should support ownerChange option');
+  assert(draftFunc.includes('OWNER_CHANGE'), 'createNotificationDraftBatch_ should use OWNER_CHANGE marker in key');
+}
+
+{
+  const source = fs.readFileSync(path.join(root, 'SnowflakeAdapter.js'), 'utf8');
+  // Verify import detection of ownership changes
+  const importChunk = extractFunction('SnowflakeAdapter.js', 'importSourceChunk_');
+  assert(importChunk.includes('buildOwnershipChangeEvent_'), 'importSourceChunk_ should call buildOwnershipChangeEvent_');
+  assert(importChunk.includes('existingAssets'), 'importSourceChunk_ should read existing NOTIFIED assets');
+  assert(importChunk.includes('state.appendMode'), 'importSourceChunk_ should check append-only mode');
+}
+
+{
+  const source = fs.readFileSync(path.join(root, 'docs/DESIGN.md'), 'utf8');
+  assert(source.includes('OWNERSHIP_CHANGED'), 'DESIGN.md should document OWNERSHIP_CHANGED event type');
+  assert(source.includes('owner-change'), 'DESIGN.md should document owner-change feature');
+  assert(source.includes('previewOwnerChangeNotifications'), 'DESIGN.md should document preview function');
+  assert(source.includes('sendOwnerChangeNotificationBatch'), 'DESIGN.md should document send function');
+}
+
+{
+  const source = fs.readFileSync(path.join(root, 'docs/SlackMessageCatalog.md'), 'utf8');
+  assert(source.includes('Owner-Change Resend'), 'SlackMessageCatalog should document owner-change resend');
+  assert(source.includes('STALE_ASSET_NOTICE'), 'SlackMessageCatalog should mention STALE_ASSET_NOTICE is reused');
+  assert(source.includes('OWNERSHIP_CHANGED'), 'SlackMessageCatalog should reference OWNERSHIP_CHANGED events');
+}
+
 console.log('Production rollout safeguards passed.');

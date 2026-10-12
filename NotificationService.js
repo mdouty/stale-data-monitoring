@@ -105,15 +105,15 @@ function createNotificationDrafts(input) {
   return result;
 }
 
-function createAndSendNotificationGroups_(assetIds, notificationType, skipLock) {
-  if (skipLock) return createAndSendNotificationGroupsLocked_(assetIds, notificationType);
+function createAndSendNotificationGroups_(assetIds, notificationType, skipLock, options) {
+  if (skipLock) return createAndSendNotificationGroupsLocked_(assetIds, notificationType, options);
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(30000)) throw new Error('Another consolidated Slack delivery is in progress. Try again shortly.');
-  try { return createAndSendNotificationGroupsLocked_(assetIds, notificationType); }
+  try { return createAndSendNotificationGroupsLocked_(assetIds, notificationType, options); }
   finally { lock.releaseLock(); }
 }
 
-function createAndSendNotificationGroupsLocked_(assetIds, notificationType) {
+function createAndSendNotificationGroupsLocked_(assetIds, notificationType, options) {
   const profile = assertEnvironmentWritable_();
   recoverPendingSynchronousDelivery_();
   const type = normalizeSlackMessageType_(notificationType);
@@ -122,7 +122,7 @@ function createAndSendNotificationGroupsLocked_(assetIds, notificationType) {
   ensureNotificationBatchColumns_();
   const representatives = {};
   const notificationIdsByRecipient = {};
-  const drafted = createNotificationDraftBatch_(ids, type);
+  const drafted = createNotificationDraftBatch_(ids, type, options);
   const errors = drafted.errors;
   drafted.records.forEach(function (record) {
     const status = cleanText_(record.STATUS).toUpperCase();
@@ -159,8 +159,9 @@ function createAndSendNotificationGroupsLocked_(assetIds, notificationType) {
   return deliverGroups();
 }
 
-function createNotificationDraftBatch_(assetIds, messageType) {
+function createNotificationDraftBatch_(assetIds, messageType, options) {
   const ids = Array.from(new Set((assetIds || []).map(cleanText_).filter(Boolean)));
+  const ownerChangeMap = (options && options.ownerChange) || {};
   const assets = indexObjectsBy_(readObjectsByKeys_(APP.sheets.assetsCurrent, 'ASSET_ID', ids), 'ASSET_ID');
   const cases = {};
   readObjectsByKeys_(APP.sheets.cases, 'ASSET_ID', ids).forEach(function (caseRecord) {
@@ -208,8 +209,13 @@ function createNotificationDraftBatch_(assetIds, messageType) {
       if (!routing.primaryRecipient) {
         throw new Error('No primary recipient could be resolved for ' + messageType + '. Add an owner or configure the applicable routing recipient.');
       }
-      const idempotencyKey = [caseRecord.CASE_ID, messageType, caseRecord.STATE].join('|');
-      let record = existingByKey[idempotencyKey] || existingByCaseType[cleanText_(caseRecord.CASE_ID) + '|' + messageType];
+      // For owner-change resends, include the recipient in the idempotency key to bypass the SENT check.
+      const isOwnerChange = ownerChangeMap[assetId];
+      const idempotencyKey = isOwnerChange
+        ? [caseRecord.CASE_ID, messageType, caseRecord.STATE, 'OWNER_CHANGE', routing.primaryRecipient].join('|')
+        : [caseRecord.CASE_ID, messageType, caseRecord.STATE].join('|');
+      // For owner-change, only look up by the exact key; skip the existingByCaseType fallback.
+      let record = existingByKey[idempotencyKey] || (!isOwnerChange && existingByCaseType[cleanText_(caseRecord.CASE_ID) + '|' + messageType]);
       if (!record) {
         record = {
           NOTIFICATION_ID: uuid_(),
@@ -228,14 +234,21 @@ function createNotificationDraftBatch_(assetIds, messageType) {
           ERROR: ''
         };
         existingByKey[idempotencyKey] = record;
-        existingByCaseType[cleanText_(caseRecord.CASE_ID) + '|' + messageType] = record;
+        if (!isOwnerChange) existingByCaseType[cleanText_(caseRecord.CASE_ID) + '|' + messageType] = record;
         additions.push(record);
-        events.push(notificationEventRow_(record, 'NOTIFICATION_DRAFTED', caseRecord.STATE, caseRecord.STATE, '', {
+        const eventDetails = {
           notificationId: record.NOTIFICATION_ID,
           messageType: messageType,
           primaryRecipient: routing.primaryRecipient,
           primaryRecipientSource: routing.primaryRecipientSource
-        }));
+        };
+        if (isOwnerChange) {
+          eventDetails.reason = 'OWNERSHIP_CHANGE';
+          eventDetails.sweepId = ownerChangeMap[assetId].sweepId;
+          eventDetails.previousRecipient = ownerChangeMap[assetId].previousRecipient;
+          eventDetails.newRecipient = ownerChangeMap[assetId].recipient;
+        }
+        events.push(notificationEventRow_(record, 'NOTIFICATION_DRAFTED', caseRecord.STATE, caseRecord.STATE, '', eventDetails));
       } else if (['DRAFT', 'FAILED'].indexOf(cleanText_(record.STATUS).toUpperCase()) !== -1) {
         const needsRefresh = cleanText_(record.STATUS).toUpperCase() === 'FAILED' ||
           cleanText_(record.TYPE) !== messageType ||
@@ -253,12 +266,19 @@ function createNotificationDraftBatch_(assetIds, messageType) {
           record.MESSAGE_PREVIEW = buildNotificationPreview_(buildSlackMessage_(detail, messageType));
           record.ERROR = '';
           updates.push(record);
-          events.push(notificationEventRow_(record, 'NOTIFICATION_DRAFT_REFRESHED', caseRecord.STATE, caseRecord.STATE, '', {
+          const eventDetails = {
             notificationId: record.NOTIFICATION_ID,
             messageType: messageType,
             primaryRecipient: routing.primaryRecipient,
             primaryRecipientSource: routing.primaryRecipientSource
-          }));
+          };
+          if (isOwnerChange) {
+            eventDetails.reason = 'OWNERSHIP_CHANGE';
+            eventDetails.sweepId = ownerChangeMap[assetId].sweepId;
+            eventDetails.previousRecipient = ownerChangeMap[assetId].previousRecipient;
+            eventDetails.newRecipient = ownerChangeMap[assetId].recipient;
+          }
+          events.push(notificationEventRow_(record, 'NOTIFICATION_DRAFT_REFRESHED', caseRecord.STATE, caseRecord.STATE, '', eventDetails));
         }
       }
       records.push(record);
@@ -588,11 +608,11 @@ function validateNotificationState_(messageType, lifecycleState) {
   }
 }
 
-function resolvePrimaryRecipient_(detail, messageType) {
+function resolvePrimaryRecipient_(detail, messageType, options) {
   const asset = detail.asset || {};
   const config = getConfig_();
   const profile = getEnvironmentProfile_();
-  if (profile.key === 'DEV' && profile.recipientLock) {
+  if (profile.key === 'DEV' && profile.recipientLock && !(options && options.ignoreRecipientLock)) {
     return {
       primaryRecipient: profile.recipientLock,
       primaryRecipientSource: 'DEV_PRIMARY_RECIPIENT_LOCK',

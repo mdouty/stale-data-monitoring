@@ -159,8 +159,18 @@ erDiagram
 
 - **`Assets_Current` / `Assets_Staging` / `Assets_Previous`** — the asset table (57 columns, `ASSET_HEADERS`, `Config.js:76-93`). Import writes to `Assets_Staging`, then an atomic-ish rename promotes staging → current (old current → previous).
 - **`Lifecycle_Cases`** — one governance case per asset (`CASE_HEADERS`, `Config.js:95-102`): current `STATE`, deadlines, exception linkage.
-- **`Lifecycle_Events`** — append-only **audit log** of every transition, comment, notification, and partner action.
-- **`Notifications`** — Slack draft/sent rows, keyed `IDEMPOTENCY_KEY = CASE_ID|TYPE|STATE`.
+- **`Lifecycle_Events`** — append-only **audit log** of every transition, comment, notification, and partner action. Event types include:
+  - `NOTIFIED` — asset transitioned to NOTIFIED; `DETAILS_JSON` includes recipient info.
+  - `CONTESTED` — owner contested; includes exception ID.
+  - `ACCEPTED` — owner accepted deprecation.
+  - `EXEMPT` — exception approved.
+  - `SELF_PURGE_PENDING` — owner requested purge.
+  - `QUARANTINED` — asset moved to quarantine.
+  - `PURGED` — asset purged by platform team.
+  - `RESTORED` — asset restored.
+  - `DISMISSED` — admin dismissed case.
+  - `OWNERSHIP_CHANGED` — asset ownership (Technical Steward or Schema Owner) changed since last import; only logged for NOTIFIED cases where the resolved primary recipient differs. `DETAILS_JSON` includes `{field, before, after, previousRecipient, newRecipient, previousSource, newSource, changes:[...]}`.
+- **`Notifications`** — Slack draft/sent rows, keyed `IDEMPOTENCY_KEY = CASE_ID|TYPE|STATE` (or `CASE_ID|TYPE|STATE|OWNER_CHANGE|<recipient>` for owner-change resends).
 - **`Platform_Actions`** — quarantine/purge/restore handoff queue (non-dispatching).
 - **`Evaluation_Snapshots`** — per-run evaluation history.
 - **`Job_Runs`** — import & campaign job records with counters.
@@ -197,6 +207,7 @@ stateDiagram-v2
     NOTIFIED --> EXEMPT: approved exception
     NOTIFIED --> SELF_PURGE_PENDING: owner self-purge
     NOTIFIED --> DISMISSED: admin dismiss
+    NOTIFIED --> NOTIFIED: admin resends to new owner
     CONTESTED --> ACCEPTED: contest resolved
     CONTESTED --> EXEMPT: exception approved
     ACCEPTED --> QUARANTINED: contest window elapsed
@@ -212,6 +223,7 @@ stateDiagram-v2
 
 - **Owner actions** (`LifecycleService.js`): `contestAssets` (:373), `requestSelfPurge` (:239), `requestAssetRestorations` (:290), `markAssetsExempt` (:431).
 - **Admin actions**: `adminChangeLifecycleStatus` (:110) constrained by `allowedAdminLifecycleTransitions_` (:99); `bulkTransitionCandidates` (:187) for CONFIRM_DEPRECATION / DISMISS. Dismissal is **admin-only** (:74).
+  - **Ownership change resend** (`PlatformActionService.js`): `previewOwnerChangeNotifications` (:~715) and `sendOwnerChangeNotificationBatch` (:~750) allow admin to resend `STALE_ASSET_NOTICE` to new Technical Steward or Schema owner if ownership changed on an already-NOTIFIED asset. This is a self-loop (NOTIFIED → NOTIFIED) that does not change lifecycle state but records an `OWNERSHIP_CHANGED` event.
 - Transitions that notify go through `transitionCaseAndNotify` (:23) → `immediateNotificationTypeForTransition_` (:44) → the Slack path. Every transition appends a `Lifecycle_Events` audit row via `logEvent_`.
 - Timers (`getClientConfig` policy, `Config.js:374-383`): stale threshold 180d, contest window 9d, quarantine 181d, purge notice 30d (all config-overridable).
 
@@ -303,6 +315,28 @@ sequenceDiagram
 - **NOT_RECEIVED** → mark `RETRY_APPROVED`, clearing the block so a retry may send.
 
 Notifications are **grouped one consolidated message per owner** (`NotificationService.js:108-136`, campaign groups `SnowflakeAdapter.js:3129`). Drafts are idempotent via `IDEMPOTENCY_KEY = CASE_ID|TYPE|STATE`. The campaign worker (`continueImportNotificationCampaign`, `SA:2953`) runs `DRAFTING → DELIVERING` under its own time budget, persisting a cursor per batch and self-healing when stalled >5 min (surfaced as the "Run next Slack checkpoint now" banner).
+
+### 9a. Owner-change notification resends
+
+When an asset's Technical Steward or Schema Owner changes and the asset is already in NOTIFIED state (a stale-asset notice was previously sent), the new owner should receive the notice. This is triggered manually by an admin via "Notify new owners" button (Index.html).
+
+**Detection (at import time):**
+- `SnowflakeAdapter.js:buildOwnershipChangeEvent_` compares the previous asset against the newly imported one.
+- Returns `null` unless:
+  - Previous asset exists.
+  - Case was NOTIFIED before and remains NOTIFIED after.
+  - Ownership field changed (using `normalizedComparisonValue_`).
+  - Resolved primary recipient differs (via `resolvePrimaryRecipient_` with `ignoreRecipientLock: true`, allowing DEV to see true owners for comparison).
+- If eligible, logs an `OWNERSHIP_CHANGED` event to `Lifecycle_Events` with details (`{field, before, after, previousRecipient, newRecipient, ...}`).
+
+**Admin sweep:**
+- `PlatformActionService.js:previewOwnerChangeNotifications` scans `Lifecycle_Events` for `OWNERSHIP_CHANGED` rows and shows a count of eligible assets.
+- `PlatformActionService.js:sendOwnerChangeNotificationBatch` collects targets, builds an informed set from existing SENT notifications + owner-change rows already sent, and calls `createAndSendNotificationGroups_` with `{ownerChange: map}` options.
+  - For owner-change assets, the idempotency key is `CASE_ID|TYPE|STATE|OWNER_CHANGE|<newRecipient>` instead of the usual `CASE_ID|TYPE|STATE`.
+  - This ensures the new recipient receives a distinct notification row, bypassing the standard dedup.
+  - The "informed set" rule prevents resending to a recipient if they already received a STALE_ASSET_NOTICE for this asset (via a SENT row) or were already informed by a prior owner-change sweep.
+
+**Message:** Reuses `STALE_ASSET_NOTICE` type; no new Slack catalog entry. The payload is identical to the original stale-asset notice.
 
 ---
 

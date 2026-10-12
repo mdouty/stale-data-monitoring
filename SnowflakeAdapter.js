@@ -2032,7 +2032,7 @@ function startSnowflakeImportInternal_(actor, reviewToken, lockHeld) {
       snapshotAt: review.sourceSnapshotAt || nowIso_(),
       counts: { state: {}, evaluation: {}, environment: {}, ownership: {}, domain: {} },
       message: 'Publishing reviewed ' + profile.label + ' Snowflake intake' +
-        (appendMode ? ' (append-only: existing assets are not compared or carried forward)' : '')
+        (appendMode ? ' (append-only: existing assets are not compared, carried forward, or owner-change detected)' : '')
     };
     setImportState_(state);
     // Best-effort watchdog. When triggers are unavailable (missing script.scriptapp grant
@@ -2188,6 +2188,15 @@ function importSourceChunk_(state, inlineExecution, deferScheduling) {
     return fqn ? 'SNOWFLAKE|' + fqn : '';
   }).filter(Boolean);
   const cases = indexObjectsBy_(readObjectsByKeys_(APP.sheets.cases, 'ASSET_ID', batchAssetIds), 'ASSET_ID');
+
+  // Read existing NOTIFIED assets for ownership change detection (normal mode only).
+  const existingAssets = state.appendMode ? {} : indexObjectsBy_(
+    readObjectsByKeys_(APP.sheets.assetsCurrent, 'ASSET_ID',
+      batchAssetIds.filter(function (id) {
+        return cases[id] && canonicalLifecycleState_(cases[id].STATE) === APP.lifecycle.notified;
+      })),
+    'ASSET_ID');
+
   const schemaOwnerLookup = loadSchemaOwnerLookup_();
   const assetRows = [];
   const snapshots = [];
@@ -2199,6 +2208,15 @@ function importSourceChunk_(state, inlineExecution, deferScheduling) {
     try {
       const result = normalizeSnowflakeRowV2_(row, headerMap, state.cursorRow + offset, state.snapshotAt, state.runId, cases, policy, schemaOwnerLookup);
       if (!result) return;
+
+      // Detect ownership changes for NOTIFIED assets (wrapped to never increment errors).
+      try {
+        const ownerEvent = buildOwnershipChangeEvent_(existingAssets[result.asset.ASSET_ID], result.asset, cases[result.asset.ASSET_ID], state.snapshotAt, state.runId);
+        if (ownerEvent) newEvents.push(ownerEvent);
+      } catch (ownerDetectError) {
+        // Ownership detection failure must not block the import.
+      }
+
       assetRows.push(result.asset);
       snapshots.push(result.snapshot);
       incrementCount_(state.counts.state, result.asset.LIFECYCLE_STATE);
@@ -2727,6 +2745,49 @@ function buildDetectedCase_(assetId, ownerStatus, detectedAt, runId) {
 
 function lifecycleEventRow_(caseId, assetId, eventType, fromState, toState, eventAt, actor, runId, details) {
   return [uuid_(), caseId || '', assetId, eventType, fromState || '', toState || '', eventAt || nowIso_(), actor || 'SYSTEM', runId || '', JSON.stringify(details || {})];
+}
+
+function buildOwnershipChangeEvent_(previousAsset, nextAsset, caseRecord, snapshotAt, runId) {
+  // Detect if the primary recipient changed between a NOTIFIED case's previous and new asset.
+  // Returns a lifecycle event row if so, null otherwise. Wrapped in try/catch by caller.
+  if (!previousAsset || !nextAsset || !caseRecord) return null;
+
+  // Case must be NOTIFIED before and after.
+  const priorState = canonicalLifecycleState_(caseRecord.STATE);
+  const nextState = canonicalLifecycleState_(nextAsset.LIFECYCLE_STATE || 'DETECTED');
+  if (priorState !== APP.lifecycle.notified || nextState !== APP.lifecycle.notified) return null;
+
+  // Check if Technical Steward or Schema Owner changed (normalized comparison).
+  const changedFields = [];
+  const prevTech = normalizedComparisonValue_(previousAsset.TECHNICAL_STEWARD || '');
+  const nextTech = normalizedComparisonValue_(nextAsset.TECHNICAL_STEWARD || '');
+  if (prevTech !== nextTech) changedFields.push({field: 'TECHNICAL_STEWARD', before: previousAsset.TECHNICAL_STEWARD, after: nextAsset.TECHNICAL_STEWARD});
+
+  const prevSchema = normalizedComparisonValue_(previousAsset.SCHEMA_OWNER || '');
+  const nextSchema = normalizedComparisonValue_(nextAsset.SCHEMA_OWNER || '');
+  if (prevSchema !== nextSchema) changedFields.push({field: 'SCHEMA_OWNER', before: previousAsset.SCHEMA_OWNER, after: nextAsset.SCHEMA_OWNER});
+
+  if (!changedFields.length) return null;
+
+  // Resolve the primary recipients (ignoring the DEV lock to see the true owner change).
+  const prevRecipient = resolvePrimaryRecipient_({asset: previousAsset}, 'STALE_ASSET_NOTICE', {ignoreRecipientLock: true});
+  const nextRecipient = resolvePrimaryRecipient_({asset: nextAsset}, 'STALE_ASSET_NOTICE', {ignoreRecipientLock: true});
+
+  // Only emit an event if the recipient actually changed and is non-empty.
+  if (prevRecipient.primaryRecipient === nextRecipient.primaryRecipient || !nextRecipient.primaryRecipient) return null;
+
+  const details = {
+    field: changedFields[0].field,
+    before: changedFields[0].before,
+    after: changedFields[0].after,
+    previousRecipient: prevRecipient.primaryRecipient,
+    newRecipient: nextRecipient.primaryRecipient,
+    previousSource: prevRecipient.primaryRecipientSource,
+    newSource: nextRecipient.primaryRecipientSource,
+    changes: changedFields
+  };
+
+  return lifecycleEventRow_(caseRecord.CASE_ID, nextAsset.ASSET_ID, 'OWNERSHIP_CHANGED', APP.lifecycle.notified, APP.lifecycle.notified, snapshotAt, 'SYSTEM', runId, details);
 }
 
 function loadCaseMap_() {

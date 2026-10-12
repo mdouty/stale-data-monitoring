@@ -704,3 +704,216 @@ function ensureLifecycleAutomationTrigger_() {
   });
   if (!exists) ScriptApp.newTrigger('runLifecycleAutomation').timeBased().everyDays(1).atHour(8).create();
 }
+
+function collectOwnerChangeTargets_(limit, excludeAssetIds) {
+  // Scan Lifecycle_Events for OWNERSHIP_CHANGED rows and determine which assets need resend.
+  // Returns targets where the new recipient is different from what was already notified.
+  const excludeMap = {};
+  (excludeAssetIds || []).forEach(function (id) { excludeMap[cleanText_(id)] = true; });
+
+  const result = {
+    targets: [],
+    total: 0,
+    remaining: 0,
+    truncated: false,
+    skipped: { notNotified: 0, alreadyInformed: 0, noRecipient: 0, assetGone: 0 }
+  };
+
+  // Scan events for OWNERSHIP_CHANGED type.
+  const eventSheet = getSheet_(APP.sheets.events);
+  const lastRow = eventSheet.getLastRow();
+  const lastColumn = eventSheet.getLastColumn();
+  if (lastRow < 2 || lastColumn < 1) return result;
+
+  const headers = eventSheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0];
+  const eventTypeCol = headers.indexOf('EVENT_TYPE');
+  const assetIdCol = headers.indexOf('ASSET_ID');
+  const caseIdCol = headers.indexOf('CASE_ID');
+  const detailsCol = headers.indexOf('DETAILS_JSON');
+
+  if (eventTypeCol === -1 || assetIdCol === -1 || caseIdCol === -1) return result;
+
+  const rowCount = lastRow - 1;
+  const eventTypes = eventTypeCol !== -1 ? eventSheet.getRange(2, eventTypeCol + 1, rowCount, 1).getDisplayValues() : [];
+  const assetIds = eventSheet.getRange(2, assetIdCol + 1, rowCount, 1).getDisplayValues();
+  const caseIds = caseIdCol !== -1 ? eventSheet.getRange(2, caseIdCol + 1, rowCount, 1).getDisplayValues() : [];
+  const detailsRows = detailsCol !== -1 ? eventSheet.getRange(2, detailsCol + 1, rowCount, 1).getDisplayValues() : [];
+
+  const uniqueAssets = {};
+  for (let i = 0; i < rowCount; i += 1) {
+    if (cleanText_(eventTypes[i][0]).toUpperCase() === 'OWNERSHIP_CHANGED') {
+      const assetId = cleanText_(assetIds[i][0]);
+      if (assetId && !uniqueAssets[assetId]) uniqueAssets[assetId] = true;
+    }
+  }
+
+  // Bulk read current assets and cases.
+  const assetIdList = Object.keys(uniqueAssets);
+  const assetsMap = indexObjectsBy_(readObjectsByKeys_(APP.sheets.assetsCurrent, 'ASSET_ID', assetIdList), 'ASSET_ID');
+  const casesMap = {};
+  readObjectsByKeys_(APP.sheets.cases, 'ASSET_ID', assetIdList).forEach(function (caseRecord) {
+    casesMap[caseRecord.ASSET_ID] = caseRecord;
+  });
+
+  // Build "informed set" from SENT notifications.
+  const informedSet = {};
+  const notificationsSheet = getSheet_(APP.sheets.notifications);
+  const notLastRow = notificationsSheet.getLastRow();
+  const notLastColumn = notificationsSheet.getLastColumn();
+  if (notLastRow >= 2 && notLastColumn >= 1) {
+    const notHeaders = notificationsSheet.getRange(1, 1, 1, notLastColumn).getDisplayValues()[0];
+    const notRecipientCol = notHeaders.indexOf('RECIPIENTS');
+    const notIdempCol = notHeaders.indexOf('IDEMPOTENCY_KEY');
+    const notStatusCol = notHeaders.indexOf('STATUS');
+    const notCaseIdCol = notHeaders.indexOf('CASE_ID');
+    const notRowCount = notLastRow - 1;
+    if (notStatusCol !== -1 && notRecipientCol !== -1) {
+      const notStatuses = notStatusCol !== -1 ? notificationsSheet.getRange(2, notStatusCol + 1, notRowCount, 1).getDisplayValues() : [];
+      const notRecipients = notRecipientCol !== -1 ? notificationsSheet.getRange(2, notRecipientCol + 1, notRowCount, 1).getDisplayValues() : [];
+      const notIdempKeys = notIdempCol !== -1 ? notificationsSheet.getRange(2, notIdempCol + 1, notRowCount, 1).getDisplayValues() : [];
+      const notCaseIds = notCaseIdCol !== -1 ? notificationsSheet.getRange(2, notCaseIdCol + 1, notRowCount, 1).getDisplayValues() : [];
+      for (let i = 0; i < notRowCount; i += 1) {
+        if (cleanText_(notStatuses[i][0]).toUpperCase() === 'SENT') {
+          const recipient = cleanText_(notRecipients[i][0]).toLowerCase();
+          const caseId = notCaseIds[i] ? cleanText_(notCaseIds[i][0]) : '';
+          const idempKey = notIdempKeys[i] ? cleanText_(notIdempKeys[i][0]) : '';
+          if (recipient && caseId) {
+            if (!informedSet[caseId]) informedSet[caseId] = {};
+            informedSet[caseId][recipient] = true;
+          }
+          // Extract owner-change suffix if present.
+          if (idempKey.indexOf('|OWNER_CHANGE|') !== -1) {
+            const parts = idempKey.split('|');
+            if (parts.length >= 5) {
+              const ownerChangeRecipient = cleanText_(parts[4]).toLowerCase();
+              if (ownerChangeRecipient && caseId) {
+                if (!informedSet[caseId]) informedSet[caseId] = {};
+                informedSet[caseId][ownerChangeRecipient] = true;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const cap = Number(limit || 0);
+  assetIdList.forEach(function (assetId) {
+    if (excludeMap[cleanText_(assetId)]) return;
+    if (cap > 0 && result.targets.length >= cap) {
+      result.remaining += 1;
+      result.truncated = true;
+      return;
+    }
+
+    const asset = assetsMap[assetId];
+    const caseRecord = casesMap[assetId];
+
+    if (!asset) {
+      result.skipped.assetGone += 1;
+      return;
+    }
+    if (!caseRecord || canonicalLifecycleState_(caseRecord.STATE) !== APP.lifecycle.notified) {
+      result.skipped.notNotified += 1;
+      return;
+    }
+
+    // Resolve the new recipient.
+    const routing = resolvePrimaryRecipient_({asset: asset}, 'STALE_ASSET_NOTICE');
+    if (!routing.primaryRecipient || routing.primaryRecipientSource === 'EDG_OPERATIONS_RECIPIENT') {
+      result.skipped.noRecipient += 1;
+      return;
+    }
+
+    // Check if this recipient is already informed.
+    const caseId = cleanText_(caseRecord.CASE_ID);
+    const newRecipient = cleanText_(routing.primaryRecipient).toLowerCase();
+    if (informedSet[caseId] && informedSet[caseId][newRecipient]) {
+      result.skipped.alreadyInformed += 1;
+      return;
+    }
+
+    result.total += 1;
+    result.targets.push({
+      assetId: assetId,
+      caseId: caseId,
+      objectFqn: asset.OBJECT_FQN,
+      newRecipient: routing.primaryRecipient,
+      newRecipientSource: routing.primaryRecipientSource
+    });
+  });
+
+  return result;
+}
+
+function previewOwnerChangeNotifications() {
+  assertAdmin_();
+  const targets = collectOwnerChangeTargets_(100, []);
+  const sample = targets.targets.slice(0, 10).map(function (target) {
+    return {
+      objectFqn: target.objectFqn,
+      newRecipient: target.newRecipient,
+      newRecipientSource: target.newRecipientSource
+    };
+  });
+  return {
+    environment: getActiveEnvironment_(),
+    total: targets.total,
+    skipped: targets.skipped,
+    sample: sample
+  };
+}
+
+function sendOwnerChangeNotificationBatch(input) {
+  assertAdmin_();
+  const profile = assertEnvironmentWritable_();
+  const sweepId = (input && input.sweepId) || uuid_();
+  const excludeAssetIds = (input && input.excludeAssetIds) || [];
+
+  const targets = collectOwnerChangeTargets_(lifecycleReminderMaxAssetsPerBatch_(), excludeAssetIds);
+
+  if (!targets.targets.length) {
+    return {
+      environment: getActiveEnvironment_(),
+      processed: 0,
+      groups: 0,
+      remaining: targets.remaining,
+      done: targets.total === 0,
+      failedAssetIds: [],
+      notificationFailureCount: 0,
+      notificationErrors: []
+    };
+  }
+
+  // Build owner-change map for the notification creator.
+  const ownerChangeMap = {};
+  targets.targets.forEach(function (target) {
+    ownerChangeMap[target.assetId] = {
+      recipient: target.newRecipient,
+      previousRecipient: target.previousRecipient || '',
+      sweepId: sweepId
+    };
+  });
+
+  const assetIds = targets.targets.map(function (t) { return t.assetId; });
+  const deliveryErrors = [];
+  let delivery = { assetCount: 0, groupCount: 0, failedAssetCount: 0, errors: [] };
+
+  try {
+    delivery = createAndSendNotificationGroups_(assetIds, 'STALE_ASSET_NOTICE', false, {ownerChange: ownerChangeMap});
+    (delivery.errors || []).forEach(function (error) { deliveryErrors.push(error); });
+  } catch (error) {
+    deliveryErrors.push({ error: String(error.message || error).substring(0, 500) });
+  }
+
+  return {
+    environment: getActiveEnvironment_(),
+    processed: delivery.assetCount || 0,
+    groups: delivery.groupCount || 0,
+    remaining: targets.remaining,
+    done: targets.remaining === 0,
+    failedAssetIds: deliveryErrors.map(function (err) { return err.assetId; }).filter(Boolean),
+    notificationFailureCount: deliveryErrors.length,
+    notificationErrors: deliveryErrors
+  };
+}
