@@ -394,6 +394,54 @@ function inspectDevUatData_() {
   });
 }
 
+/**
+ * One-time backfill: for every Assets_Current row whose SCHEMA_OWNER_DOMAIN
+ * and/or SCHEMA_OWNER_SUBDOMAIN is blank, look up DATABASE_NAME+SCHEMA_NAME
+ * against the Schema Master List and fill in whichever of the two fields are
+ * currently empty. Never overwrites a field that already has a value. This
+ * maintenance function is intentionally not exposed in the application UI —
+ * trigger it once (e.g. via the Apps Script editor) after deploying the
+ * SCHEMA_OWNER_DOMAIN/SCHEMA_OWNER_SUBDOMAIN columns.
+ */
+function backfillSchemaOwnerDomains() {
+  const actor = assertAdmin_();
+  const profile = assertEnvironmentWritable_();
+  const assets = readObjects_(APP.sheets.assetsCurrent);
+  const lookup = loadSchemaOwnerLookup_();
+  let scanned = 0;
+  let updated = 0;
+  let noMatch = 0;
+  const toUpdate = [];
+  assets.forEach(function (asset) {
+    if (!asset.ASSET_ID) return;
+    scanned += 1;
+    const domainMissing = !cleanText_(asset.SCHEMA_OWNER_DOMAIN);
+    const subDomainMissing = !cleanText_(asset.SCHEMA_OWNER_SUBDOMAIN);
+    if (!domainMissing && !subDomainMissing) return;
+    const key = normalizeDatabaseSchemaKey_(asset.DATABASE_NAME, asset.SCHEMA_NAME);
+    const owner = key && lookup.owners ? lookup.owners[key] : null;
+    if (!owner) {
+      noMatch += 1;
+      return;
+    }
+    if (domainMissing) asset.SCHEMA_OWNER_DOMAIN = owner.domain || '';
+    if (subDomainMissing) asset.SCHEMA_OWNER_SUBDOMAIN = owner.subDomain || '';
+    toUpdate.push(asset);
+    updated += 1;
+  });
+  if (toUpdate.length) updateObjectsByKey_(APP.sheets.assetsCurrent, 'ASSET_ID', toUpdate);
+  const result = {
+    environment: profile.key,
+    ranAt: nowIso_(),
+    ranBy: actor.email,
+    scanned: scanned,
+    updated: updated,
+    noMatch: noMatch
+  };
+  console.log(JSON.stringify(result));
+  return result;
+}
+
 function getAdminOperations() {
   assertAdmin_();
   const actions = readObjects_(APP.sheets.platformActions);
