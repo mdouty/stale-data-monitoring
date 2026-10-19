@@ -65,6 +65,7 @@
             <div id="environmentFilter" class="multi-select"></div>
             <div id="stewardshipFilter" class="multi-select"></div>
             <div id="domainFilter" class="multi-select"></div>
+            <button id="exportAllButton" class="button subtle" onclick="exportAllMatchingAssets_()">EXPORT ALL (FILTERED)</button>
           </div>
         </div>
         <div id="bulkActionBar" class="bulk-action-bar hidden" aria-live="polite">
@@ -86,7 +87,17 @@
             <tbody id="assetRows"><tr><td colspan="13" class="empty">Loading assets…</td></tr></tbody>
           </table>
         </div>
-        <div class="pagination"><button class="button subtle" onclick="changePage(-1)">Previous</button><span id="pageLabel">Page 1</span><button class="button subtle" onclick="changePage(1)">Next</button></div>
+        <div class="pagination">
+          <label class="page-size-control">Rows per page
+            <select id="pageSizeSelect" onchange="changePageSize(this.value)">
+              <option value="25">25</option>
+              <option value="50" selected>50</option>
+              <option value="100">100</option>
+              <option value="200">200</option>
+            </select>
+          </label>
+          <button class="button subtle" onclick="changePage(-1)">Previous</button><span id="pageLabel">Page 1</span><button class="button subtle" onclick="changePage(1)">Next</button>
+        </div>
       </section>
       </div>
 

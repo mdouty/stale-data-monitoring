@@ -1,12 +1,8 @@
-function getDashboard(request) {
-  const query = request || {};
-  const email = getCurrentUserEmail_();
-  const role = getUserRole_(email) || 'VIEWER';
-  const accessEmails = getUserAccessEmails_(email, role);
+function resolveDashboardMatches_(query, accessEmails, role) {
   const assets = readObjects_(APP.sheets.assetsCurrent).filter(function (asset) {
     return canAccessAssetWithEmails_(asset, accessEmails);
   });
-  if (!assets.length) return emptyDashboard_();
+  if (!assets.length) return null;
   const search = cleanText_(query.search).toLowerCase();
   const lifecycleFilters = dashboardFilterValues_(query.lifecycleStatuses || query.lifecycleStatus || query.state);
   const assetStatusFilters = dashboardFilterValues_(query.assetStatuses || query.assetStatus);
@@ -15,8 +11,6 @@ function getDashboard(request) {
   const stewardFilters = dashboardFilterValues_(query.stewards || query.stewardship);
   const domainFilters = dashboardFilterValues_(query.domains || query.domain);
   const typeFilters = dashboardFilterValues_(query.assetTypes || query.assetType);
-  const page = Math.max(1, Number(query.page || 1));
-  const pageSize = Math.min(200, Math.max(10, Number(query.pageSize || 50)));
   const matching = [];
   const stateCounts = {};
   const assetStatusCounts = {};
@@ -93,37 +87,74 @@ function getDashboard(request) {
     if (rightDays !== leftDays) return Number(rightDays === null ? -1 : rightDays) - Number(leftDays === null ? -1 : leftDays);
     return cleanText_(left.OBJECT_FQN).localeCompare(cleanText_(right.OBJECT_FQN));
   });
-  const jobs = readObjects_(APP.sheets.jobs);
-  const latestJob = jobs.length ? jobs[jobs.length - 1] : null;
+
+  return {
+    matching: matching,
+    metrics: {
+      staleCount: staleCount,
+      staleSizeGb: staleSizeGb,
+      needsContact: needsContact,
+      acceptedCount: acceptedCount,
+      quarantinedCount: quarantinedCount,
+      purgeWithin30Count: purgeWithin30Count,
+      purgedCount: purgedCount,
+      totalAccessibleAssets: assets.length
+    },
+    stateCounts: stateCounts,
+    assetStatusCounts: assetStatusCounts,
+    environmentCounts: environmentCounts,
+    evaluationCounts: evaluationCounts,
+    domainCounts: domainCounts,
+    domains: domains,
+    types: types,
+    stewards: stewards,
+    snapshotAt: snapshotAt
+  };
+}
+
+function getDashboard(request) {
+  const query = request || {};
+  const email = getCurrentUserEmail_();
+  const role = getUserRole_(email) || 'VIEWER';
+  const accessEmails = getUserAccessEmails_(email, role);
+  const result = resolveDashboardMatches_(query, accessEmails, role);
+  if (!result) return emptyDashboard_();
+
+  const page = Math.max(1, Number(query.page || 1));
+  const pageSize = Math.min(200, Math.max(10, Number(query.pageSize || 50)));
   const offset = (page - 1) * pageSize;
-  const pageAssets = matching.slice(offset, offset + pageSize);
+  const pageAssets = result.matching.slice(offset, offset + pageSize);
   const notificationDates = dashboardNotificationDates_(pageAssets.map(function (asset) { return asset.ASSET_ID; }));
   const profile = getEnvironmentProfile_();
+
+  const jobs = readObjects_(APP.sheets.jobs);
+  const latestJob = jobs.length ? jobs[jobs.length - 1] : null;
+
   return {
-    snapshotAt: snapshotAt,
+    snapshotAt: result.snapshotAt,
     metrics: {
-      totalAssets: assets.length,
-      sourceRows: role === 'ADMIN' && latestJob ? Number(latestJob.SOURCE_ROWS || 0) : assets.length,
-      staleAssets: staleCount,
-      staleSizeGb: Math.round(staleSizeGb * 100) / 100,
-      needsOwner: needsContact,
-      quarantineReady: acceptedCount,
-      quarantined: quarantinedCount,
-      purgeWithin30: purgeWithin30Count,
-      purged: purgedCount
+      totalAssets: result.metrics.totalAccessibleAssets,
+      sourceRows: role === 'ADMIN' && latestJob ? Number(latestJob.SOURCE_ROWS || 0) : result.metrics.totalAccessibleAssets,
+      staleAssets: result.metrics.staleCount,
+      staleSizeGb: Math.round(result.metrics.staleSizeGb * 100) / 100,
+      needsOwner: result.metrics.needsContact,
+      quarantineReady: result.metrics.acceptedCount,
+      quarantined: result.metrics.quarantinedCount,
+      purgeWithin30: result.metrics.purgeWithin30Count,
+      purged: result.metrics.purgedCount
     },
     breakdowns: {
-      state: countMapToArray_(stateCounts),
-      assetStatus: countMapToArray_(assetStatusCounts),
-      environment: countMapToArray_(environmentCounts),
-      evaluation: countMapToArray_(evaluationCounts),
-      domain: countMapToArray_(domainCounts)
+      state: countMapToArray_(result.stateCounts),
+      assetStatus: countMapToArray_(result.assetStatusCounts),
+      environment: countMapToArray_(result.environmentCounts),
+      evaluation: countMapToArray_(result.evaluationCounts),
+      domain: countMapToArray_(result.domainCounts)
     },
     filterOptions: {
-      domains: Object.keys(domains).sort(),
-      environments: Object.keys(environmentCounts).sort(),
-      assetTypes: Object.keys(types).sort(),
-      stewards: Object.keys(stewards).map(function (key) { return stewards[key]; }).sort(function (left, right) { return left.localeCompare(right); }),
+      domains: Object.keys(result.domains).sort(),
+      environments: Object.keys(result.environmentCounts).sort(),
+      assetTypes: Object.keys(result.types).sort(),
+      stewards: Object.keys(result.stewards).map(function (key) { return result.stewards[key]; }).sort(function (left, right) { return left.localeCompare(right); }),
       assetStatuses: [APP.assetStatus.stale, APP.assetStatus.active, APP.assetStatus.quarantined, APP.assetStatus.purged],
       lifecycleStatuses: dashboardLifecycleStatuses_()
     },
@@ -139,8 +170,8 @@ function getDashboard(request) {
     pagination: {
       page: page,
       pageSize: pageSize,
-      total: matching.length,
-      pages: Math.max(1, Math.ceil(matching.length / pageSize))
+      total: result.matching.length,
+      pages: Math.max(1, Math.ceil(result.matching.length / pageSize))
     }
   };
 }
@@ -179,6 +210,39 @@ function prepareAssetDetailsExport(input) {
     fileName: getActiveEnvironment_() + '_ASSET_DETAILS_' + date + '.csv',
     headers: headers,
     rows: rows
+  };
+}
+
+function exportDashboardAssetsChunk(input) {
+  const query = (input && input.query) || {};
+  const offset = Math.max(0, Number(input && input.offset || 0));
+  const CHUNK_SIZE = 500;
+  const MAX_ROWS = 5000;
+  const email = getCurrentUserEmail_();
+  const role = getUserRole_(email) || 'VIEWER';
+  const accessEmails = getUserAccessEmails_(email, role);
+  const result = resolveDashboardMatches_(query, accessEmails, role);
+  const matching = result ? result.matching : [];
+  if (matching.length > MAX_ROWS) {
+    throw new Error('This search/filter matches ' + matching.length + ' assets, which exceeds the ' + MAX_ROWS + '-row export limit. Narrow your search or filters and try again.');
+  }
+  const sheet = getSheet_(APP.sheets.assetsCurrent);
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getDisplayValues()[0];
+  const slice = matching.slice(offset, offset + CHUNK_SIZE);
+  const rows = slice.map(function (asset) {
+    asset.LIFECYCLE_STATE = canonicalLifecycleState_(asset.LIFECYCLE_STATE);
+    asset.ASSET_STATUS = deriveAssetStatus_(asset, asset.LIFECYCLE_STATE);
+    return headers.map(function (header) { return asset[header] === undefined ? '' : asset[header]; });
+  });
+  const nextOffset = offset + rows.length;
+  const date = Utilities.formatDate(new Date(), Session.getScriptTimeZone() || 'America/New_York', 'yyyyMMdd-HHmm');
+  return {
+    headers: headers,
+    rows: rows,
+    nextOffset: nextOffset,
+    total: matching.length,
+    done: nextOffset >= matching.length,
+    fileName: getActiveEnvironment_() + '_ASSET_DETAILS_ALL_' + date + '.csv'
   };
 }
 

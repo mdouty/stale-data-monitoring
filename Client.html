@@ -1,5 +1,5 @@
 <script>
-  const state = { config: null, page: 1, pages: 1, timer: null, poller: null, intakeReviewPoller: null, intakePreparation: null, intakeReviewOverlayDismissed: false, uploadProgressTimer: null, detailRequestId: 0, dashboardRequestId: 0, loadingRequestId: 0, loadingRequests: {}, manualLoading: false, publicationOverlayDismissed: false, currentAssets: [], selectedAssets: {}, pendingAssetId: '', confirmationAction: null, adminStatusFlow: null, intakeReview: null, intakeReviewStep: 0, intakeReviewCompletedStep: 0, intakeReviewRecords: [], intakeReviewVisibleRecords: [], intakeReviewSelection: {}, intakeReviewDismissed: {}, purgeReview: null, purgeReviewTimer: null, exceptionFlow: null, myTeam: null, adminTeams: [], userGuideInitialized: false, userGuideDismissed: false, currentPage: 'LANDSCAPE', currentAdminSection: 'OPERATIONS', openDashboardFilter: '', dashboardFilters: { assetStatus: ['STALE'], lifecycle: [], assetType: [], environment: [], stewardship: [], domain: [] }, pendingDashboardFilters: null, dashboardFilterOptions: {} };
+  const state = { config: null, page: 1, pageSize: 50, pages: 1, timer: null, poller: null, intakeReviewPoller: null, intakePreparation: null, intakeReviewOverlayDismissed: false, uploadProgressTimer: null, detailRequestId: 0, dashboardRequestId: 0, loadingRequestId: 0, loadingRequests: {}, manualLoading: false, publicationOverlayDismissed: false, currentAssets: [], selectedAssets: {}, pendingAssetId: '', confirmationAction: null, adminStatusFlow: null, intakeReview: null, intakeReviewStep: 0, intakeReviewCompletedStep: 0, intakeReviewRecords: [], intakeReviewVisibleRecords: [], intakeReviewSelection: {}, intakeReviewDismissed: {}, purgeReview: null, purgeReviewTimer: null, exceptionFlow: null, myTeam: null, adminTeams: [], userGuideInitialized: false, userGuideDismissed: false, currentPage: 'LANDSCAPE', currentAdminSection: 'OPERATIONS', openDashboardFilter: '', dashboardFilters: { assetStatus: ['STALE'], lifecycle: [], assetType: [], environment: [], stewardship: [], domain: [] }, pendingDashboardFilters: null, dashboardFilterOptions: {}, exportAllRunning: false };
 
   const INTAKE_REVIEW_STEPS = [
     { key: 'NEW_STALE', title: 'Newly stale', description: 'Review records entering or re-entering the stale lifecycle. Dismissals are recorded when the refresh is published.' },
@@ -189,6 +189,18 @@
     if (argument === null || argument === undefined) runner[name](); else runner[name](argument);
   }
 
+  function buildDashboardQuery_() {
+    return {
+      search: document.getElementById('search').value,
+      assetStatuses: state.dashboardFilters.assetStatus.slice(),
+      lifecycleStatuses: state.dashboardFilters.lifecycle.slice(),
+      assetTypes: state.dashboardFilters.assetType.slice(),
+      environments: state.dashboardFilters.environment.slice(),
+      stewards: state.dashboardFilters.stewardship.slice(),
+      domains: state.dashboardFilters.domain.slice()
+    };
+  }
+
   function loadDashboard(page, options) {
     const loadOptions = options || {};
     state.page = page || state.page;
@@ -199,16 +211,7 @@
       ? null
       : beginServerLoading_('Loading dashboard', 'Refreshing metrics, statuses, and matching assets…');
     const activeEnvironment = state.config.environment.key;
-    const request = {
-      page: state.page, pageSize: 50,
-      search: document.getElementById('search').value,
-      assetStatuses: state.dashboardFilters.assetStatus.slice(),
-      lifecycleStatuses: state.dashboardFilters.lifecycle.slice(),
-      assetTypes: state.dashboardFilters.assetType.slice(),
-      environments: state.dashboardFilters.environment.slice(),
-      stewards: state.dashboardFilters.stewardship.slice(),
-      domains: state.dashboardFilters.domain.slice()
-    };
+    const request = Object.assign({ page: state.page, pageSize: state.pageSize }, buildDashboardQuery_());
     let runner = google.script.run.withSuccessHandler(function (data) {
       if (loadingToken) endServerLoading_(loadingToken);
       if (requestId !== state.dashboardRequestId || state.config.environment.key !== activeEnvironment) return;
@@ -223,6 +226,53 @@
       body.innerHTML = '<tr><td colspan="13"><div class="section-load-error"><strong>' + escapeHtml(info.title) + '</strong><span>' + escapeHtml(info.message) + '</span><button class="button subtle" type="button" onclick="' + (info.isAuth ? 'refreshApplication_()' : 'loadDashboard(state.page)') + '">' + (info.isAuth ? 'Refresh & sign in' : 'Try again') + '</button></div></td></tr>';
     });
     runner.getDashboard(request);
+  }
+
+  function changePageSize(value) {
+    const next = Math.min(200, Math.max(10, Number(value) || 50));
+    if (next === state.pageSize) return;
+    state.pageSize = next;
+    loadDashboard(1);
+  }
+
+  function exportAllMatchingAssets_() {
+    if (state.exportAllRunning) return;
+    const query = buildDashboardQuery_();
+    state.exportAllRunning = true;
+    setExportAllBusy_(true);
+    const accumulated = { headers: null, rows: [], fileName: '' };
+    const loadingToken = beginServerLoading_('Preparing export', 'Collecting matching assets…', true);
+    const step = function (offset) {
+      google.script.run.withSuccessHandler(function (chunk) {
+        if (!accumulated.headers) accumulated.headers = chunk.headers;
+        accumulated.rows = accumulated.rows.concat(chunk.rows);
+        accumulated.fileName = chunk.fileName;
+        if (!chunk.done) {
+          step(chunk.nextOffset);
+          return;
+        }
+        endServerLoading_(loadingToken);
+        state.exportAllRunning = false;
+        setExportAllBusy_(false);
+        if (!accumulated.rows.length) {
+          showToast('No assets match the current search/filters.');
+          return;
+        }
+        downloadCsvFile_(accumulated);
+        showToast(formatNumber(accumulated.rows.length) + ' asset record(s) exported.');
+      }).withFailureHandler(function (error) {
+        endServerLoading_(loadingToken);
+        state.exportAllRunning = false;
+        setExportAllBusy_(false);
+        showAppError_(error, 'Unable to export all matching assets.');
+      }).exportDashboardAssetsChunk({ query: query, offset: offset });
+    };
+    step(0);
+  }
+
+  function setExportAllBusy_(busy) {
+    const button = document.getElementById('exportAllButton');
+    if (button) button.disabled = busy;
   }
 
   function showAssetTableLoading_(message) {
