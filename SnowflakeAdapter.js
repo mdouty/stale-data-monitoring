@@ -72,12 +72,14 @@ function loadSchemaOwnerLookup_() {
     const email = schemaOwnerEmails_(username);
     if (!key || !email) eligibleWithoutOwner += 1;
     if (!key || owners[key]) return;
+    const domainRaw = sourceValue_(row, headerMap, 'DOMAIN');
+    const domainSegment = domainRaw ? domainRaw.split('.')[0] : '';
     owners[key] = {
       email: email,
       name: sourceValue_(row, headerMap, 'DELEGATE_NAMES'),
       username: username,
       status: sourceValue_(row, headerMap, 'STATUS'),
-      domain: sourceValue_(row, headerMap, 'DOMAIN')
+      domain: domainSegment
     };
   });
   const result = {
