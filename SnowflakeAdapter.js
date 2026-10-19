@@ -8,7 +8,7 @@ const SNOWFLAKE_V2_REQUIRED_HEADERS = Object.freeze([
 ]);
 
 const SCHEMA_OWNER_REQUIRED_HEADERS = Object.freeze([
-  'DB_NAME', 'SCHEMA_NAME', 'DELEGATE_NAMES', 'DS_DELEGATES', 'STATUS'
+  'DB_NAME', 'SCHEMA_NAME', 'DELEGATE_NAMES', 'DS_DELEGATES', 'STATUS', 'DOMAIN'
 ]);
 const SCHEMA_OWNER_ELIGIBLE_STATUSES = Object.freeze(['CONFIRMED', 'ASSIGNED - FINAL']);
 
@@ -76,7 +76,8 @@ function loadSchemaOwnerLookup_() {
       email: email,
       name: sourceValue_(row, headerMap, 'DELEGATE_NAMES'),
       username: username,
-      status: sourceValue_(row, headerMap, 'STATUS')
+      status: sourceValue_(row, headerMap, 'STATUS'),
+      domain: sourceValue_(row, headerMap, 'DOMAIN')
     };
   });
   const result = {
@@ -1575,6 +1576,7 @@ function materialIntakeChanges_(asset, row, headerMap, schemaOwner) {
     ['Snowflake owner', asset.SNOWFLAKE_TABLE_OWNER || asset.DATABASE_OWNER, sourceValue_(row, headerMap, 'SNOWFLAKE_TABLE_OWNER')],
     ['Schema owner', asset.SCHEMA_OWNER, schemaOwner && schemaOwner.email || ''],
     ['Schema owner assignment', asset.SCHEMA_OWNER_ASSIGNMENT_STATUS, schemaOwner && schemaOwner.status || ''],
+    ['Schema owner domain', asset.SCHEMA_OWNER_DOMAIN, schemaOwner && schemaOwner.domain || ''],
     ['Database owner', asset.DATABASE_OWNER, sourceValue_(row, headerMap, 'DATABASE_OWNER')],
     ['Snowflake data status', normalizedSnowflakeDataStatus_(asset.SNOWFLAKE_DATA_STATUS), normalizedSnowflakeDataStatus_(sourceValue_(row, headerMap, 'SNOWFLAKE_DATA_STATUS'))],
     ['DPM team', asset.DPM_TEAM, sourceValue_(row, headerMap, 'SF_DPM_TEAM')],
@@ -1701,7 +1703,7 @@ function buildSnowflakeIntakeReviewExport_(headers, rows, review, dismissedAsset
     'CURRENT_LIFECYCLE_STATE', 'REVIEW_STAGE', 'REVIEW_TYPE', 'REVIEW_LABEL', 'REVIEW_CHANGE',
     'DISMISSED_IN_REVIEW', 'PROPOSED_LIFECYCLE_STATE', 'RECONCILED_OWNERSHIP_STATUS',
     'RECONCILED_CONTACT_COVERAGE_STATUS', 'SCHEMA_OWNER_MATCHED', 'SCHEMA_OWNER_EMAIL',
-    'SCHEMA_OWNER_NAME', 'SCHEMA_OWNER_USERNAME', 'SCHEMA_OWNER_ASSIGNMENT_STATUS',
+    'SCHEMA_OWNER_NAME', 'SCHEMA_OWNER_USERNAME', 'SCHEMA_OWNER_ASSIGNMENT_STATUS', 'SCHEMA_OWNER_DOMAIN',
     'NOTIFICATION_MESSAGE_TYPE', 'NOTIFICATION_RECIPIENT', 'NOTIFICATION_RECIPIENT_ROLE',
     'NOTIFICATION_WILL_SEND'
   ];
@@ -1738,7 +1740,8 @@ function buildSnowflakeIntakeReviewExport_(headers, rows, review, dismissedAsset
       email: asset.SCHEMA_OWNER,
       name: asset.SCHEMA_OWNER_NAME,
       username: asset.SCHEMA_OWNER_USERNAME,
-      status: asset.SCHEMA_OWNER_ASSIGNMENT_STATUS
+      status: asset.SCHEMA_OWNER_ASSIGNMENT_STATUS,
+      domain: asset.SCHEMA_OWNER_DOMAIN
     } : null;
     const activity = {
       isStale: deriveAssetStatus_(asset, currentState) === APP.assetStatus.stale,
@@ -1820,6 +1823,7 @@ function intakeReviewExportDetails_(item, assetId, activity, currentState, isDis
     intakeReviewExportProposedState_(item, currentState, isDismissed), ownershipStatus, contactCoverage,
     schemaOwner && schemaOwner.email ? 'TRUE' : 'FALSE', schemaOwner && schemaOwner.email || '',
     schemaOwner && schemaOwner.name || '', schemaOwner && schemaOwner.username || '', schemaOwner && schemaOwner.status || '',
+    schemaOwner && schemaOwner.domain || '',
     messageType, recipient, item.primaryRecipientRole || '', willSend ? 'TRUE' : 'FALSE'
   ];
 }
@@ -2475,6 +2479,7 @@ function normalizeSnowflakeRowV2_(row, headerMap, sourceRow, snapshotAt, runId, 
     SCHEMA_OWNER_NAME: schemaOwner && schemaOwner.name || '',
     SCHEMA_OWNER_USERNAME: schemaOwner && schemaOwner.username || '',
     SCHEMA_OWNER_ASSIGNMENT_STATUS: schemaOwner && schemaOwner.status || '',
+    SCHEMA_OWNER_DOMAIN: schemaOwner && schemaOwner.domain || '',
     RECORD_OWNER: contactEmail,
     TECHNICAL_STEWARD: technicalSteward,
     BUSINESS_STEWARD: businessSteward,
