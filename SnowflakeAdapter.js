@@ -2203,11 +2203,18 @@ function importSourceChunk_(state, inlineExecution, deferScheduling) {
   const newCases = [];
   const updatedCases = [];
   const newEvents = [];
+  const seenAssetIds = {}; // Deduplicate by ASSET_ID (FQN)
 
   rows.forEach(function (row, offset) {
     try {
       const result = normalizeSnowflakeRowV2_(row, headerMap, state.cursorRow + offset, state.snapshotAt, state.runId, cases, policy, schemaOwnerLookup);
       if (!result) return;
+
+      // Skip duplicate FQNs (keep first occurrence, discard subsequent ones)
+      if (seenAssetIds[result.asset.ASSET_ID]) {
+        return; // Skip this duplicate
+      }
+      seenAssetIds[result.asset.ASSET_ID] = true;
 
       // Detect ownership changes for NOTIFIED assets (wrapped to never increment errors).
       try {
