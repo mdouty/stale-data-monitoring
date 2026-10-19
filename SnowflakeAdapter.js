@@ -73,13 +73,14 @@ function loadSchemaOwnerLookup_() {
     if (!key || !email) eligibleWithoutOwner += 1;
     if (!key || owners[key]) return;
     const domainRaw = sourceValue_(row, headerMap, 'DOMAIN');
-    const domainSegment = domainRaw ? domainRaw.split('.')[0] : '';
+    const domainParts = domainRaw ? domainRaw.split('.') : [];
     owners[key] = {
       email: email,
       name: sourceValue_(row, headerMap, 'DELEGATE_NAMES'),
       username: username,
       status: sourceValue_(row, headerMap, 'STATUS'),
-      domain: domainSegment
+      domain: domainParts[0] || '',
+      subDomain: domainParts[1] || ''
     };
   });
   const result = {
@@ -1579,6 +1580,7 @@ function materialIntakeChanges_(asset, row, headerMap, schemaOwner) {
     ['Schema owner', asset.SCHEMA_OWNER, schemaOwner && schemaOwner.email || ''],
     ['Schema owner assignment', asset.SCHEMA_OWNER_ASSIGNMENT_STATUS, schemaOwner && schemaOwner.status || ''],
     ['Schema owner domain', asset.SCHEMA_OWNER_DOMAIN, schemaOwner && schemaOwner.domain || ''],
+    ['Schema owner sub-domain', asset.SCHEMA_OWNER_SUBDOMAIN, schemaOwner && schemaOwner.subDomain || ''],
     ['Database owner', asset.DATABASE_OWNER, sourceValue_(row, headerMap, 'DATABASE_OWNER')],
     ['Snowflake data status', normalizedSnowflakeDataStatus_(asset.SNOWFLAKE_DATA_STATUS), normalizedSnowflakeDataStatus_(sourceValue_(row, headerMap, 'SNOWFLAKE_DATA_STATUS'))],
     ['DPM team', asset.DPM_TEAM, sourceValue_(row, headerMap, 'SF_DPM_TEAM')],
@@ -1705,7 +1707,7 @@ function buildSnowflakeIntakeReviewExport_(headers, rows, review, dismissedAsset
     'CURRENT_LIFECYCLE_STATE', 'REVIEW_STAGE', 'REVIEW_TYPE', 'REVIEW_LABEL', 'REVIEW_CHANGE',
     'DISMISSED_IN_REVIEW', 'PROPOSED_LIFECYCLE_STATE', 'RECONCILED_OWNERSHIP_STATUS',
     'RECONCILED_CONTACT_COVERAGE_STATUS', 'SCHEMA_OWNER_MATCHED', 'SCHEMA_OWNER_EMAIL',
-    'SCHEMA_OWNER_NAME', 'SCHEMA_OWNER_USERNAME', 'SCHEMA_OWNER_ASSIGNMENT_STATUS', 'SCHEMA_OWNER_DOMAIN',
+    'SCHEMA_OWNER_NAME', 'SCHEMA_OWNER_USERNAME', 'SCHEMA_OWNER_ASSIGNMENT_STATUS', 'SCHEMA_OWNER_DOMAIN', 'SCHEMA_OWNER_SUBDOMAIN',
     'NOTIFICATION_MESSAGE_TYPE', 'NOTIFICATION_RECIPIENT', 'NOTIFICATION_RECIPIENT_ROLE',
     'NOTIFICATION_WILL_SEND'
   ];
@@ -1743,7 +1745,8 @@ function buildSnowflakeIntakeReviewExport_(headers, rows, review, dismissedAsset
       name: asset.SCHEMA_OWNER_NAME,
       username: asset.SCHEMA_OWNER_USERNAME,
       status: asset.SCHEMA_OWNER_ASSIGNMENT_STATUS,
-      domain: asset.SCHEMA_OWNER_DOMAIN
+      domain: asset.SCHEMA_OWNER_DOMAIN,
+      subDomain: asset.SCHEMA_OWNER_SUBDOMAIN
     } : null;
     const activity = {
       isStale: deriveAssetStatus_(asset, currentState) === APP.assetStatus.stale,
@@ -1825,7 +1828,7 @@ function intakeReviewExportDetails_(item, assetId, activity, currentState, isDis
     intakeReviewExportProposedState_(item, currentState, isDismissed), ownershipStatus, contactCoverage,
     schemaOwner && schemaOwner.email ? 'TRUE' : 'FALSE', schemaOwner && schemaOwner.email || '',
     schemaOwner && schemaOwner.name || '', schemaOwner && schemaOwner.username || '', schemaOwner && schemaOwner.status || '',
-    schemaOwner && schemaOwner.domain || '',
+    schemaOwner && schemaOwner.domain || '', schemaOwner && schemaOwner.subDomain || '',
     messageType, recipient, item.primaryRecipientRole || '', willSend ? 'TRUE' : 'FALSE'
   ];
 }
@@ -2482,6 +2485,7 @@ function normalizeSnowflakeRowV2_(row, headerMap, sourceRow, snapshotAt, runId, 
     SCHEMA_OWNER_USERNAME: schemaOwner && schemaOwner.username || '',
     SCHEMA_OWNER_ASSIGNMENT_STATUS: schemaOwner && schemaOwner.status || '',
     SCHEMA_OWNER_DOMAIN: schemaOwner && schemaOwner.domain || '',
+    SCHEMA_OWNER_SUBDOMAIN: schemaOwner && schemaOwner.subDomain || '',
     RECORD_OWNER: contactEmail,
     TECHNICAL_STEWARD: technicalSteward,
     BUSINESS_STEWARD: businessSteward,

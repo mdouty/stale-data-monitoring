@@ -285,6 +285,7 @@ function dashboardAsset_(asset, notificationDate) {
     schemaOwnerUsername: asset.SCHEMA_OWNER_USERNAME,
     schemaOwnerAssignmentStatus: asset.SCHEMA_OWNER_ASSIGNMENT_STATUS,
     schemaOwnerDomain: asset.SCHEMA_OWNER_DOMAIN,
+    schemaOwnerSubdomain: asset.SCHEMA_OWNER_SUBDOMAIN,
     databaseOwner: asset.DATABASE_OWNER,
     snowflakeDataStatus: asset.SNOWFLAKE_DATA_STATUS || APP.lifecycle.active,
     technicalSteward: asset.TECHNICAL_STEWARD,
