@@ -406,6 +406,11 @@ function inspectDevUatData_() {
 function backfillSchemaOwnerDomains() {
   const actor = assertAdmin_();
   const profile = assertEnvironmentWritable_();
+  // ensureDataModelV2_ only runs lazily (import start / lifecycle transitions),
+  // so a sheet that has not gone through either since SCHEMA_OWNER_DOMAIN and
+  // SCHEMA_OWNER_SUBDOMAIN were added to ASSET_HEADERS may still be missing
+  // those columns on its header row. Add them here so the writes below land.
+  ensureDataModelV2_();
   const assets = readObjects_(APP.sheets.assetsCurrent);
   const lookup = loadSchemaOwnerLookup_();
   let scanned = 0;
