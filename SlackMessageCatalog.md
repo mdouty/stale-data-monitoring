@@ -138,7 +138,7 @@ Message content is not constructed by Apps Script. Slack delivery remains disabl
 
 The resolver chooses the first usable value in the applicable chain:
 
-- Standard owner notices and owner escalation: `TECHNICAL_STEWARD` → `BUSINESS_STEWARD` → `SNOWFLAKE_TABLE_OWNER` → `SCHEMA_OWNER` → `DATABASE_OWNER` → configured EDG operations.
+- Standard owner notices and owner escalation: `SCHEMA_OWNER` → `TECHNICAL_STEWARD` → `BUSINESS_STEWARD` → `SNOWFLAKE_TABLE_OWNER` → `DATABASE_OWNER` → configured EDG operations.
 - Contestation and restoration confirmations: actor who performed the transition → standard owner chain.
 - Orphan notices use the same owner hierarchy so newly enriched schema owners are contacted before the EDG operations fallback.
 - Sandbox notices: configured sandbox owner → standard owner chain.

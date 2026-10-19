@@ -640,10 +640,10 @@ function resolvePrimaryRecipient_(detail, messageType, options) {
     };
   }
   const ownerCandidates = [
+    recipientCandidate_('SCHEMA_OWNER', asset.SCHEMA_OWNER),
     recipientCandidate_('TECHNICAL_STEWARD', asset.TECHNICAL_STEWARD),
     recipientCandidate_('BUSINESS_STEWARD', asset.BUSINESS_STEWARD),
     recipientCandidate_('SNOWFLAKE_TABLE_OWNER', asset.SNOWFLAKE_TABLE_OWNER),
-    recipientCandidate_('SCHEMA_OWNER', asset.SCHEMA_OWNER),
     recipientCandidate_('DATABASE_OWNER', asset.DATABASE_OWNER),
     recipientCandidate_('EDG_OPERATIONS_RECIPIENT', config.EDG_OPERATIONS_RECIPIENT)
   ];
@@ -724,13 +724,13 @@ function isSlackChannelId_(value) {
 }
 
 function expectedPrimarySource_(messageType) {
-  if (messageType === 'OWNER_ESCALATION') return 'TECHNICAL_STEWARD';
+  if (messageType === 'OWNER_ESCALATION') return 'SCHEMA_OWNER';
   if (messageType === 'CONTESTATION_RECEIVED') return 'CONTESTATION_EVENT_ACTOR';
   if (messageType === 'RESTORATION_CONFIRMED') return 'RESTORATION_EVENT_ACTOR';
-  if (messageType === 'ORPHAN_QUARANTINE_NOTICE') return 'TECHNICAL_STEWARD';
+  if (messageType === 'ORPHAN_QUARANTINE_NOTICE') return 'SCHEMA_OWNER';
   if (messageType.indexOf('SANDBOX_') === 0) return 'SANDBOX_OWNER_RECIPIENT';
   if (messageType === 'PURGE_BLOCKED' || messageType === 'LIFECYCLE_SLA_ALERT') return 'EDG_OPERATIONS_RECIPIENT';
-  return 'TECHNICAL_STEWARD';
+  return 'SCHEMA_OWNER';
 }
 
 function latestEventActorForState_(detail, state) {

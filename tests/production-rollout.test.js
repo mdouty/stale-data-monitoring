@@ -510,6 +510,117 @@ function context(values) {
 }
 
 {
+  // Test SCHEMA_OWNER priority order in recipient resolution (issue: moved to priority 1)
+  const sandbox = context({
+    APP: {
+      lifecycle: { contested: 'CONTESTED', restored: 'RESTORED' }
+    },
+    getConfig_: () => ({ EDG_OPERATIONS_RECIPIENT: 'edgops@salesforce.com' }),
+    getEnvironmentProfile_: () => ({ key: 'PRD' }),
+    cleanText_: value => String(value == null ? '' : value).trim()
+  });
+
+  // Extract all necessary functions
+  vm.runInContext(extractFunction('NotificationService.js', 'isSlackEmail_'), sandbox);
+  vm.runInContext(extractFunction('NotificationService.js', 'allowsSalesforceUserId_'), sandbox);
+  vm.runInContext(extractFunction('NotificationService.js', 'isSalesforceUserId_'), sandbox);
+  vm.runInContext(extractFunction('NotificationService.js', 'firstRecipientEmail_'), sandbox);
+  vm.runInContext(extractFunction('NotificationService.js', 'recipientCandidate_'), sandbox);
+  vm.runInContext(extractFunction('NotificationService.js', 'firstUsableRecipient_'), sandbox);
+  vm.runInContext(extractFunction('NotificationService.js', 'latestEventActorForState_'), sandbox);
+  vm.runInContext(extractFunction('NotificationService.js', 'platformOperationsRecipient_'), sandbox);
+  vm.runInContext(extractFunction('NotificationService.js', 'expectedPrimarySource_'), sandbox);
+  vm.runInContext(extractFunction('NotificationService.js', 'resolvePrimaryRecipient_'), sandbox);
+
+  const testCases = [
+    {
+      name: 'All six fields populated → SCHEMA_OWNER wins',
+      asset: {
+        SCHEMA_OWNER: 'schema@salesforce.com',
+        TECHNICAL_STEWARD: 'tech@salesforce.com',
+        BUSINESS_STEWARD: 'biz@salesforce.com',
+        SNOWFLAKE_TABLE_OWNER: 'table@salesforce.com',
+        DATABASE_OWNER: 'db@salesforce.com'
+      },
+      expectedRecipient: 'schema@salesforce.com',
+      expectedSource: 'SCHEMA_OWNER'
+    },
+    {
+      name: 'SCHEMA_OWNER empty → TECHNICAL_STEWARD wins',
+      asset: {
+        SCHEMA_OWNER: '',
+        TECHNICAL_STEWARD: 'tech@salesforce.com',
+        BUSINESS_STEWARD: 'biz@salesforce.com',
+        SNOWFLAKE_TABLE_OWNER: 'table@salesforce.com',
+        DATABASE_OWNER: 'db@salesforce.com'
+      },
+      expectedRecipient: 'tech@salesforce.com',
+      expectedSource: 'TECHNICAL_STEWARD'
+    },
+    {
+      name: 'SCHEMA_OWNER + TECHNICAL_STEWARD empty → BUSINESS_STEWARD wins',
+      asset: {
+        SCHEMA_OWNER: '',
+        TECHNICAL_STEWARD: '',
+        BUSINESS_STEWARD: 'biz@salesforce.com',
+        SNOWFLAKE_TABLE_OWNER: 'table@salesforce.com',
+        DATABASE_OWNER: 'db@salesforce.com'
+      },
+      expectedRecipient: 'biz@salesforce.com',
+      expectedSource: 'BUSINESS_STEWARD'
+    },
+    {
+      name: 'Only SNOWFLAKE_TABLE_OWNER + DATABASE_OWNER + EDG → SNOWFLAKE_TABLE_OWNER wins',
+      asset: {
+        SCHEMA_OWNER: '',
+        TECHNICAL_STEWARD: '',
+        BUSINESS_STEWARD: '',
+        SNOWFLAKE_TABLE_OWNER: 'table@salesforce.com',
+        DATABASE_OWNER: 'db@salesforce.com'
+      },
+      expectedRecipient: 'table@salesforce.com',
+      expectedSource: 'SNOWFLAKE_TABLE_OWNER'
+    },
+    {
+      name: 'Only DATABASE_OWNER + EDG → DATABASE_OWNER wins',
+      asset: {
+        SCHEMA_OWNER: '',
+        TECHNICAL_STEWARD: '',
+        BUSINESS_STEWARD: '',
+        SNOWFLAKE_TABLE_OWNER: '',
+        DATABASE_OWNER: 'db@salesforce.com'
+      },
+      expectedRecipient: 'db@salesforce.com',
+      expectedSource: 'DATABASE_OWNER'
+    },
+    {
+      name: 'Nothing but EDG config → EDG_OPERATIONS_RECIPIENT wins (fallback)',
+      asset: {
+        SCHEMA_OWNER: '',
+        TECHNICAL_STEWARD: '',
+        BUSINESS_STEWARD: '',
+        SNOWFLAKE_TABLE_OWNER: '',
+        DATABASE_OWNER: ''
+      },
+      expectedRecipient: 'edgops@salesforce.com',
+      expectedSource: 'EDG_OPERATIONS_RECIPIENT'
+    }
+  ];
+
+  testCases.forEach(function(testCase) {
+    const result = sandbox.resolvePrimaryRecipient_(
+      { asset: testCase.asset },
+      'STALE_ASSET_NOTICE',
+      {}
+    );
+    assert.strictEqual(result.primaryRecipient, testCase.expectedRecipient,
+      'SCHEMA_OWNER priority order: ' + testCase.name + ' recipient mismatch');
+    assert.strictEqual(result.primaryRecipientSource, testCase.expectedSource,
+      'SCHEMA_OWNER priority order: ' + testCase.name + ' source mismatch');
+  });
+}
+
+{
   const source = fs.readFileSync(path.join(root, 'PlatformActionService.js'), 'utf8');
   assert(source.includes('function previewOwnerChangeNotifications()'), 'Missing previewOwnerChangeNotifications');
   assert(source.includes('function sendOwnerChangeNotificationBatch(input)'), 'Missing sendOwnerChangeNotificationBatch');
