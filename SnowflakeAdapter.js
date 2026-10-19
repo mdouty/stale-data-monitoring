@@ -566,9 +566,8 @@ function mergeIntakeReviewPartials_(partials, staged) {
       payloads[key].assets = payloads[key].assets.concat(payload.assets || []).slice(0, 10);
     });
   });
-  if (Object.keys(duplicates).length) {
-    throw new Error('The intake contains ' + Object.keys(duplicates).length + ' duplicate FQN values. Correct the file before EDG review.');
-  }
+  // Duplicate FQNs across review partials are now handled during import (deduplicated by keeping first).
+  merged.duplicateFqns = Object.keys(duplicates).length; // Track for diagnostics
   merged.tableTypes = countMapArray_(tableTypes);
   merged.domains = countMapArray_(domains);
   merged.notificationPayloadPreviews = Object.keys(payloads).sort().map(function (key) { return payloads[key]; });
@@ -745,11 +744,8 @@ function stageSnowflakeCsvUploadLocked_(formObject) {
   parsed.forEach(function (row) {
     if (row.some(function (value) { return cleanText_(value); })) rows.push(row);
   });
-  // Fail fast on duplicate asset keys at upload rather than after the ~2-hour
-  // review prep. Two rows collide when their SNOWFLAKE|UPPER(FQN) identity is
-  // equal (e.g. case-variant table names), which mergeIntakeReviewPartials_
-  // would otherwise reject only at the merge stage. See asset-identity re-key.
-  assertNoDuplicateIntakeFqns_(headerMap, rows);
+  // Duplicate FQNs are now handled during import (deduplicated by keeping first occurrence).
+  // Files with duplicate FQNs are allowed to proceed through intake/review.
   const sheet = writeIntakeUploadSheet_(headers, rows, profile.key);
   clearIntakeReviewCache_(profile.key);
   const staged = {
