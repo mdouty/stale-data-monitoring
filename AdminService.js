@@ -447,6 +447,64 @@ function backfillSchemaOwnerDomains() {
   return result;
 }
 
+/**
+ * One-time full resync: for every Assets_Current row with a DATABASE_NAME+
+ * SCHEMA_NAME match in the Schema Master List reference sheet, overwrite
+ * SCHEMA_OWNER, SCHEMA_OWNER_NAME, SCHEMA_OWNER_USERNAME,
+ * SCHEMA_OWNER_ASSIGNMENT_STATUS, SCHEMA_OWNER_DOMAIN and
+ * SCHEMA_OWNER_SUBDOMAIN with the reference sheet's current values —
+ * unlike backfillSchemaOwnerDomains above, this replaces existing values
+ * too (the reference sheet is treated as the source of truth). Rows with
+ * no match in the reference sheet are left untouched. This maintenance
+ * function is intentionally not exposed in the application UI — trigger it
+ * once (e.g. via the Apps Script editor) to resync all schema-owner fields
+ * from the latest reference sheet contents.
+ */
+function resyncSchemaOwnersFromReference() {
+  const actor = assertAdmin_();
+  const profile = assertEnvironmentWritable_();
+  // ensureDataModelV2_ only runs lazily (import start / lifecycle transitions),
+  // so a sheet that has not gone through either since SCHEMA_OWNER_DOMAIN and
+  // SCHEMA_OWNER_SUBDOMAIN were added to ASSET_HEADERS may still be missing
+  // those columns on its header row. Add them here so the writes below land.
+  ensureDataModelV2_();
+  const assets = readObjects_(APP.sheets.assetsCurrent);
+  const lookup = loadSchemaOwnerLookup_();
+  let scanned = 0;
+  let updated = 0;
+  let noMatch = 0;
+  const toUpdate = [];
+  assets.forEach(function (asset) {
+    if (!asset.ASSET_ID) return;
+    scanned += 1;
+    const key = normalizeDatabaseSchemaKey_(asset.DATABASE_NAME, asset.SCHEMA_NAME);
+    const owner = key && lookup.owners ? lookup.owners[key] : null;
+    if (!owner) {
+      noMatch += 1;
+      return;
+    }
+    asset.SCHEMA_OWNER = owner.email || '';
+    asset.SCHEMA_OWNER_NAME = owner.name || '';
+    asset.SCHEMA_OWNER_USERNAME = owner.username || '';
+    asset.SCHEMA_OWNER_ASSIGNMENT_STATUS = owner.status || '';
+    asset.SCHEMA_OWNER_DOMAIN = owner.domain || '';
+    asset.SCHEMA_OWNER_SUBDOMAIN = owner.subDomain || '';
+    toUpdate.push(asset);
+    updated += 1;
+  });
+  if (toUpdate.length) updateObjectsByKey_(APP.sheets.assetsCurrent, 'ASSET_ID', toUpdate);
+  const result = {
+    environment: profile.key,
+    ranAt: nowIso_(),
+    ranBy: actor.email,
+    scanned: scanned,
+    updated: updated,
+    noMatch: noMatch
+  };
+  console.log(JSON.stringify(result));
+  return result;
+}
+
 function getAdminOperations() {
   assertAdmin_();
   const actions = readObjects_(APP.sheets.platformActions);
