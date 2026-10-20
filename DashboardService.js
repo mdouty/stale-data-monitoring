@@ -1,8 +1,10 @@
 function resolveDashboardMatches_(query, accessEmails, role) {
+  const startedAt = Date.now();
   const assets = readObjects_(APP.sheets.assetsCurrent).filter(function (asset) {
     return canAccessAssetWithEmails_(asset, accessEmails);
   });
   if (!assets.length) return null;
+  const scanStartedAt = Date.now();
   const search = cleanText_(query.search).toLowerCase();
   const lifecycleFilters = dashboardFilterValues_(query.lifecycleStatuses || query.lifecycleStatus || query.state);
   const assetStatusFilters = dashboardFilterValues_(query.assetStatuses || query.assetStatus);
@@ -81,12 +83,24 @@ function resolveDashboardMatches_(query, accessEmails, role) {
     matching.push(asset);
   });
 
-  matching.sort(function (left, right) {
-    const leftDays = assetReadInactivityDays_(left);
-    const rightDays = assetReadInactivityDays_(right);
-    if (rightDays !== leftDays) return Number(rightDays === null ? -1 : rightDays) - Number(leftDays === null ? -1 : leftDays);
-    return cleanText_(left.OBJECT_FQN).localeCompare(cleanText_(right.OBJECT_FQN));
+  const sortStartedAt = Date.now();
+  // Parse the inactivity value and FQN once per asset instead of inside the comparator
+  // (~n log n comparisons x 2 parses each at 60k+ rows).
+  const collator = typeof Intl !== 'undefined' && Intl.Collator ? new Intl.Collator() : null;
+  const compareText = collator ? collator.compare : function (left, right) { return left.localeCompare(right); };
+  const sortable = matching.map(function (asset) {
+    const days = assetReadInactivityDays_(asset);
+    return { asset: asset, days: days === null ? -1 : Number(days), fqn: cleanText_(asset.OBJECT_FQN) };
   });
+  sortable.sort(function (left, right) {
+    if (right.days !== left.days) return right.days - left.days;
+    return compareText(left.fqn, right.fqn);
+  });
+  for (let index = 0; index < sortable.length; index += 1) matching[index] = sortable[index].asset;
+  console.log('dashboard timing ms ' + JSON.stringify({
+    read: scanStartedAt - startedAt, filter: sortStartedAt - scanStartedAt,
+    sort: Date.now() - sortStartedAt, assets: assets.length, matching: matching.length
+  }));
 
   return {
     matching: matching,
@@ -127,7 +141,7 @@ function getDashboard(request) {
   const notificationDates = dashboardNotificationDates_(pageAssets.map(function (asset) { return asset.ASSET_ID; }));
   const profile = getEnvironmentProfile_();
 
-  const jobs = readObjects_(APP.sheets.jobs);
+  const jobs = role === 'ADMIN' ? readObjects_(APP.sheets.jobs) : [];
   const latestJob = jobs.length ? jobs[jobs.length - 1] : null;
 
   return {

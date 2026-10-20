@@ -232,7 +232,7 @@
     const next = Math.min(200, Math.max(10, Number(value) || 50));
     if (next === state.pageSize) return;
     state.pageSize = next;
-    loadDashboard(1);
+    loadDashboard(1, { tableOnlyLoading: true });
   }
 
   function exportAllMatchingAssets_() {
@@ -1932,7 +1932,7 @@
 
   function closeDrawer() { state.detailRequestId += 1; document.getElementById('drawerBackdrop').classList.add('hidden'); document.getElementById('detailDrawer').classList.remove('open'); document.getElementById('detailDrawer').setAttribute('aria-hidden', 'true'); document.getElementById('detailDrawer').setAttribute('aria-busy', 'false'); }
   function showAllAssets() { state.dashboardFilters.assetStatus = []; state.dashboardFilters.lifecycle = []; state.pendingDashboardFilters = null; state.openDashboardFilter = ''; renderDashboardFilters_(state.dashboardFilterOptions); loadDashboard(1); document.querySelector('.asset-panel').scrollIntoView({ behavior: 'smooth' }); }
-  function changePage(delta) { const next = Math.min(state.pages, Math.max(1, state.page + delta)); if (next !== state.page) loadDashboard(next); }
+  function changePage(delta) { const next = Math.min(state.pages, Math.max(1, state.page + delta)); if (next !== state.page) loadDashboard(next, { tableOnlyLoading: true }); }
   function debouncedLoad() {
     clearTimeout(state.timer);
     showAssetTableLoading_('Searching assets…');
