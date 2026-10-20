@@ -172,7 +172,7 @@
     clearAppErrorBanner_();
     banner.classList.remove('hidden');
     banner.textContent = 'Switching to ' + environment + '…';
-    document.getElementById('assetRows').innerHTML = '<tr><td colspan="13" class="empty">Loading ' + escapeHtml(environment) + ' assets…</td></tr>';
+    document.getElementById('assetRows').innerHTML = '<tr><td colspan="14" class="empty">Loading ' + escapeHtml(environment) + ' assets…</td></tr>';
     runServer('setActiveEnvironment', environment, function (config) {
       applyClientConfig(config);
       showToast('Viewing ' + environment + '.');
@@ -223,7 +223,7 @@
       const body = document.getElementById('assetRows');
       const info = showAppError_(error, 'Unable to load the dashboard table.');
       body.setAttribute('aria-busy', 'false');
-      body.innerHTML = '<tr><td colspan="13"><div class="section-load-error"><strong>' + escapeHtml(info.title) + '</strong><span>' + escapeHtml(info.message) + '</span><button class="button subtle" type="button" onclick="' + (info.isAuth ? 'refreshApplication_()' : 'loadDashboard(state.page)') + '">' + (info.isAuth ? 'Refresh & sign in' : 'Try again') + '</button></div></td></tr>';
+      body.innerHTML = '<tr><td colspan="14"><div class="section-load-error"><strong>' + escapeHtml(info.title) + '</strong><span>' + escapeHtml(info.message) + '</span><button class="button subtle" type="button" onclick="' + (info.isAuth ? 'refreshApplication_()' : 'loadDashboard(state.page)') + '">' + (info.isAuth ? 'Refresh & sign in' : 'Try again') + '</button></div></td></tr>';
     });
     runner.getDashboard(request);
   }
@@ -278,7 +278,7 @@
   function showAssetTableLoading_(message) {
     const body = document.getElementById('assetRows');
     body.setAttribute('aria-busy', 'true');
-    body.innerHTML = '<tr><td colspan="13"><div class="section-loading compact"><div class="loading-spinner" aria-hidden="true"></div><span>' + escapeHtml(message || 'Loading assets…') + '</span></div></td></tr>';
+    body.innerHTML = '<tr><td colspan="14"><div class="section-loading compact"><div class="loading-spinner" aria-hidden="true"></div><span>' + escapeHtml(message || 'Loading assets…') + '</span></div></td></tr>';
     document.getElementById('selectAllAssets').disabled = true;
   }
 
@@ -484,7 +484,7 @@
     body.setAttribute('aria-busy', 'false');
     state.currentAssets = assets;
     document.getElementById('selectAllAssets').disabled = assets.length === 0;
-    if (!assets.length) { body.innerHTML = '<tr><td colspan="13" class="empty">No assets match these filters.</td></tr>'; updateBulkSelectionUi(); return; }
+    if (!assets.length) { body.innerHTML = '<tr><td colspan="14" class="empty">No assets match these filters.</td></tr>'; updateBulkSelectionUi(); return; }
     body.innerHTML = assets.map(function (asset) {
       const noRead = ['NEW_UNREAD', 'STALE_NO_READ_IN_AVAILABLE_HISTORY'].indexOf(asset.sourceActivityStatus) !== -1;
       const signalGap = /^(INVALID_|MISSING_)/.test(asset.sourceActivityStatus || '');
@@ -496,12 +496,13 @@
       const stewardship = asset.businessSteward || asset.technicalSteward || 'No Slack email';
       const techSteward = asset.technicalSteward || '—';
       const schemaOwner = asset.schemaOwnerName || asset.schemaOwner || '—';
+      const schemaOwnerDomain = [asset.schemaOwnerDomain, asset.schemaOwnerSubdomain].filter(Boolean).join(' · ') || '—';
       const domain = asset.domain + (asset.subDomain ? ' · ' + asset.subDomain : '');
       const assetType = humanizeFilterValue_(asset.assetType || 'UNKNOWN');
       const rowCount = asset.rowCount === null || asset.rowCount === undefined ? '—' : formatNumber(asset.rowCount);
       const rowCountClass = Number(asset.rowCount) === 0 && asset.rowCount !== null ? ' row-count-zero' : '';
       const rowCountTitle = rowCountClass ? 'This asset currently reports zero rows.' : rowCount + ' rows';
-      return '<tr onclick="openAsset(' + JSON.stringify(asset.assetId).replace(/"/g, '&quot;') + ')"><td class="select-column" onclick="event.stopPropagation()">' + checkbox + '</td><td class="object" title="' + escapeHtml(asset.objectFqn) + '">' + escapeHtml(asset.objectFqn) + '</td><td class="asset-type-cell">' + escapeHtml(assetType) + '</td><td class="domain-cell" title="' + escapeHtml(domain) + '">' + escapeHtml(domain) + '</td><td class="numeric-column"><span class="row-count-value' + rowCountClass + '" title="' + escapeHtml(rowCountTitle) + '">' + escapeHtml(rowCount) + '</span></td><td class="date-cell">' + escapeHtml(formatDate(asset.lastRead)) + '</td><td>' + escapeHtml(reason) + '</td><td class="date-cell">' + escapeHtml(formatDate(asset.notificationDate)) + '</td><td class="steward-cell" title="' + escapeHtml(stewardship) + '">' + escapeHtml(stewardship) + '</td><td class="steward-cell" title="' + escapeHtml(techSteward) + '">' + escapeHtml(techSteward) + '</td><td class="steward-cell" title="' + escapeHtml(schemaOwner) + '">' + escapeHtml(schemaOwner) + '</td><td>' + badge(asset.assetStatus) + '</td><td>' + mainTableLifecycleBadge_(asset.lifecycleState) + '</td></tr>';
+      return '<tr onclick="openAsset(' + JSON.stringify(asset.assetId).replace(/"/g, '&quot;') + ')"><td class="select-column" onclick="event.stopPropagation()">' + checkbox + '</td><td class="object" title="' + escapeHtml(asset.objectFqn) + '">' + escapeHtml(asset.objectFqn) + '</td><td class="asset-type-cell">' + escapeHtml(assetType) + '</td><td class="domain-cell" title="' + escapeHtml(domain) + '">' + escapeHtml(domain) + '</td><td class="numeric-column"><span class="row-count-value' + rowCountClass + '" title="' + escapeHtml(rowCountTitle) + '">' + escapeHtml(rowCount) + '</span></td><td class="date-cell">' + escapeHtml(formatDate(asset.lastRead)) + '</td><td>' + escapeHtml(reason) + '</td><td class="date-cell">' + escapeHtml(formatDate(asset.notificationDate)) + '</td><td class="steward-cell" title="' + escapeHtml(stewardship) + '">' + escapeHtml(stewardship) + '</td><td class="steward-cell" title="' + escapeHtml(techSteward) + '">' + escapeHtml(techSteward) + '</td><td class="steward-cell" title="' + escapeHtml(schemaOwner) + '">' + escapeHtml(schemaOwner) + '</td><td class="domain-cell" title="' + escapeHtml(schemaOwnerDomain) + '">' + escapeHtml(schemaOwnerDomain) + '</td><td>' + badge(asset.assetStatus) + '</td><td>' + mainTableLifecycleBadge_(asset.lifecycleState) + '</td></tr>';
     }).join('');
     updateBulkSelectionUi();
   }
