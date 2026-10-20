@@ -214,65 +214,79 @@ function createNotificationDraftBatch_(assetIds, messageType, options) {
           throw new Error('Only NOTIFIED assets can be delegated to a new owner.');
         }
         if (!isSlackEmail_(delegation.recipient)) throw new Error('The delegated owner is not a valid email address.');
-        routing = { primaryRecipient: cleanText_(delegation.recipient).toLowerCase(), primaryRecipientSource: 'DELEGATED_OWNER' };
+        const delegatedRecipient = cleanText_(delegation.recipient).toLowerCase();
+        routing = { primaryRecipient: delegatedRecipient, primaryRecipients: [delegatedRecipient], primaryRecipientSource: 'DELEGATED_OWNER' };
       } else {
         routing = resolvePrimaryRecipient_(detail, messageType);
       }
       if (!routing.primaryRecipient) {
         throw new Error('No primary recipient could be resolved for ' + messageType + '. Add an owner or configure the applicable routing recipient.');
       }
-      // Owner-change and delegated resends include the recipient (and sweep, for delegation) in the key to bypass the SENT check.
+      // A single winning source field (e.g. SCHEMA_OWNER) can carry several comma/semicolon-
+      // separated owner emails; fan those out into one notification record per recipient so
+      // every owner gets their own consolidated Slack message, while a single resolved email
+      // (the overwhelmingly common case) keeps the exact pre-existing single-record behavior.
+      const recipients = routing.primaryRecipients && routing.primaryRecipients.length
+        ? routing.primaryRecipients : [routing.primaryRecipient];
       const isOwnerChange = ownerChangeMap[assetId];
-      const isSpecialSend = Boolean(isOwnerChange || delegation);
-      let idempotencyKey = [caseRecord.CASE_ID, messageType, caseRecord.STATE].join('|');
-      if (delegation) idempotencyKey += '|DELEGATED|' + routing.primaryRecipient + '|' + cleanText_(delegation.sweepId);
-      else if (isOwnerChange) idempotencyKey += '|OWNER_CHANGE|' + routing.primaryRecipient;
-      // Special sends look up only the exact key; skip the existingByCaseType fallback.
-      let record = existingByKey[idempotencyKey] || (!isSpecialSend && existingByCaseType[cleanText_(caseRecord.CASE_ID) + '|' + messageType]);
-      if (!record) {
-        record = {
-          NOTIFICATION_ID: uuid_(),
-          IDEMPOTENCY_KEY: idempotencyKey,
-          CASE_ID: caseRecord.CASE_ID,
-          ASSET_ID: asset.ASSET_ID,
-          TYPE: messageType,
-          CHANNEL: 'SLACK_WORKFLOW_WEBHOOK',
-          RECIPIENTS: routing.primaryRecipient,
-          STATUS: 'DRAFT',
-          BATCH_ID: '',
-          BATCH_SIZE: '',
-          SENT_AT: '',
-          RESPONSE_CODE: '',
-          MESSAGE_PREVIEW: buildNotificationPreview_(buildSlackMessage_(detail, messageType)),
-          ERROR: ''
-        };
-        existingByKey[idempotencyKey] = record;
-        if (!isSpecialSend) existingByCaseType[cleanText_(caseRecord.CASE_ID) + '|' + messageType] = record;
-        additions.push(record);
-        const eventDetails = draftEventDetails_(record, messageType, routing, ownerChangeMap[assetId], delegation);
-        events.push(notificationEventRow_(record, 'NOTIFICATION_DRAFTED', caseRecord.STATE, caseRecord.STATE, '', eventDetails));
-      } else if (['DRAFT', 'FAILED'].indexOf(cleanText_(record.STATUS).toUpperCase()) !== -1) {
-        const needsRefresh = cleanText_(record.STATUS).toUpperCase() === 'FAILED' ||
-          cleanText_(record.TYPE) !== messageType ||
-          cleanText_(record.CHANNEL) !== 'SLACK_WORKFLOW_WEBHOOK' ||
-          cleanText_(record.RECIPIENTS).toLowerCase() !== cleanText_(routing.primaryRecipient).toLowerCase();
-        if (needsRefresh) {
-          record.TYPE = messageType;
-          record.CHANNEL = 'SLACK_WORKFLOW_WEBHOOK';
-          record.RECIPIENTS = routing.primaryRecipient;
-          record.STATUS = 'DRAFT';
-          record.BATCH_ID = '';
-          record.BATCH_SIZE = '';
-          record.SENT_AT = '';
-          record.RESPONSE_CODE = '';
-          record.MESSAGE_PREVIEW = buildNotificationPreview_(buildSlackMessage_(detail, messageType));
-          record.ERROR = '';
-          updates.push(record);
-          const eventDetails = draftEventDetails_(record, messageType, routing, ownerChangeMap[assetId], delegation);
-          events.push(notificationEventRow_(record, 'NOTIFICATION_DRAFT_REFRESHED', caseRecord.STATE, caseRecord.STATE, '', eventDetails));
+      const isMultiRecipient = recipients.length > 1;
+      // Owner-change, delegated, and multi-recipient fan-out resends include the recipient (and
+      // sweep, for delegation) in the key to bypass the SENT check / avoid colliding on one slot.
+      const isSpecialSend = Boolean(isOwnerChange || delegation || isMultiRecipient);
+      recipients.forEach(function (recipientEmail) {
+        const effectiveRouting = recipientEmail === routing.primaryRecipient
+          ? routing : Object.assign({}, routing, { primaryRecipient: recipientEmail });
+        let idempotencyKey = [caseRecord.CASE_ID, messageType, caseRecord.STATE].join('|');
+        if (delegation) idempotencyKey += '|DELEGATED|' + recipientEmail + '|' + cleanText_(delegation.sweepId);
+        else if (isOwnerChange) idempotencyKey += '|OWNER_CHANGE|' + recipientEmail;
+        else if (isMultiRecipient) idempotencyKey += '|RECIPIENT|' + recipientEmail;
+        // Special sends look up only the exact key; skip the existingByCaseType fallback.
+        let record = existingByKey[idempotencyKey] || (!isSpecialSend && existingByCaseType[cleanText_(caseRecord.CASE_ID) + '|' + messageType]);
+        if (!record) {
+          record = {
+            NOTIFICATION_ID: uuid_(),
+            IDEMPOTENCY_KEY: idempotencyKey,
+            CASE_ID: caseRecord.CASE_ID,
+            ASSET_ID: asset.ASSET_ID,
+            TYPE: messageType,
+            CHANNEL: 'SLACK_WORKFLOW_WEBHOOK',
+            RECIPIENTS: recipientEmail,
+            STATUS: 'DRAFT',
+            BATCH_ID: '',
+            BATCH_SIZE: '',
+            SENT_AT: '',
+            RESPONSE_CODE: '',
+            MESSAGE_PREVIEW: buildNotificationPreview_(buildSlackMessage_(detail, messageType)),
+            ERROR: ''
+          };
+          existingByKey[idempotencyKey] = record;
+          if (!isSpecialSend) existingByCaseType[cleanText_(caseRecord.CASE_ID) + '|' + messageType] = record;
+          additions.push(record);
+          const eventDetails = draftEventDetails_(record, messageType, effectiveRouting, ownerChangeMap[assetId], delegation);
+          events.push(notificationEventRow_(record, 'NOTIFICATION_DRAFTED', caseRecord.STATE, caseRecord.STATE, '', eventDetails));
+        } else if (['DRAFT', 'FAILED'].indexOf(cleanText_(record.STATUS).toUpperCase()) !== -1) {
+          const needsRefresh = cleanText_(record.STATUS).toUpperCase() === 'FAILED' ||
+            cleanText_(record.TYPE) !== messageType ||
+            cleanText_(record.CHANNEL) !== 'SLACK_WORKFLOW_WEBHOOK' ||
+            cleanText_(record.RECIPIENTS).toLowerCase() !== cleanText_(recipientEmail).toLowerCase();
+          if (needsRefresh) {
+            record.TYPE = messageType;
+            record.CHANNEL = 'SLACK_WORKFLOW_WEBHOOK';
+            record.RECIPIENTS = recipientEmail;
+            record.STATUS = 'DRAFT';
+            record.BATCH_ID = '';
+            record.BATCH_SIZE = '';
+            record.SENT_AT = '';
+            record.RESPONSE_CODE = '';
+            record.MESSAGE_PREVIEW = buildNotificationPreview_(buildSlackMessage_(detail, messageType));
+            record.ERROR = '';
+            updates.push(record);
+            const eventDetails = draftEventDetails_(record, messageType, effectiveRouting, ownerChangeMap[assetId], delegation);
+            events.push(notificationEventRow_(record, 'NOTIFICATION_DRAFT_REFRESHED', caseRecord.STATE, caseRecord.STATE, '', eventDetails));
+          }
         }
-      }
-      records.push(record);
+        records.push(record);
+      });
     } catch (error) {
       errors.push({ assetId: assetId, error: String(error.message || error).substring(0, 500) });
     }
@@ -635,6 +649,7 @@ function resolvePrimaryRecipient_(detail, messageType, options) {
   if (profile.key === 'DEV' && profile.recipientLock && !(options && options.ignoreRecipientLock)) {
     return {
       primaryRecipient: profile.recipientLock,
+      primaryRecipients: [profile.recipientLock],
       primaryRecipientSource: 'DEV_PRIMARY_RECIPIENT_LOCK',
       recipientFallbackUsed: false
     };
@@ -671,15 +686,24 @@ function resolvePrimaryRecipient_(detail, messageType, options) {
     ].concat(ownerCandidates)
   };
   const selected = firstUsableRecipient_(routeGroups[messageType] || ownerCandidates);
+  // A winning candidate (e.g. SCHEMA_OWNER) can itself contain multiple comma/semicolon-separated
+  // delegate emails; fan those out here so every downstream caller that wants multi-recipient
+  // delivery can iterate primaryRecipients, while primaryRecipient (first email) stays unchanged
+  // for every existing single-recipient code path.
+  const allEmails = selected && selected.values && selected.values.length ? selected.values : (selected ? [selected.value] : []);
   return {
     primaryRecipient: selected ? selected.value : '',
+    primaryRecipients: allEmails,
     primaryRecipientSource: selected ? selected.source : '',
     recipientFallbackUsed: Boolean(selected && selected.source !== expectedPrimarySource_(messageType))
   };
 }
 
 function recipientCandidate_(source, value) {
-  return { source: source, value: firstRecipientEmail_(value, source) };
+  // value carries the first resolved email (unchanged contract for every existing caller);
+  // values carries every distinct resolved email so a comma/semicolon-separated owner field
+  // (e.g. SCHEMA_OWNER with multiple delegates) can fan out to multiple Slack recipients.
+  return { source: source, value: firstRecipientEmail_(value, source), values: allRecipientEmails_(value, source) };
 }
 
 function firstRecipientEmail_(value, source) {
@@ -694,6 +718,27 @@ function firstRecipientEmail_(value, source) {
     }
   }
   return '';
+}
+
+function allRecipientEmails_(value, source) {
+  const groups = cleanText_(value).split(/[;,\n]+/).map(cleanText_).filter(Boolean);
+  const seen = {};
+  const emails = [];
+  groups.forEach(function (group) {
+    let resolved = '';
+    const parts = group.split(/\s+/);
+    for (let partIndex = 0; partIndex < parts.length; partIndex += 1) {
+      if (isSlackEmail_(parts[partIndex])) { resolved = cleanText_(parts[partIndex]).toLowerCase(); break; }
+    }
+    if (!resolved && allowsSalesforceUserId_(source) && isSalesforceUserId_(group)) {
+      resolved = group.toLowerCase() + '@salesforce.com';
+    }
+    if (resolved && !seen[resolved]) {
+      seen[resolved] = true;
+      emails.push(resolved);
+    }
+  });
+  return emails;
 }
 
 function allowsSalesforceUserId_(source) {

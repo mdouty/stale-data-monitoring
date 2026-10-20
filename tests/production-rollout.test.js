@@ -432,7 +432,7 @@ function context(values) {
   const batch = extractFunction('NotificationService.js', 'buildSlackBatchMessage_');
   const summary = extractFunction('NotificationService.js', 'buildSlackAssetSummary_');
   assert(drafts.includes("'NOTIFICATION_DRAFT_REFRESHED'"));
-  assert(drafts.includes("record.RECIPIENTS = routing.primaryRecipient"));
+  assert(drafts.includes("record.RECIPIENTS = recipientEmail"));
   assert(drafts.includes('existingByCaseType'));
   assert(drafts.includes("cleanText_(record.STATUS).toUpperCase() === 'SENT'"));
   assert(batch.includes('Number(totalAssetCount || 0)'));
@@ -525,6 +525,7 @@ function context(values) {
   vm.runInContext(extractFunction('NotificationService.js', 'allowsSalesforceUserId_'), sandbox);
   vm.runInContext(extractFunction('NotificationService.js', 'isSalesforceUserId_'), sandbox);
   vm.runInContext(extractFunction('NotificationService.js', 'firstRecipientEmail_'), sandbox);
+  vm.runInContext(extractFunction('NotificationService.js', 'allRecipientEmails_'), sandbox);
   vm.runInContext(extractFunction('NotificationService.js', 'recipientCandidate_'), sandbox);
   vm.runInContext(extractFunction('NotificationService.js', 'firstUsableRecipient_'), sandbox);
   vm.runInContext(extractFunction('NotificationService.js', 'latestEventActorForState_'), sandbox);
@@ -618,6 +619,96 @@ function context(values) {
     assert.strictEqual(result.primaryRecipientSource, testCase.expectedSource,
       'SCHEMA_OWNER priority order: ' + testCase.name + ' source mismatch');
   });
+
+  // Comma/semicolon-separated SCHEMA_OWNER values fan out to multiple primaryRecipients while
+  // primaryRecipient (first email) stays the single-value contract every other caller relies on.
+  const multiOwnerCases = [
+    { value: 'alice@salesforce.com,bob@salesforce.com', expected: ['alice@salesforce.com', 'bob@salesforce.com'] },
+    { value: 'alice@salesforce.com; bob@salesforce.com ; alice@salesforce.com', expected: ['alice@salesforce.com', 'bob@salesforce.com'] },
+    { value: 'alice@salesforce.com', expected: ['alice@salesforce.com'] }
+  ];
+  multiOwnerCases.forEach(function (testCase) {
+    const result = sandbox.resolvePrimaryRecipient_({ asset: { SCHEMA_OWNER: testCase.value } }, 'STALE_ASSET_NOTICE', {});
+    assert.strictEqual(result.primaryRecipient, testCase.expected[0], 'primaryRecipient must remain the first resolved email');
+    assert.deepStrictEqual(JSON.parse(JSON.stringify(result.primaryRecipients)), testCase.expected, 'primaryRecipients should list every distinct resolved email, de-duplicated');
+  });
+}
+
+{
+  // Multi-recipient fan-out: createNotificationDraftBatch_ should emit one DRAFT record per
+  // distinct recipient email resolved from a comma-separated owner field, sharing CASE_ID/ASSET_ID
+  // but with distinct NOTIFICATION_ID/RECIPIENTS/IDEMPOTENCY_KEY.
+  const asset = { ASSET_ID: 'a1', SCHEMA_OWNER: 'alice@salesforce.com,bob@salesforce.com' };
+  const caseRecord = { ASSET_ID: 'a1', CASE_ID: 'c1', STATE: 'DETECTED' };
+  const appended = [];
+  const updated = [];
+  const eventsAppended = [];
+  let uuidCounter = 0;
+  const sandbox = context({
+    APP: {
+      sheets: { assetsCurrent: 'assets', cases: 'cases', notifications: 'notifications', events: 'events' },
+      lifecycle: { detected: 'DETECTED', notified: 'NOTIFIED' }
+    },
+    cleanText_: value => String(value == null ? '' : value).trim(),
+    canonicalLifecycleState_: value => value,
+    readObjectsByKeys_: function (sheetName) {
+      if (sheetName === 'assets') return [asset];
+      if (sheetName === 'cases') return [caseRecord];
+      return [];
+    },
+    indexObjectsBy_: function (objects, keyHeader) {
+      const index = {};
+      objects.forEach(function (object) { index[object[keyHeader]] = object; });
+      return index;
+    },
+    normalizeSlackMessageType_: value => value,
+    validateNotificationState_: () => {},
+    buildExceptionUrl_: () => '',
+    resolvePrimaryRecipient_: () => ({
+      primaryRecipient: 'alice@salesforce.com',
+      primaryRecipients: ['alice@salesforce.com', 'bob@salesforce.com'],
+      primaryRecipientSource: 'SCHEMA_OWNER'
+    }),
+    isSlackEmail_: value => /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(value || '').trim()),
+    uuid_: function () { uuidCounter += 1; return 'uuid-' + uuidCounter; },
+    buildNotificationPreview_: () => 'preview',
+    buildSlackMessage_: () => ({}),
+    draftEventDetails_: function (record, messageType, routing) {
+      return { notificationId: record.NOTIFICATION_ID, messageType: messageType, primaryRecipient: routing.primaryRecipient };
+    },
+    getSheet_: function () {
+      return {
+        getLastColumn: function () { return 14; },
+        getRange: function () {
+          return {
+            getDisplayValues: function () {
+              return [['NOTIFICATION_ID', 'IDEMPOTENCY_KEY', 'CASE_ID', 'ASSET_ID', 'TYPE', 'CHANNEL',
+                'RECIPIENTS', 'STATUS', 'BATCH_ID', 'BATCH_SIZE', 'SENT_AT', 'RESPONSE_CODE', 'MESSAGE_PREVIEW', 'ERROR']];
+            }
+          };
+        }
+      };
+    },
+    appendObjectRows_: function (sheetName, headers, objects) { objects.forEach(function (object) { appended.push(object); }); },
+    updateObjectsByKey_: function (sheetName, keyHeader, objects) { objects.forEach(function (object) { updated.push(object); }); },
+    appendRawRows_: function (sheetName, rows) { rows.forEach(function (row) { eventsAppended.push(row); }); },
+    notificationEventRow_: function (record, eventType) { return [record.NOTIFICATION_ID, eventType]; }
+  });
+  vm.runInContext(extractFunction('NotificationService.js', 'createNotificationDraftBatch_'), sandbox);
+  const result = sandbox.createNotificationDraftBatch_(['a1'], 'STALE_ASSET_NOTICE');
+  assert.strictEqual(result.errors.length, 0, 'multi-recipient fan-out should not error');
+  assert.strictEqual(result.records.length, 2, 'should create one record per comma-separated SCHEMA_OWNER email');
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(result.records.map(function (record) { return record.RECIPIENTS; }))), ['alice@salesforce.com', 'bob@salesforce.com']);
+  result.records.forEach(function (record) {
+    assert.strictEqual(record.CASE_ID, 'c1');
+    assert.strictEqual(record.ASSET_ID, 'a1');
+    assert.strictEqual(record.STATUS, 'DRAFT');
+  });
+  assert.notStrictEqual(result.records[0].NOTIFICATION_ID, result.records[1].NOTIFICATION_ID, 'each recipient gets a distinct NOTIFICATION_ID');
+  const idempotencyKeys = result.records.map(function (record) { return record.IDEMPOTENCY_KEY; });
+  assert.notStrictEqual(idempotencyKeys[0], idempotencyKeys[1], 'each recipient must have a distinct idempotency key');
+  idempotencyKeys.forEach(function (key) { assert(key.indexOf('|RECIPIENT|') !== -1, 'multi-recipient key should carry a |RECIPIENT| marker'); });
+  assert.strictEqual(appended.length, 2, 'both records should be appended as new drafts');
 }
 
 {
