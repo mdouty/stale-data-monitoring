@@ -580,7 +580,8 @@ function markInitialNotificationBatchNotified_(items, batchId, actor, plan) {
     cases.push(caseRecord);
     assets.push(asset);
     events.push(notificationEventRow_(item.record, 'STATE_TRANSITION', APP.lifecycle.detected, APP.lifecycle.notified, actor, {
-      batchId: batchId, notes: 'Consolidated Slack stale-data notice sent.'
+      batchId: batchId, notes: 'Consolidated Slack stale-data notice sent.',
+      primaryRecipient: cleanText_(item.record.RECIPIENTS)
     }));
   });
   if (plan) {

@@ -1388,7 +1388,8 @@
       const canRetry = notice.STATUS === 'FAILED';
       const send = canRetry && state.config.integrations.slack.enabled && state.config.integrations.slack.configured ? '<button class="button primary" onclick="sendDraft(' + JSON.stringify(notice.NOTIFICATION_ID).replace(/"/g, '&quot;') + ',' + JSON.stringify(asset.ASSET_ID).replace(/"/g, '&quot;') + ')">Retry notification</button>' : '';
       const batch = notice.BATCH_SIZE ? ' · ' + notice.BATCH_SIZE + ' assets' : '';
-      return '<div class="integration"><span>' + escapeHtml(notice.TYPE + ' · ' + notice.STATUS + batch) + '</span>' + send + '</div>';
+      const recipientLabel = notice.RECIPIENTS ? ' · to ' + notice.RECIPIENTS : '';
+      return '<div class="integration"><span>' + escapeHtml(notice.TYPE + ' · ' + notice.STATUS + batch + recipientLabel) + '</span>' + send + '</div>';
     }).join('') : '<div class="empty">No notification records.</div>';
     const platformActions = detail.platformActions.length ? detail.platformActions.map(function (item) {
       const dispatch = (item.STATUS === 'READY' || item.STATUS === 'FAILED') && detail.permissions.canAdmin && state.config.integrations[item.PLATFORM === 'DATA360' ? 'data360Actions' : 'snowflakeActions'].enabled ? '<button class="button primary" onclick="dispatchAction(' + JSON.stringify(item.ACTION_ID).replace(/"/g, '&quot;') + ',' + JSON.stringify(asset.ASSET_ID).replace(/"/g, '&quot;') + ')">Dispatch</button>' : '';
@@ -1410,7 +1411,12 @@
     if (!raw) return '';
     try {
       const details = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      return String(details.comment || details.notes || details.reason || '').trim();
+      const text = String(details.comment || details.notes || details.reason || '').trim();
+      // Notification events record who the Slack message went to; the ACTOR column is only the
+      // person who triggered the send, so surface the recipient alongside the note.
+      const recipient = String(details.primaryRecipient || details.recipient || '').trim();
+      if (!recipient) return text;
+      return text ? text + ' Sent to ' + recipient + '.' : 'Recipient: ' + recipient;
     } catch (error) {
       return '';
     }

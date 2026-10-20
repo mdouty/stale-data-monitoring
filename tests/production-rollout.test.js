@@ -186,6 +186,7 @@ function context(values) {
     addDaysIso_: (value, days) => new Date(Date.parse(value) + days * 86400000).toISOString(),
     configNumber_: () => 9,
     canonicalLifecycleState_: value => value,
+    cleanText_: value => String(value == null ? '' : value).trim(),
     updateObjectsByKey_: (sheet, key, rows) => { if (sheet === 'cases') writes.cases = rows; else writes.assets = rows; },
     appendRawRows_: (sheet, rows) => { writes.events = rows; },
     notificationEventRow_: () => ['event']
