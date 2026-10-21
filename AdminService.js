@@ -508,7 +508,6 @@ function resyncSchemaOwnersFromReference() {
 function getAdminOperations() {
   assertAdmin_();
   const actions = readObjects_(APP.sheets.platformActions);
-  const assets = indexObjectsBy_(readObjects_(APP.sheets.assetsCurrent), 'ASSET_ID');
   const now = new Date();
   const existingPurgeCases = {};
   actions.forEach(function (action) {
@@ -516,7 +515,9 @@ function getAdminOperations() {
     const actionStatus = cleanText_(action.STATUS).toUpperCase();
     if ((actionType === 'PURGE' && actionStatus !== 'CANCELLED') || (actionType === 'RESTORE' && actionStatus !== 'CANCELLED')) existingPurgeCases[action.CASE_ID] = true;
   });
-  const eligiblePurgeAssets = readObjects_(APP.sheets.cases).filter(function (caseRecord) {
+  // Only these Cases columns are used below; reading the full wide sheet is the
+  // dominant cost of opening the Operations tab.
+  const eligiblePurgeAssets = readObjectColumns_(APP.sheets.cases, ['CASE_ID', 'ASSET_ID', 'PLATFORM', 'STATE', 'PURGE_ELIGIBLE_DATE']).filter(function (caseRecord) {
     return canonicalLifecycleState_(caseRecord.STATE) === APP.lifecycle.purgeEligible &&
       caseRecord.PURGE_ELIGIBLE_DATE && new Date(caseRecord.PURGE_ELIGIBLE_DATE) <= now &&
       !existingPurgeCases[caseRecord.CASE_ID];
@@ -531,6 +532,14 @@ function getAdminOperations() {
   readyActions.forEach(function (action) {
     incrementCount_(counts, cleanText_(action.ACTION).toUpperCase() + '_' + cleanText_(action.STATUS).toUpperCase());
   });
+  const visibleActions = readyActions.slice().reverse().slice(0, 200);
+  // Fetch only the Assets_Current rows this response actually renders instead of
+  // loading the whole (60k+ row) sheet to look up a few hundred assets.
+  const neededAssetIds = [];
+  eligiblePurgeAssets.concat(purgeHolds, visibleActions).forEach(function (record) {
+    neededAssetIds.push(record.ASSET_ID);
+  });
+  const assets = indexObjectsBy_(readObjectsByKeys_(APP.sheets.assetsCurrent, 'ASSET_ID', neededAssetIds), 'ASSET_ID');
   return {
     environment: getActiveEnvironment_(),
     integrations: getIntegrationStatus(),
@@ -560,7 +569,7 @@ function getAdminOperations() {
         heldBy: action.PARTNER_REFERENCE
       };
     }),
-    actions: readyActions.slice().reverse().slice(0, 200).map(function (action) {
+    actions: visibleActions.map(function (action) {
       const asset = assets[action.ASSET_ID] || {};
       return {
         actionId: action.ACTION_ID,

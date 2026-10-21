@@ -94,6 +94,32 @@ function readObjects_(sheetName) {
   }).map(function (row) { return rowToObject_(headers, row); });
 }
 
+// Like readObjects_ but fetches only the named columns, so wide sheets with many
+// rows do not pay for columns the caller never reads.
+function readObjectColumns_(sheetName, headers) {
+  const sheet = getSheet_(sheetName);
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+  if (lastRow < 2 || lastColumn < 1) return [];
+  const allHeaders = sheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0];
+  const wanted = (headers || []).filter(function (header) { return allHeaders.indexOf(header) !== -1; });
+  const columnValues = wanted.map(function (header) {
+    return sheet.getRange(2, allHeaders.indexOf(header) + 1, lastRow - 1, 1).getDisplayValues();
+  });
+  const objects = [];
+  for (let i = 0; i < lastRow - 1; i += 1) {
+    const value = {};
+    let hasValue = false;
+    wanted.forEach(function (header, index) {
+      const cell = columnValues[index][i][0];
+      value[header] = cell;
+      if (cell !== '') hasValue = true;
+    });
+    if (hasValue) objects.push(value);
+  }
+  return objects;
+}
+
 function sheetHeaderIndex_(sheet, header) {
   const lastColumn = sheet.getLastColumn();
   if (lastColumn < 1) return -1;
