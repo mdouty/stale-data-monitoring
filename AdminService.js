@@ -593,11 +593,12 @@ function preparePlatformExport(actionName) {
   assertEnvironmentWritable_();
   const actionType = cleanText_(actionName).toUpperCase();
   if (['QUARANTINE', 'RESTORE', 'PURGE'].indexOf(actionType) === -1) throw new Error('Only quarantine, restoration, and purge exports are supported.');
-  const assets = indexObjectsBy_(readObjects_(APP.sheets.assetsCurrent), 'ASSET_ID');
-  const cases = indexObjectsBy_(readObjects_(APP.sheets.cases), 'CASE_ID');
   const ready = readObjects_(APP.sheets.platformActions).filter(function (action) {
     return cleanText_(action.ACTION).toUpperCase() === actionType && cleanText_(action.STATUS).toUpperCase() === 'READY';
   });
+  // Only the assets and cases behind the READY batch are needed for the export rows.
+  const assets = indexObjectsBy_(readObjectsByKeys_(APP.sheets.assetsCurrent, 'ASSET_ID', ready.map(function (action) { return action.ASSET_ID; })), 'ASSET_ID');
+  const cases = indexObjectsBy_(readObjectsByKeys_(APP.sheets.cases, 'CASE_ID', ready.map(function (action) { return action.CASE_ID; })), 'CASE_ID');
   const headers = [
     'ACTION_ID', 'ACTION', 'PLATFORM', 'ASSET_ID', 'OBJECT_FQN', 'CASE_ID',
     'ASSET_STATUS', 'LIFECYCLE_STATE', 'REQUESTED_AT', 'DESIRED_SNOWFLAKE_STATUS'
@@ -628,7 +629,7 @@ function markPlatformActionsExported(input) {
   if (!actionIds.length) return getAdminOperations();
   const targets = {};
   actionIds.forEach(function (actionId) { targets[actionId] = true; });
-  const updates = readObjects_(APP.sheets.platformActions).filter(function (action) {
+  const updates = readObjectsByKeys_(APP.sheets.platformActions, 'ACTION_ID', actionIds).filter(function (action) {
     return targets[action.ACTION_ID] && cleanText_(action.STATUS).toUpperCase() === 'READY';
   }).map(function (action) {
     action.STATUS = 'EXPORTED';
