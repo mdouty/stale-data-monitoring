@@ -505,6 +505,46 @@ function resyncSchemaOwnersFromReference() {
   return result;
 }
 
+/**
+ * Read-only diagnostic: reports duplicate ASSET_ID values and duplicate
+ * OBJECT_FQN values (compared case-insensitively, so case-variant table names
+ * that collide under the UPPER(FQN) key are included). Writes nothing. Not
+ * exposed in the application UI — run it from the Apps Script editor and read
+ * the logged result.
+ */
+function reportAssetDuplicates() {
+  assertAdmin_();
+  const environment = getActiveEnvironment_();
+  const assets = readObjects_(APP.sheets.assetsCurrent);
+  const byAssetId = {};
+  const byFqn = {};
+  assets.forEach(function (asset) {
+    const assetId = cleanText_(asset.ASSET_ID);
+    const fqn = cleanText_(asset.OBJECT_FQN).toUpperCase();
+    if (assetId) (byAssetId[assetId] || (byAssetId[assetId] = [])).push(asset);
+    if (fqn) (byFqn[fqn] || (byFqn[fqn] = [])).push(asset);
+  });
+  const duplicateGroups = function (index) {
+    return Object.keys(index).filter(function (key) { return index[key].length > 1; });
+  };
+  const assetIdGroups = duplicateGroups(byAssetId);
+  const fqnGroups = duplicateGroups(byFqn);
+  const result = {
+    environment: environment,
+    scanned: assets.length,
+    duplicateAssetIdValues: assetIdGroups.length,
+    rowsWithDuplicateAssetId: assetIdGroups.reduce(function (total, key) { return total + byAssetId[key].length; }, 0),
+    duplicateFqnValues: fqnGroups.length,
+    rowsWithDuplicateFqn: fqnGroups.reduce(function (total, key) { return total + byFqn[key].length; }, 0),
+    sampleDuplicateAssetIds: assetIdGroups.slice(0, 20),
+    sampleDuplicateFqns: fqnGroups.slice(0, 20).map(function (key) {
+      return { objectFqn: key, variants: Array.from(new Set(byFqn[key].map(function (asset) { return cleanText_(asset.OBJECT_FQN); }))) };
+    })
+  };
+  console.log(JSON.stringify(result));
+  return result;
+}
+
 function getAdminOperations() {
   assertAdmin_();
   const actions = readObjects_(APP.sheets.platformActions);
