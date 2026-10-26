@@ -236,7 +236,7 @@ function getImportStatus() {
   if (!state) {
     const recoveryJobs = readObjects_(APP.sheets.jobs);
     const failedJob = recoveryJobs.length ? recoveryJobs[recoveryJobs.length - 1] : null;
-    const cellLimitFailure = failedJob && /number of cells[\s\S]*limit of 10000000 cells/i.test(cleanText_(failedJob.MESSAGE));
+    const cellLimitFailure = failedJob && /number of cells[\s\S]*limit of (10000000|20000000) cells/i.test(cleanText_(failedJob.MESSAGE));
     if (cellLimitFailure && isRecoverableFailedFinalization_(failedJob)) {
       try {
         reclaimOperationalGridCapacity_();
