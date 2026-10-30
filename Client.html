@@ -270,6 +270,40 @@
     step(0);
   }
 
+  function exportRecoveredAssets_() {
+    const button = document.getElementById('exportRecoveredButton');
+    if (button.disabled) return;
+    button.disabled = true;
+    const accumulated = { headers: null, rows: [], fileName: '' };
+    const loadingToken = beginServerLoading_('Preparing export', 'Collecting assets that were stale and are now active…', true);
+    const finish = function () {
+      endServerLoading_(loadingToken);
+      button.disabled = false;
+    };
+    const step = function (offset) {
+      google.script.run.withSuccessHandler(function (chunk) {
+        if (!accumulated.headers) accumulated.headers = chunk.headers;
+        accumulated.rows = accumulated.rows.concat(chunk.rows);
+        accumulated.fileName = chunk.fileName;
+        if (!chunk.done) {
+          step(chunk.nextOffset);
+          return;
+        }
+        finish();
+        if (!accumulated.rows.length) {
+          showToast('No active assets with a prior stale history were found.');
+          return;
+        }
+        downloadCsvFile_(accumulated);
+        showToast(formatNumber(accumulated.rows.length) + ' recovered asset(s) exported.');
+      }).withFailureHandler(function (error) {
+        finish();
+        showAppError_(error, 'Unable to export recovered assets.');
+      }).exportRecoveredAssetsChunk({ offset: offset });
+    };
+    step(0);
+  }
+
   function setExportAllBusy_(busy) {
     const button = document.getElementById('exportAllButton');
     if (button) button.disabled = busy;
@@ -2742,6 +2776,42 @@
     }).exportSnowflakeIntakeReview({
       token: review.token,
       dismissedAssetIds: Object.keys(state.intakeReviewDismissed)
+    });
+  }
+
+  function exportIntakeReviewStep() {
+    const review = state.intakeReview;
+    const step = INTAKE_REVIEW_STEPS[state.intakeReviewStep];
+    const button = document.getElementById('exportIntakeReviewStepButton');
+    if (!review || !review.token || !step || step.key === 'PUBLISH') {
+      showToast('This intake review is no longer available for export.', true);
+      return;
+    }
+    const label = document.getElementById('intakeReviewCategoryFilter').value;
+    const match = label ? state.intakeReviewRecords.filter(function (item) { return item.reviewStage === step.key && item.reviewLabel === label; })[0] : null;
+    const reviewType = match ? ({ MISSING: 'MISSING_FROM_EXTRACT' }[match.reviewType] || match.reviewType) : '';
+    button.disabled = true;
+    button.textContent = 'Preparing export…';
+    const restore = function () {
+      button.disabled = false;
+      button.textContent = 'Export all';
+    };
+    google.script.run.withSuccessHandler(function (exportData) {
+      restore();
+      if (!exportData.rows.length) {
+        showToast('No records in this category to export.');
+        return;
+      }
+      downloadCsvFile_(exportData);
+      showToast(formatNumber(exportData.rows.length) + ' record' + (exportData.rows.length === 1 ? '' : 's') + ' exported.');
+    }).withFailureHandler(function (error) {
+      restore();
+      showToast(error.message || String(error), true);
+    }).exportSnowflakeIntakeReview({
+      token: review.token,
+      dismissedAssetIds: Object.keys(state.intakeReviewDismissed),
+      reviewStage: step.key,
+      reviewType: reviewType
     });
   }
 

@@ -506,6 +506,108 @@ function resyncSchemaOwnersFromReference() {
 }
 
 /**
+ * Editor-run setup: stage uploaded intake CSVs in a separate spreadsheet so the
+ * copy does not count against the foundation workbook's cell limit. Pass an empty
+ * value to go back to staging inside the foundation workbook. Only affects new uploads.
+ */
+function setIntakeStagingSpreadsheet(spreadsheetId) {
+  assertAdmin_();
+  const id = cleanText_(spreadsheetId);
+  if (id) {
+    // Throws if the id is wrong or the script owner cannot edit the file.
+    const book = SpreadsheetApp.openById(id);
+    if (!book.getSheets().length) throw new Error('The intake staging spreadsheet has no sheets.');
+  }
+  updateConfigValue_('INTAKE_STAGING_SPREADSHEET_ID', id);
+  return { intakeStagingSpreadsheetId: id || APP.foundationSpreadsheetId };
+}
+
+/**
+ * Read-only preview for a schema-wide exception: counts the Assets_Current rows
+ * in the given database and schemas, grouped by lifecycle state. When
+ * includeObjects is true it also returns one entry per matching object. Writes nothing.
+ * Run it from the Apps Script editor before any bulk exemption.
+ */
+function previewSchemaExemption(databaseName, schemaNames, includeObjects) {
+  assertAdmin_();
+  const database = cleanText_(databaseName).toUpperCase();
+  const schemas = (schemaNames || []).map(function (schema) { return cleanText_(schema).toUpperCase(); }).filter(Boolean);
+  if (!database || !schemas.length) throw new Error('Provide a database name and at least one schema name.');
+  const byState = {};
+  const existingExceptions = {};
+  const objects = [];
+  let matched = 0;
+  readObjects_(APP.sheets.assetsCurrent).forEach(function (asset) {
+    if (cleanText_(asset.DATABASE_NAME).toUpperCase() !== database) return;
+    if (schemas.indexOf(cleanText_(asset.SCHEMA_NAME).toUpperCase()) === -1) return;
+    matched += 1;
+    incrementCount_(byState, asset.LIFECYCLE_STATE);
+    if (cleanText_(asset.EXCEPTION_ID)) incrementCount_(existingExceptions, cleanText_(asset.EXCEPTION_ID));
+    if (includeObjects) {
+      objects.push({
+        assetId: asset.ASSET_ID, objectFqn: asset.OBJECT_FQN, lifecycleState: asset.LIFECYCLE_STATE || 'UNKNOWN',
+        exceptionId: cleanText_(asset.EXCEPTION_ID)
+      });
+    }
+  });
+  const result = { database: database, schemas: schemas, matchedAssets: matched, byState: byState, existingExceptions: existingExceptions };
+  if (includeObjects) result.objects = objects;
+  return result;
+}
+
+/**
+ * One-time schema-wide exemption. Applies EXEMPT to every object in the given
+ * database and schemas regardless of lifecycle state, with an expiry date.
+ * dryRun = true only counts matches. Refuses to run while an import is active.
+ * Run from the Apps Script editor; see exemptSchemas in Untitled.gs.
+ */
+function exemptSchemaObjects(databaseName, schemaNames, exceptionId, expiresAt, dryRun) {
+  const actor = assertAdmin_();
+  const code = normalizeApprovedExceptionId_(exceptionId);
+  const expiry = cleanText_(expiresAt);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(expiry) || new Date(expiry + 'T23:59:59Z') <= new Date()) {
+    throw new Error('Provide a future expiry date as YYYY-MM-DD.');
+  }
+  const preview = previewSchemaExemption(databaseName, schemaNames, true);
+  if (!preview.objects.length) throw new Error('No assets matched those schemas.');
+  if (dryRun) return { dryRun: true, matchedAssets: preview.matchedAssets, byState: preview.byState, existingExceptions: preview.existingExceptions };
+  assertEnvironmentWritable_();
+  if (getAnyImportState_()) throw new Error('An import is running. Run the exemption after it finishes.');
+  ensureDataModelV2_();
+  const result = { processed: 0, failed: 0, details: [] };
+  preview.objects.forEach(function (object) {
+    try {
+      const cases = readObjectsByField_(APP.sheets.cases, 'ASSET_ID', object.assetId, 1);
+      if (!cases.length) throw new Error('Lifecycle case not found.');
+      const caseRecord = cases[cases.length - 1];
+      const fromState = canonicalLifecycleState_(caseRecord.STATE);
+      upsertExceptionForAsset_({
+        EXCEPTION_ID: code, ASSET_ID: object.assetId, PLATFORM: caseRecord.PLATFORM, CASE_ID: caseRecord.CASE_ID,
+        TYPE: 'BUSINESS', STATUS: 'APPROVED', OWNER: actor.email,
+        JUSTIFICATION: 'One-time schema exemption ' + code + ' for ' + preview.database + ' schemas ' + preview.schemas.join(', '),
+        REQUESTED_AT: caseRecord.CONTESTED_AT || nowIso_(), APPROVED_AT: nowIso_(), EXPIRES_AT: expiry, LAST_SYNCED_AT: nowIso_()
+      });
+      caseRecord.STATE = APP.lifecycle.exempt;
+      caseRecord.EXCEPTION_ID = code;
+      caseRecord.EXCEPTION_STATUS = 'APPROVED';
+      caseRecord.LAST_TRANSITION_AT = nowIso_();
+      caseRecord.NOTES = 'Schema exemption ' + code + ' applied; deprecation actions are suppressed until ' + expiry + '.';
+      upsertObject_(APP.sheets.cases, 'CASE_ID', caseRecord);
+      updateAssetState_(object.assetId, caseRecord.STATE, caseRecord);
+      cancelPendingPlatformActionsForAsset_(object.assetId, 'Schema exemption ' + code + ' recorded.');
+      logEvent_(caseRecord.CASE_ID, object.assetId, 'EXCEPTION_APPROVED', fromState, APP.lifecycle.exempt, '', {
+        actor: actor.email, exceptionId: code, expiresAt: expiry, bulkSchemaExemption: true
+      });
+      result.processed += 1;
+    } catch (error) {
+      result.failed += 1;
+      result.details.push({ assetId: object.assetId, objectFqn: object.objectFqn, reason: error.message || String(error) });
+    }
+  });
+  return result;
+}
+
+/**
  * Read-only diagnostic: reports duplicate ASSET_ID values and duplicate
  * OBJECT_FQN values (compared case-insensitively, so case-variant table names
  * that collide under the UPPER(FQN) key are included). Writes nothing. Not
@@ -682,4 +784,59 @@ function markPlatformActionsExported(input) {
   });
   updateObjectsByKey_(APP.sheets.platformActions, 'ACTION_ID', updates);
   return getAdminOperations();
+}
+
+// Assets that are ACTIVE now but were in the stale workflow before. The most recent event that
+// moved the asset into ACTIVE from a stale-workflow state is reported as its recovery.
+function latestRecoveryEvents_(activeAssetIds, events) {
+  const staleWorkflowStates = ['DETECTED', 'NOTIFIED', 'CONTESTED', 'ACCEPTED', 'EXEMPT', 'QUARANTINED', 'PURGE_ELIGIBLE', 'SELF_PURGE_PENDING'];
+  const latest = {};
+  events.forEach(function (event) {
+    const assetId = cleanText_(event.ASSET_ID);
+    if (!activeAssetIds[assetId]) return;
+    if (canonicalLifecycleState_(event.TO_STATE) !== APP.lifecycle.active) return;
+    const fromState = canonicalLifecycleState_(event.FROM_STATE);
+    const eventType = cleanText_(event.EVENT_TYPE).toUpperCase();
+    if (eventType !== 'STALE_ASSET_BECAME_ACTIVE' && staleWorkflowStates.indexOf(fromState) === -1) return;
+    const previous = latest[assetId];
+    if (previous && cleanText_(previous.EVENT_AT) > cleanText_(event.EVENT_AT)) return;
+    latest[assetId] = event;
+  });
+  return latest;
+}
+
+function exportRecoveredAssetsChunk(input) {
+  assertAdmin_();
+  const offset = Math.max(0, Number(input && input.offset || 0));
+  const CHUNK_SIZE = 2000;
+  const activeAssetIds = {};
+  readObjectColumns_(APP.sheets.assetsCurrent, ['ASSET_ID', 'LIFECYCLE_STATE']).forEach(function (asset) {
+    if (canonicalLifecycleState_(asset.LIFECYCLE_STATE) === APP.lifecycle.active) activeAssetIds[cleanText_(asset.ASSET_ID)] = true;
+  });
+  const events = readObjectColumns_(APP.sheets.events, ['ASSET_ID', 'EVENT_TYPE', 'FROM_STATE', 'TO_STATE', 'EVENT_AT', 'RUN_ID']);
+  const recovered = latestRecoveryEvents_(activeAssetIds, events);
+  const assetIds = Object.keys(recovered).sort();
+  const sheet = getSheet_(APP.sheets.assetsCurrent);
+  const assetHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getDisplayValues()[0];
+  const headers = assetHeaders.concat(['RECOVERED_AT', 'PREVIOUS_LIFECYCLE_STATE', 'RECOVERY_EVENT_TYPE', 'RECOVERY_RUN_ID']);
+  const slice = assetIds.slice(offset, offset + CHUNK_SIZE);
+  const assets = indexObjectsBy_(readObjectsByKeys_(APP.sheets.assetsCurrent, 'ASSET_ID', slice), 'ASSET_ID');
+  const rows = slice.filter(function (assetId) { return Boolean(assets[assetId]); }).map(function (assetId) {
+    const asset = assets[assetId];
+    const event = recovered[assetId];
+    asset.LIFECYCLE_STATE = canonicalLifecycleState_(asset.LIFECYCLE_STATE);
+    asset.ASSET_STATUS = deriveAssetStatus_(asset, asset.LIFECYCLE_STATE);
+    return assetHeaders.map(function (header) { return asset[header] === undefined ? '' : asset[header]; })
+      .concat([event.EVENT_AT, canonicalLifecycleState_(event.FROM_STATE), event.EVENT_TYPE, event.RUN_ID]);
+  });
+  const nextOffset = offset + slice.length;
+  const date = Utilities.formatDate(new Date(), Session.getScriptTimeZone() || 'America/New_York', 'yyyyMMdd-HHmm');
+  return {
+    headers: headers,
+    rows: rows,
+    nextOffset: nextOffset,
+    total: assetIds.length,
+    done: nextOffset >= assetIds.length,
+    fileName: getActiveEnvironment_() + '_RECOVERED_ACTIVE_ASSETS_' + date + '.csv'
+  };
 }

@@ -82,6 +82,39 @@ function getSheetKeyIndex_(sheet, sheetName, keyHeader) {
   return entry;
 }
 
+// Keeps cached key indexes valid across a durable write instead of forcing a full
+// key-column rescan on the next read. Appends that land directly after the indexed
+// range extend the index; any write that does not fit that shape drops the entry,
+// so the next read rebuilds it from the sheet.
+function noteSheetWrite_(sheet, sheetName, write) {
+  const prefix = resolvedSheetCacheName_(sheetName) + ' ';
+  const lastRow = sheet.getLastRow();
+  const lastColumn = sheet.getLastColumn();
+  Object.keys(SHEET_KEY_INDEX_CACHE_).forEach(function (cacheKey) {
+    if (cacheKey.indexOf(prefix) !== 0) return;
+    const entry = SHEET_KEY_INDEX_CACHE_[cacheKey];
+    const endRow = write.row + write.rows.length - 1;
+    if (entry.keyIndex < 0 || entry.lastColumn !== lastColumn) { delete SHEET_KEY_INDEX_CACHE_[cacheKey]; return; }
+    if (write.append && entry.lastRow === write.row - 1 && lastRow === endRow) {
+      write.rows.forEach(function (row, offset) {
+        const key = cleanText_(row[entry.keyIndex]);
+        if (key) (entry.rowsByKey[key] || (entry.rowsByKey[key] = [])).push(write.row + offset);
+      });
+      entry.lastRow = lastRow;
+      return;
+    }
+    if (!write.append && lastRow === entry.lastRow) {
+      // In-place update: valid only if every written row keeps its indexed key.
+      const intact = write.rows.every(function (row, offset) {
+        const key = cleanText_(row[entry.keyIndex]);
+        return key ? (entry.rowsByKey[key] || []).indexOf(write.row + offset) !== -1 : true;
+      });
+      if (intact) return;
+    }
+    delete SHEET_KEY_INDEX_CACHE_[cacheKey];
+  });
+}
+
 function readObjects_(sheetName) {
   const sheet = getSheet_(sheetName);
   const lastRow = sheet.getLastRow();

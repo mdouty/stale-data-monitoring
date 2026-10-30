@@ -124,6 +124,7 @@
               <div><h3>Data intake</h3><span>Import a reviewed Snowflake CSV and advance lifecycle operations.</span></div>
               <div class="top-actions">
                 <button class="button subtle" onclick="reviewUncertainDeliveries_()">Verify uncertain Slack deliveries</button>
+                <button id="exportRecoveredButton" class="button subtle" onclick="exportRecoveredAssets_()">Export recovered assets</button>
                 <button id="sendRemindersButton" class="button subtle hidden" onclick="openReminderSweep()">Send reminders</button>
                 <button id="sendOwnerChangeButton" class="button subtle hidden" onclick="openOwnerChangeResend()">Notify new owners</button>
                 <button id="runAutomationButton" class="button subtle hidden" onclick="runAutomationNow()">Run lifecycle automation</button>
@@ -236,7 +237,10 @@
               <h3 id="intakeReviewStepTitle">Newly stale</h3>
               <p id="intakeReviewStepDescription"></p>
             </div>
-            <span id="intakeReviewVisibleCount" class="badge gray">0 records</span>
+            <div class="review-heading-actions">
+              <span id="intakeReviewVisibleCount" class="badge gray">0 records</span>
+              <button id="exportIntakeReviewStepButton" class="button subtle" onclick="exportIntakeReviewStep()">Export all</button>
+            </div>
           </div>
           <div id="intakeReviewFilters" class="review-filters">
             <input id="intakeReviewSearch" type="search" placeholder="Search object, staleness source, or recipient" oninput="filterIntakeReview()">

@@ -672,7 +672,7 @@ function reconcileIntakeReviewChunk_(review, cursorRow, batchSize) {
   review.existingLifecycleChanges += noLonger.length;
   review.quarantinePurgeChanges += missing.filter(function (item) { return item.purgeVerification; }).length;
   review.samples.noLongerCandidates = review.samples.noLongerCandidates.concat(noLonger).slice(0, 250);
-  review.samples.missingFromExtract = review.samples.missingFromExtract.concat(missing).slice(0, 250);
+  review.samples.missingFromExtract = prioritizeMissingReviewSamples_(review.samples.missingFromExtract.concat(missing), 250);
   mergeReviewPayloadPreviews_(review, buildIntakeSlackPayloadPreviews_(missing, review.sourceSnapshotAt));
   const nextRow = startRow + count;
   return { nextRow: nextRow, done: nextRow > lastRow };
@@ -758,7 +758,7 @@ function stageSnowflakeCsvUploadLocked_(formObject) {
     preparationStatus: 'QUEUED',
     uploadRequestId: requestId,
     preparationStartedAt: nowIso_(),
-    sourceSpreadsheetId: APP.foundationSpreadsheetId,
+    sourceSpreadsheetId: intakeStagingSpreadsheetId_(),
     sourceSheetName: sheet.getName(),
     sourceRows: rows.length,
     sourceColumns: headers.length,
@@ -1436,7 +1436,7 @@ function calculateIntakeReview_(headers, rows, metadata) {
       reappearances: reappearanceItems.slice(0, reviewSampleLimit),
       unassessable: unassessableItems.slice(0, reviewSampleLimit),
       noLongerCandidates: noLonger.slice(0, reviewSampleLimit),
-      missingFromExtract: missing.slice(0, reviewSampleLimit)
+      missingFromExtract: prioritizeMissingReviewSamples_(missing, reviewSampleLimit)
     }
   };
 }
@@ -1610,8 +1610,19 @@ function normalizedComparisonValue_(value) {
   return cleanText_(value).replace(/,/g, '').toUpperCase();
 }
 
+// The staged CSV can live in a separate workbook so a full copy of the upload does not
+// count against the foundation workbook's cell limit. Empty setting = foundation workbook.
+function intakeStagingSpreadsheetId_() {
+  return cleanText_(getConfig_().INTAKE_STAGING_SPREADSHEET_ID) || APP.foundationSpreadsheetId;
+}
+
+function getIntakeStagingSpreadsheet_() {
+  const spreadsheetId = intakeStagingSpreadsheetId_();
+  return spreadsheetId === APP.foundationSpreadsheetId ? getFoundationSpreadsheet_() : SpreadsheetApp.openById(spreadsheetId);
+}
+
 function writeIntakeUploadSheet_(headers, rows, environment) {
-  const spreadsheet = getFoundationSpreadsheet_();
+  const spreadsheet = getIntakeStagingSpreadsheet_();
   const sheetName = resolveSheetName_(APP.sheets.intakeUpload, environment);
   let sheet = spreadsheet.getSheetByName(sheetName);
   if (!sheet) sheet = spreadsheet.insertSheet(sheetName);
@@ -1638,7 +1649,7 @@ function discardSnowflakeIntake(reviewToken) {
   if (getAnyImportState_()) throw new Error('The intake is already publishing and cannot be discarded.');
   const review = getPendingIntakeReview_(profile.key);
   if (!review || review.token !== cleanText_(reviewToken)) throw new Error('This intake review is no longer current.');
-  const sheet = getFoundationSpreadsheet_().getSheetByName(review.sourceSheetName);
+  const sheet = SpreadsheetApp.openById(review.sourceSpreadsheetId).getSheetByName(review.sourceSheetName);
   if (sheet) sheet.clearContents();
   deleteIntakeReviewPreparationTriggers_();
   clearIntakeReviewCache_(profile.key);
@@ -1687,11 +1698,31 @@ function exportSnowflakeIntakeReview(reviewInput) {
   const exported = buildSnowflakeIntakeReviewExport_(
     headers, rows, review, payload.dismissedAssetIds || [], currentAssets, loadCaseMap_(), loadSchemaOwnerLookup_()
   );
+  const scoped = filterIntakeReviewExportRows_(exported.headers, exported.rows, payload.reviewStage, payload.reviewType);
   return {
-    fileName: intakeReviewExportFileName_(pending.fileName),
+    fileName: intakeReviewExportFileName_(pending.fileName, scoped.suffix),
     headers: exported.headers,
-    rows: exported.rows
+    rows: scoped.rows
   };
+}
+
+// Narrows a full review export to one review step (and optionally one review type) so the
+// table's "Export all" covers the whole category, not just the loaded samples.
+function filterIntakeReviewExportRows_(headers, rows, reviewStage, reviewType) {
+  const stage = cleanText_(reviewStage).toUpperCase();
+  const type = cleanText_(reviewType).toUpperCase();
+  if (!stage && !type) return { rows: rows, suffix: '' };
+  const stageIndex = headers.indexOf('REVIEW_STAGE');
+  const typeIndex = headers.indexOf('REVIEW_TYPE');
+  const proposedIndex = headers.indexOf('PROPOSED_LIFECYCLE_STATE');
+  const filtered = rows.filter(function (row) {
+    if (stage && cleanText_(row[stageIndex]).toUpperCase() !== stage) return false;
+    // Retained-only missing rows are not part of the Quarantine & purge step; only purge verifications are.
+    if (cleanText_(row[typeIndex]).toUpperCase() === 'MISSING_FROM_EXTRACT' && cleanText_(row[proposedIndex]).toUpperCase() !== 'PURGED') return false;
+    if (type && cleanText_(row[typeIndex]).toUpperCase() !== type) return false;
+    return true;
+  });
+  return { rows: filtered, suffix: [stage, type].filter(Boolean).join('_').toLowerCase() };
 }
 
 function buildSnowflakeIntakeReviewExport_(headers, rows, review, dismissedAssetIds, currentAssets, cases, schemaOwnerLookup) {
@@ -1762,6 +1793,15 @@ function buildSnowflakeIntakeReviewExport_(headers, rows, review, dismissedAsset
     )));
   });
   return { headers: headers.concat(appendedHeaders), rows: exportRows };
+}
+
+// The review table only lists purge verifications from the missing-from-extract population, while the
+// retained-for-reconciliation items can number in the thousands. Keep the verifications first so the
+// sample cap cannot crowd them out.
+function prioritizeMissingReviewSamples_(items, limit) {
+  const verifications = items.filter(function (item) { return item.purgeVerification; });
+  const retained = items.filter(function (item) { return !item.purgeVerification; });
+  return verifications.concat(retained).slice(0, limit);
 }
 
 function intakeReviewExportItemMap_(review) {
@@ -1868,10 +1908,10 @@ function intakeReviewRawRowFromAsset_(headers, asset) {
   return headers.map(function (header) { return values[header] === undefined ? '' : values[header]; });
 }
 
-function intakeReviewExportFileName_(sourceFileName) {
+function intakeReviewExportFileName_(sourceFileName, scopeSuffix) {
   const base = cleanText_(sourceFileName).replace(/\.csv$/i, '').replace(/[^a-z0-9._-]+/gi, '_') || 'snowflake_intake';
   const stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone() || 'UTC', 'yyyyMMdd_HHmmss');
-  return base + '_review_details_' + stamp + '.csv';
+  return base + '_review_details_' + (scopeSuffix ? scopeSuffix + '_' : '') + stamp + '.csv';
 }
 
 function confirmSnowflakeIntake(reviewInput) {

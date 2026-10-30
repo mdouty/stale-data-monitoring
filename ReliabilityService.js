@@ -76,18 +76,23 @@ function planUpdateObjects_(plan, sheetName, keyHeader, objects) {
   const keyIndex = meta.headers.indexOf(keyHeader);
   if (keyIndex < 0) throw new Error('Missing recovery key column: ' + keyHeader);
   const sheet = getSheet_(sheetName);
-  const rowByKey = {};
-  const lastRow = sheet.getLastRow();
-  if (lastRow > 1) sheet.getRange(2, keyIndex + 1, lastRow - 1, 1).getDisplayValues().forEach(function (row, index) {
-    if (cleanText_(row[0])) rowByKey[cleanText_(row[0])] = index + 2;
-  });
-  meta.appended.forEach(function (item) { rowByKey[cleanText_(item.values[keyIndex])] = item.row; });
+  // Reuse the shared key index (the last occurrence of a key wins) rather than
+  // rescanning the key column on every call; rows appended by this plan overlay it.
+  const indexed = getSheetKeyIndex_(sheet, sheetName, keyHeader).rowsByKey;
+  const appendedRowByKey = {};
+  meta.appended.forEach(function (item) { appendedRowByKey[cleanText_(item.values[keyIndex])] = item.row; });
+  const rowFor = function (key) {
+    if (appendedRowByKey[key]) return appendedRowByKey[key];
+    const rows = indexed[key];
+    return rows ? rows[rows.length - 1] : 0;
+  };
   const updates = {};
   objects.forEach(function (object) {
     const key = cleanText_(object[keyHeader]);
     if (!key) return;
     const row = objectToRow_(meta.headers, object);
-    if (rowByKey[key]) updates[rowByKey[key]] = row;
+    const existingRow = rowFor(key);
+    if (existingRow) updates[existingRow] = row;
     else planAppendRows_(plan, sheetName, [row]);
   });
   // Only write selected rows. No stale snapshot of an unrelated gap is replayed.
@@ -122,6 +127,7 @@ function applyDurableWrites_(writes) {
       });
     }
     range.setValues(write.rows);
+    noteSheetWrite_(sheet, write.sheet, write);
   });
   SpreadsheetApp.flush();
 }
