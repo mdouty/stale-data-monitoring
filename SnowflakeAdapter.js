@@ -2200,7 +2200,7 @@ function importSourceChunk_(state, inlineExecution, deferScheduling) {
   setExecutionEnvironment_(state.environment, false);
   const batchKey = state.runId + '|' + state.cursorRow;
   const savedBatch = readDurablePayload_('SourceBatch', batchKey);
-  if (savedBatch) return completeSourceBatch_(state, savedBatch, inlineExecution, deferScheduling);
+  if (savedBatch) return completeSourceBatch_(state, savedBatch, inlineExecution, deferScheduling, batchKey);
   const source = SpreadsheetApp.openById(state.sourceSpreadsheetId).getSheetByName(state.sourceSheetName);
   if (!source) throw new Error('The staged intake source is no longer available.');
   const headerMap = validateSnowflakeV2Headers_(state.sourceHeaders);
@@ -2304,11 +2304,23 @@ function importSourceChunk_(state, inlineExecution, deferScheduling) {
   state.message = 'Evaluated and retained ' + state.processedRows + ' of ' + state.sourceRows + ' source rows';
   const payload = { writes: plan.writes, nextState: state };
   saveDurablePayload_('SourceBatch', batchKey, payload);
-  completeSourceBatch_(state, payload, inlineExecution, deferScheduling);
+  completeSourceBatch_(state, payload, inlineExecution, deferScheduling, batchKey);
 }
 
-function completeSourceBatch_(state, payload, inlineExecution, deferScheduling) {
-  applyDurableWrites_(payload.writes);
+function completeSourceBatch_(state, payload, inlineExecution, deferScheduling, batchKey) {
+  try {
+    applyDurableWrites_(payload.writes);
+  } catch (conflictError) {
+    if (!/conflicting row/.test(String((conflictError && conflictError.message) || conflictError))) throw conflictError;
+    // Another writer claimed a reserved append row (e.g. a manual status change or the
+    // reminder sweep wrote to Lifecycle_Events) between planning and replay. Relocate only
+    // our own appends to the sheet's current end and persist the rebased batch before
+    // applying it, mirroring the notification path. Without this the saved batch replays
+    // the same occupied position on every resume and the publish stays stuck.
+    payload = { writes: rebaseDurableAppendWrites_(payload.writes), nextState: payload.nextState };
+    saveDurablePayload_('SourceBatch', batchKey, payload);
+    applyDurableWrites_(payload.writes);
+  }
   Object.assign(state, payload.nextState);
   state.retryCount = 0;
   state.retryAfter = 0;

@@ -345,4 +345,25 @@ for (const decision of ['RECEIVED', 'NOT_RECEIVED']) {
   assert.strictEqual(h.sheets.get('events').data[2][3], 'OWNERSHIP_CHANGED');
 }
 
+// A source batch whose reserved Lifecycle_Events row was taken by another writer is
+// rebased and persisted on completion, so resuming the saved batch lands the planned
+// audit row exactly once without overwriting the foreign row.
+{
+  const h = harness(), s = h.sandbox;
+  s.updateJobRun_ = () => {}; s.setImportState_ = () => {}; s.scheduleImportContinuation_ = () => {};
+  const events = h.makeSheet('events', [['ID', 'VALUE']]);
+  const plan = s.newDurableWritePlan_();
+  s.planAppendRows_(plan, 'events', [['audit-1', 'NOTIFIED']]); // reserves events row 2
+  events.data.push(['someone-else', 'event']);                  // foreign writer takes row 2
+  const payload = { writes: plan.writes, nextState: { cursorRow: 2, processedRows: 1, writtenRows: 1, errors: 0, message: 'batch', sourceRows: 1 } };
+  s.saveDurablePayload_('SourceBatch', 'run-1|2', payload);
+  s.completeSourceBatch_({ runId: 'run-1', sourceRows: 1 }, payload, true, true, 'run-1|2');
+  assert.strictEqual(events.data[1][0], 'someone-else');  // foreign row untouched
+  assert.strictEqual(events.data[2][0], 'audit-1');       // planned audit row relocated to the end
+  assert.strictEqual(events.getLastRow(), 3);             // written exactly once
+  const saved = s.readDurablePayload_('SourceBatch', 'run-1|2');
+  s.applyDurableWrites_(saved.writes);                    // resume replays the rebased batch
+  assert.strictEqual(events.getLastRow(), 3, 'Resume must not duplicate the audit row');
+}
+
 console.log('Import reliability fault-injection checks passed.');
