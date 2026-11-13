@@ -69,18 +69,12 @@
     renderImportStatus(config.importStatus);
     renderAdminImportSummary(config.importStatus);
     loadDashboard(1);
-    // Only admins poll import/campaign progress. Import publication and Slack delivery are
-    // admin-only operations (assertAdmin_); a non-admin viewer can't act on the status and
-    // only needs the static banner rendered above. Polling from every dashboard viewer is
-    // what produced the server-side lock-contention storm during a running campaign, so a
-    // non-admin session renders once and never enters the poll loop. (A non-admin dashboard
-    // will pick up freshly published data on its next natural page load rather than live.)
-    if (config.user.isAdmin && config.importStatus.running) {
-      showPublishingLoading_(config.importStatus);
-      startPolling(true);
-    } else if (config.user.isAdmin && config.importStatus.notificationCampaign && config.importStatus.notificationCampaign.running) {
-      startPolling(false);
-    } else {
+    // Import/campaign progress polling runs only while an admin has the Admin page open
+    // (see syncImportPolling_, called from showAppPage). The Dashboard and My Team pages render
+    // the static status banner once and never enter the poll loop: every poll tick contends for
+    // the script lock that publication and Slack delivery need, which produced the lock-contention
+    // storm. (A dashboard will pick up freshly published data on its next natural page load.)
+    if (!(config.user.isAdmin && importRunActive_(config.importStatus))) {
       state.publicationOverlayDismissed = false;
       if (canImport && !config.importStatus.recoverable) recoverStagedIntake_();
     }
@@ -135,9 +129,16 @@
       tab.classList.toggle('primary', requested === item[1]);
       tab.classList.toggle('subtle', requested !== item[1]);
     });
-    if (requested === 'ADMIN') showAdminSection(state.currentAdminSection);
-    else if (requested === 'TEAM') loadMyTeam_();
-    else if (changedPage && state.config) loadDashboard(1);
+    if (requested === 'ADMIN') {
+      stopImportWatcher_();
+      showAdminSection(state.currentAdminSection);
+      syncImportPolling_();
+    } else {
+      stopImportPolling_();
+      startImportWatcher_();
+      if (requested === 'TEAM') loadMyTeam_();
+      else if (changedPage && state.config) loadDashboard(1);
+    }
   }
 
   function showAdminSection(section) {
@@ -166,6 +167,7 @@
     if (state.config && state.config.environment.key === environment) return;
     clearTimeout(state.poller);
     state.poller = null;
+    stopImportWatcher_();
     state.dashboardRequestId += 1;
     closeDrawer();
     const banner = document.getElementById('statusBanner');
@@ -3000,6 +3002,69 @@
 
   function cleanClientText_(value) {
     return String(value === null || value === undefined ? '' : value).trim();
+  }
+
+  // Start progress polling for a running import or Slack campaign, but only while an admin is on
+  // the Admin page. Idempotent: state.poller is set for as long as a poll chain is alive.
+  function syncImportPolling_() {
+    if (state.poller || !state.config || !state.config.user.isAdmin || state.currentPage !== 'ADMIN') return;
+    const status = state.config.importStatus || {};
+    if (status.running) {
+      if (!state.publicationOverlayDismissed) showPublishingLoading_(status);
+      startPolling(true);
+    } else if (status.notificationCampaign && status.notificationCampaign.running) {
+      startPolling(false);
+    }
+  }
+
+  function importRunActive_(status) {
+    return Boolean(status && (status.running || (status.notificationCampaign && status.notificationCampaign.running)));
+  }
+
+  // Admin-only completion watcher for the Dashboard and My Team pages. Unlike startPolling it only
+  // reads status, slowly, and never calls advanceActiveImportWorkflow (which takes the script lock),
+  // so it cannot slow publication. It ends itself when the run ends, then refreshes the dashboard.
+  function startImportWatcher_() {
+    if (state.watcher || !state.config || !state.config.user.isAdmin || state.currentPage === 'ADMIN') return;
+    if (!importRunActive_(state.config.importStatus)) return;
+    const intervalMs = 30000;
+    const generation = (state.watcherGeneration || 0) + 1;
+    state.watcherGeneration = generation;
+    const tick = function () {
+      google.script.run.withSuccessHandler(function (status) {
+        if (state.watcherGeneration !== generation) return;
+        renderImportStatus(status);
+        if (importRunActive_(status)) {
+          state.watcher = setTimeout(tick, intervalMs);
+          return;
+        }
+        state.watcher = null;
+        if (state.currentPage === 'LANDSCAPE') loadDashboard(1);
+        showToast(status.phase === 'FAILED' ? 'Data publication failed. Review the latest job details.' : 'Data refresh published successfully.', status.phase === 'FAILED');
+      }).withFailureHandler(function () {
+        if (state.watcherGeneration !== generation) return;
+        state.watcher = setTimeout(tick, intervalMs);
+      }).getImportStatus();
+    };
+    state.watcher = setTimeout(tick, intervalMs);
+  }
+
+  function stopImportWatcher_() {
+    if (!state.watcher) return;
+    clearTimeout(state.watcher);
+    state.watcher = null;
+    state.watcherGeneration = (state.watcherGeneration || 0) + 1;
+  }
+
+  // Leaving the Admin page ends polling; the Head time-driven triggers keep the work going.
+  function stopImportPolling_() {
+    if (!state.poller) return;
+    clearTimeout(state.poller);
+    state.poller = null;
+    // Invalidate any in-flight poll callbacks, same mechanism startPolling uses to supersede itself.
+    state.publicationPollGeneration = (state.publicationPollGeneration || 0) + 1;
+    if (state.publicationAdvancing) hideWorkflowLoading_();
+    state.publicationAdvancing = false;
   }
 
   function startPolling(showOverlay) {

@@ -166,6 +166,119 @@ for (const sparse of [false, true]) {
   assert.strictEqual(rendered.length, 1);
 }
 
+// Import polling starts only from the Admin page, never from the Dashboard or for non-admins,
+// and leaving the Admin page stops it.
+{
+  const running = { running: true, phase: 'FINALIZE' };
+  const started = [];
+  let overlays = 0, hidden = 0, cleared = 0;
+  function make(stateOverrides) {
+    const state = { poller: null, currentPage: 'ADMIN', publicationOverlayDismissed: false,
+      config: { user: { isAdmin: true }, importStatus: running }, ...stateOverrides };
+    const sandbox = load('Client.html', ['syncImportPolling_', 'stopImportPolling_'], {
+      state, showPublishingLoading_: () => overlays++, hideWorkflowLoading_: () => hidden++,
+      clearTimeout: () => cleared++, startPolling: showOverlay => { started.push(showOverlay); state.poller = 1; }
+    });
+    return { state, sandbox };
+  }
+  // Dashboard / My Team: no polling even for an admin with a running import.
+  for (const page of ['LANDSCAPE', 'TEAM']) make({ currentPage: page }).sandbox.syncImportPolling_();
+  // Non-admin on the Admin page: no polling.
+  make({ config: { user: { isAdmin: false }, importStatus: running } }).sandbox.syncImportPolling_();
+  assert.strictEqual(started.length, 0);
+  // Admin page with a running import polls once; repeated syncs do not restart it.
+  const admin = make({});
+  admin.sandbox.syncImportPolling_(); admin.sandbox.syncImportPolling_();
+  assert.deepStrictEqual(started, [true]);
+  assert.strictEqual(overlays, 1);
+  // Campaign-only phase polls without the publication overlay.
+  make({ config: { user: { isAdmin: true }, importStatus: { running: false, notificationCampaign: { running: true } } } }).sandbox.syncImportPolling_();
+  assert.deepStrictEqual(started, [true, false]);
+  assert.strictEqual(overlays, 1);
+  // Nothing running: nothing to poll.
+  make({ config: { user: { isAdmin: true }, importStatus: { running: false } } }).sandbox.syncImportPolling_();
+  assert.strictEqual(started.length, 2);
+  // Leaving the Admin page stops the chain, supersedes in-flight callbacks, and hides the overlay.
+  admin.state.publicationAdvancing = true;
+  admin.state.publicationPollGeneration = 4;
+  admin.sandbox.stopImportPolling_();
+  assert.strictEqual(admin.state.poller, null);
+  assert.strictEqual(admin.state.publicationPollGeneration, 5);
+  assert.strictEqual(admin.state.publicationAdvancing, false);
+  assert.strictEqual(cleared, 1);
+  assert.strictEqual(hidden, 1);
+  admin.sandbox.stopImportPolling_();
+  assert.strictEqual(cleared, 1);
+}
+
+// The Dashboard/My Team watcher is admin-only, read-only (never advances the workflow), and ends
+// itself with a dashboard refresh and toast when the run finishes.
+{
+  const running = { running: true, phase: 'FINALIZE' };
+  function watcherHarness(stateOverrides) {
+    const calls = [], timers = [], toasts = [], rendered = [];
+    let dashboards = 0;
+    function runner(success, failure) {
+      return { withSuccessHandler: fn => runner(fn, failure), withFailureHandler: fn => runner(success, fn),
+        getImportStatus: () => calls.push({ success, failure }) };
+    }
+    const state = { watcher: null, currentPage: 'LANDSCAPE', config: { user: { isAdmin: true }, importStatus: running }, ...stateOverrides };
+    const sandbox = load('Client.html', ['importRunActive_', 'startImportWatcher_', 'stopImportWatcher_'], {
+      state, google: { script: { run: runner() } }, clearTimeout: noop,
+      setTimeout: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+      renderImportStatus: value => rendered.push(value), loadDashboard: () => dashboards++,
+      showToast: (message, isError) => toasts.push({ message, isError: Boolean(isError) })
+    });
+    return { state, sandbox, calls, timers, toasts, rendered, dashboards: () => dashboards };
+  }
+  // No watcher for non-admins, on the Admin page, or when nothing is running.
+  for (const overrides of [
+    { config: { user: { isAdmin: false }, importStatus: running } },
+    { currentPage: 'ADMIN' },
+    { config: { user: { isAdmin: true }, importStatus: { running: false } } }
+  ]) {
+    const idle = watcherHarness(overrides);
+    idle.sandbox.startImportWatcher_();
+    assert.strictEqual(idle.timers.length, 0);
+  }
+  // Admin on the Dashboard: one 30s read-only tick per interval, idempotent start.
+  const h = watcherHarness({});
+  h.sandbox.startImportWatcher_(); h.sandbox.startImportWatcher_();
+  assert.strictEqual(h.timers.length, 1);
+  assert.strictEqual(h.timers[0].ms, 30000);
+  h.timers.shift().fn();
+  assert.strictEqual(h.calls.length, 1);
+  h.calls[0].success({ running: true, phase: 'FINALIZE' });
+  assert.strictEqual(h.timers.length, 1);
+  assert.strictEqual(h.dashboards(), 0);
+  // A transient failure keeps watching.
+  h.timers.shift().fn();
+  h.calls[1].failure(new Error('offline'));
+  assert.strictEqual(h.timers.length, 1);
+  // Completion ends the watcher, refreshes the dashboard, and toasts once.
+  h.timers.shift().fn();
+  h.calls[2].success({ running: false, phase: 'COMPLETE' });
+  assert.strictEqual(h.state.watcher, null);
+  assert.strictEqual(h.timers.length, 0);
+  assert.strictEqual(h.dashboards(), 1);
+  assert.deepStrictEqual(h.toasts, [{ message: 'Data refresh published successfully.', isError: false }]);
+  // A campaign that is still running keeps the watcher alive; a failed run toasts an error.
+  const f = watcherHarness({});
+  f.sandbox.startImportWatcher_(); f.timers.shift().fn();
+  f.calls[0].success({ running: false, notificationCampaign: { running: true } });
+  assert.strictEqual(f.timers.length, 1);
+  f.timers.shift().fn();
+  f.calls[1].success({ running: false, phase: 'FAILED' });
+  assert.strictEqual(f.toasts[0].isError, true);
+  // Stopping supersedes an in-flight read.
+  const s = watcherHarness({});
+  s.sandbox.startImportWatcher_(); s.timers.shift().fn();
+  s.sandbox.stopImportWatcher_();
+  s.calls[0].success({ running: false, phase: 'COMPLETE' });
+  assert.strictEqual(s.toasts.length, 0);
+  assert.strictEqual(s.rendered.length, 0);
+}
+
 // Unknown-duration stages never invent an overall completion percentage.
 {
   const views = [];
