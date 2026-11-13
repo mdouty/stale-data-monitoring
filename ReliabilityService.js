@@ -104,6 +104,15 @@ function planUpdateObjects_(plan, sheetName, keyHeader, objects) {
   });
 }
 
+// Replay compares what the sheet returns against the saved plan. Sheets turns a planned
+// 'TRUE' / 'FALSE' string into a real boolean, which stringifies lowercase, so a row this
+// plan already wrote would read back as a conflict. Compare booleans case-insensitively.
+function durableCellMatches_(cell, expected) {
+  const want = String(expected === undefined ? '' : expected);
+  if (String(cell) === want) return true;
+  return typeof cell === 'boolean' && String(cell).toUpperCase() === want.toUpperCase();
+}
+
 function applyDurableWrites_(writes) {
   (writes || []).forEach(function (write) {
     if (!write.rows.length) return;
@@ -114,7 +123,7 @@ function applyDurableWrites_(writes) {
       const existing = range.getValues();
       existing.forEach(function (row, index) {
         const matches = function (expected) {
-          return row.every(function (cell, column) { return String(cell) === String(expected[column] === undefined ? '' : expected[column]); });
+          return row.every(function (cell, column) { return durableCellMatches_(cell, expected[column]); });
         };
         const rowNumber = write.row + index;
         const matchesPlannedUpdate = writes.some(function (other) {
@@ -154,7 +163,7 @@ function rebaseDurableAppendWrites_(writes) {
           return other.sheet === write.sheet && rowNumber >= other.row && rowNumber < other.row + other.rows.length &&
             row.every(function (cell, column) {
               const expected = other.rows[rowNumber - other.row];
-              return String(cell) === String(expected[column] === undefined ? '' : expected[column]);
+              return durableCellMatches_(cell, expected[column]);
             });
         });
         if (row.some(function (cell) { return cell !== ''; }) && !matchesPlanned) conflict = true;

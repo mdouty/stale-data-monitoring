@@ -103,6 +103,21 @@ for (const after of [false, true]) for (let boundary = 1; boundary <= 4; boundar
   assert.strictEqual(sheet.data[1][0], 'someone-else');
 }
 
+// Replaying a batch that already landed must not read as a conflict when Sheets has turned a
+// planned 'TRUE' string into a boolean. The replay is idempotent and writes no duplicate rows;
+// a genuinely different value (or a boolean that disagrees) still conflicts.
+{
+  const h = harness(), s = h.sandbox;
+  const assets = h.makeSheet('assets', [['ASSET_ID', 'IS_STALE_180']]);
+  const plan = s.newDurableWritePlan_(); s.planAppendRows_(plan, 'assets', [['a1', 'TRUE'], ['a2', 'FALSE']]);
+  assets.data.push(['a1', true], ['a2', false]); // what the sheet returns after the first apply
+  s.applyDurableWrites_(plan.writes);
+  assert.strictEqual(assets.getLastRow(), 3);
+  assert.strictEqual(s.rebaseDurableAppendWrites_(plan.writes)[0].row, 2); // not relocated
+  assets.data[2][1] = true; // a2 planned FALSE, sheet says TRUE
+  assert.throws(() => s.applyDurableWrites_(plan.writes), /conflicting row/);
+}
+
 // When another writer took a reserved append row, the delivery-replay recovery
 // relocates only its own appends to the sheet's current end: the foreign row is
 // preserved, fixed-row updates stay put, every planned row lands exactly once, and
