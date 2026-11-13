@@ -4233,10 +4233,22 @@ function carryForwardAndReconcileChunk_(state, cursorRow, batchSize) {
     return rowToObject_(headers, row);
   });
   const assetIds = cases.map(function (caseRecord) { return cleanText_(caseRecord.ASSET_ID); }).filter(Boolean);
-  const current = indexObjectsBy_(readObjectsByKeys_(APP.sheets.assetsCurrent, 'ASSET_ID', assetIds), 'ASSET_ID');
-  const previous = indexObjectsBy_(readObjectsByKeys_(APP.sheets.assetsStaging, 'ASSET_ID', assetIds), 'ASSET_ID');
+  // Most Cases rows still have an Assets_Current row. Only presence matters for those, so
+  // answer it from the key index and fetch full rows (Assets_Staging, Platform_Actions) only
+  // for the few assets the loop below can actually carry forward or purge.
+  const current = existingSheetKeys_(APP.sheets.assetsCurrent, 'ASSET_ID', assetIds);
+  const skippedStates = [APP.lifecycle.dismissed, APP.lifecycle.active, APP.lifecycle.restored];
+  const missing = cases.filter(function (caseRecord) {
+    const assetId = cleanText_(caseRecord.ASSET_ID);
+    return assetId && !current[assetId] && skippedStates.indexOf(canonicalLifecycleState_(caseRecord.STATE)) === -1;
+  });
+  const missingIds = missing.map(function (caseRecord) { return cleanText_(caseRecord.ASSET_ID); });
+  const purgeCandidateIds = missing.filter(function (caseRecord) {
+    return [APP.lifecycle.quarantined, APP.lifecycle.purgeEligible].indexOf(canonicalLifecycleState_(caseRecord.STATE)) !== -1;
+  }).map(function (caseRecord) { return cleanText_(caseRecord.ASSET_ID); });
+  const previous = indexObjectsBy_(readObjectsByKeys_(APP.sheets.assetsStaging, 'ASSET_ID', missingIds), 'ASSET_ID');
   const completedPurge = {};
-  readObjectsByKeys_(APP.sheets.platformActions, 'ASSET_ID', assetIds).forEach(function (action) {
+  readObjectsByKeys_(APP.sheets.platformActions, 'ASSET_ID', purgeCandidateIds).forEach(function (action) {
     if (cleanText_(action.ACTION).toUpperCase() === 'PURGE' && cleanText_(action.STATUS).toUpperCase() === 'COMPLETED') {
       completedPurge[action.ASSET_ID] = true;
     }

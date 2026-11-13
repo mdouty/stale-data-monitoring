@@ -284,6 +284,19 @@ function readObjectsByKeys_(sheetName, keyHeader, keyValues) {
   return objects;
 }
 
+// Which of keyValues exist in the sheet, answered from the cached key index with no cell reads.
+// Use instead of readObjectsByKeys_ when the caller only needs presence: matched rows scattered
+// across a large sheet are otherwise fetched as full-width windows.
+function existingSheetKeys_(sheetName, keyHeader, keyValues) {
+  const present = {};
+  const keys = (keyValues || []).map(cleanText_).filter(Boolean);
+  if (!keys.length) return present;
+  const index = getSheetKeyIndex_(getSheet_(sheetName), sheetName, keyHeader);
+  if (index.keyIndex === -1 || index.lastRow < 2 || index.lastColumn < 1) return present;
+  keys.forEach(function (key) { if (index.rowsByKey[key]) present[key] = true; });
+  return present;
+}
+
 function repositoryBulkWindowSize_() {
   const configured = typeof configNumber_ === 'function' ? configNumber_('SHEET_BULK_IO_WINDOW_ROWS', 500) : 500;
   return Math.max(100, Math.min(1000, Number(configured || 500)));
