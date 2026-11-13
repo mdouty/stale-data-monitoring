@@ -2134,8 +2134,8 @@ function continueSnowflakeImport() {
       }
     } else if (state.phase === 'PREPARE_FINALIZE' || (state.phase === 'FINALIZE' && !state.assetBuffersPublished && state.assetBufferIds)) beginImportFinalization_(state, false);
     else if (state.phase === 'FINALIZE') {
-      // Loop multiple RECONCILE batches per execution to warm the key-index cache.
-      if (state.finalization && state.finalization.stage === 'RECONCILE') {
+      // Loop multiple batches per execution: approvals and reconcile each advance one batch per call.
+      if (state.finalization && ['APPROVE_CANDIDATES', 'RECONCILE'].indexOf(state.finalization.stage) !== -1) {
         const batchStartedAt = Date.now();
         let completedBatches = 0;
         const batchCap = Math.max(1, Math.min(60, configNumber_('FINALIZATION_BATCHES_PER_EXECUTION', 20)));
@@ -2143,7 +2143,7 @@ function continueSnowflakeImport() {
         do {
           finalizeImport_(state, true);
           completedBatches += 1;
-        } while (state.finalization && state.finalization.stage === 'RECONCILE' && completedBatches < batchCap && Date.now() - batchStartedAt < executionBudgetMs);
+        } while (state.finalization && ['APPROVE_CANDIDATES', 'RECONCILE'].indexOf(state.finalization.stage) !== -1 && completedBatches < batchCap && Date.now() - batchStartedAt < executionBudgetMs);
         // Schedule the next execution once, outside the loop.
         const current = getImportState_(state.environment);
         if (current && ['FINALIZE'].indexOf(current.phase) !== -1) {

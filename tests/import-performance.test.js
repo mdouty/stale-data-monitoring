@@ -342,7 +342,7 @@ for (const scenario of [{ duration: 1, limit: 99, batchCap: 3, expected: 3 }, { 
   assert.strictEqual(released, 1);
 }
 
-// Non-RECONCILE finalization stages run once per execution (no looping).
+// APPROVE_CANDIDATES loops like RECONCILE, capped at 60 batches per execution.
 {
   let approveBatches = 0, scheduled = 0;
   const state = { environment: 'DEV', phase: 'FINALIZE', runId: 'run', finalization: { stage: 'APPROVE_CANDIDATES', approvalCursorRow: 2 }, counts: { state: {}, evaluation: {}, environment: {}, ownership: {}, domain: {} } };
@@ -355,8 +355,8 @@ for (const scenario of [{ duration: 1, limit: 99, batchCap: 3, expected: 3 }, { 
     failSnowflakeImport_: () => assert.fail('Unexpected import failure'), configNumber_: () => 99
   });
   sandbox.continueSnowflakeImport();
-  assert.strictEqual(approveBatches, 1);
-  assert.strictEqual(scheduled, 1);
+  assert.strictEqual(approveBatches, 60);
+  assert.strictEqual(scheduled, 2);
 }
 
 console.log('Import performance and progress regressions passed.');
