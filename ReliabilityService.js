@@ -401,7 +401,16 @@ function recoverPendingSynchronousDelivery_() {
   const completedKey = reliabilityProperty_('SynchronousDeliveryCompleted');
   if (properties.getProperty(completedKey) === pointer.key) return null;
   const saved = readDurablePayload_('SynchronousDelivery', pointer.key);
-  applyDurableWrites_(saved.writes);
+  try {
+    applyDurableWrites_(saved.writes);
+  } catch (conflictError) {
+    if (!/conflicting row/.test(String((conflictError && conflictError.message) || conflictError))) throw conflictError;
+    // Another writer took a reserved append row after this payload was saved. Relocate only our
+    // own appends and persist the rebased plan, so a failed run cannot wedge the campaign retry loop.
+    saved.writes = rebaseDurableAppendWrites_(saved.writes);
+    saveDurablePayload_('SynchronousDelivery', pointer.key, saved);
+    applyDurableWrites_(saved.writes);
+  }
   properties.setProperty(completedKey, pointer.key);
   return saved.result;
 }

@@ -125,7 +125,8 @@ assert.deepStrictEqual(wideAssetsBeforeWrite, [], 'no full-row fetch of existing
 const stagingRowsFetched = new Set();
 wide('staging').forEach(r => { for (let i = 0; i < r.rows; i++) stagingRowsFetched.add(r.row + i); });
 // staging rows (1-based sheet rows): A3 = 303, A4 = 304, A5 = 305 -> only A3 and A5 are candidates.
-assert.deepStrictEqual([...stagingRowsFetched].sort((a, b) => a - b), [303, 305]);
+// Candidates two rows apart are fetched as one tight range (A4's row rides along); nothing beyond it.
+assert.deepStrictEqual([...stagingRowsFetched].sort((a, b) => a - b), [303, 304, 305]);
 const actionRowsFetched = new Set();
 wide('actions').forEach(r => { for (let i = 0; i < r.rows; i++) actionRowsFetched.add(r.row + i); });
 assert.deepStrictEqual([...actionRowsFetched], [302], 'only the purge candidate A5 is looked up in Platform_Actions');
@@ -143,6 +144,40 @@ assert.strictEqual(keyScans(), 1, 'Assets_Current key column scanned once for th
   assert.deepStrictEqual(Object.keys(h.sandbox.existingSheetKeys_('assets', 'NO_SUCH_COLUMN', ['A1'])), []);
   const viaRead = Array.from(h.sandbox.readObjectsByKeys_('assets', 'ASSET_ID', ['A1', 'A2', 'ZZZ']), o => o.ASSET_ID).sort();
   assert.deepStrictEqual(Object.keys(present).sort(), viaRead);
+}
+
+// Sparse grouping: scattered rows become tight ranges, not fixed 500-row windows.
+{
+  const h = build();
+  const plain = value => JSON.parse(JSON.stringify(value));
+  const span = groups => groups.reduce((sum, g) => sum + g.end - g.start + 1, 0);
+  const shape = groups => plain(groups.map(g => [g.start, g.end]));
+
+  assert.deepStrictEqual(shape(h.sandbox.groupSheetRowsForSparseIo_([90000, 10, 12, 5000, 12], 100, 1000, 200)),
+    [[10, 12], [5000, 5000], [90000, 90000]], 'close rows merge, distant rows stay separate, duplicates collapse');
+  // Rows within maxGap unselected rows merge; one more and they split.
+  assert.deepStrictEqual(shape(h.sandbox.groupSheetRowsForSparseIo_([10, 111], 100, 1000, 200)), [[10, 111]]);
+  assert.deepStrictEqual(shape(h.sandbox.groupSheetRowsForSparseIo_([10, 112], 100, 1000, 200)), [[10, 10], [112, 112]]);
+  // A merged range never exceeds maxRows.
+  const dense = Array.from({ length: 50 }, (_, i) => 10 + i * 50);
+  h.sandbox.groupSheetRowsForSparseIo_(dense, 100, 1000, 200).forEach(g => assert(g.end - g.start + 1 <= 1000));
+
+  // 53 rows spread over a 95k-row sheet: tight ranges read the rows, windows read hundreds of times more.
+  const scattered = Array.from({ length: 53 }, (_, i) => 2 + i * 1800);
+  const tight = h.sandbox.groupSheetRowsForSparseIo_(scattered, 100, 1000, 200);
+  const windows = h.sandbox.groupSheetRowsForBulkIo_(scattered);
+  assert.strictEqual(span(tight), 53);
+  assert(span(windows) > 53 * 100, 'fixed windows over-read scattered rows');
+
+  // More ranges than maxGroups is not a sparse lookup: fall back to the bulk windows.
+  const many = Array.from({ length: 201 }, (_, i) => 2 + i * 1000);
+  assert.deepStrictEqual(shape(h.sandbox.groupSheetRowsForSparseIo_(many, 100, 1000, 200)), shape(h.sandbox.groupSheetRowsForBulkIo_(many)));
+
+  // The sparse option returns the same rows as the default path.
+  const viaWindows = Array.from(h.sandbox.readObjectsByKeys_('staging', 'ASSET_ID', ['A1', 'A3', 'A5', 'ZZZ']), o => o.ASSET_ID).sort();
+  const viaSparse = Array.from(h.sandbox.readObjectsByKeys_('staging', 'ASSET_ID', ['A1', 'A3', 'A5', 'ZZZ'], true), o => o.ASSET_ID).sort();
+  assert.deepStrictEqual(viaSparse, viaWindows);
+  assert.deepStrictEqual(viaSparse, ['A1', 'A3', 'A5']);
 }
 
 console.log('reconcile-chunk-performance ok');

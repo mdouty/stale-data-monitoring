@@ -256,7 +256,8 @@ function readObjectsByField_(sheetName, keyHeader, keyValue, limit) {
   return objects;
 }
 
-function readObjectsByKeys_(sheetName, keyHeader, keyValues) {
+// sparse: the caller expects a few rows scattered across a large sheet (see groupSheetRowsForSparseIo_).
+function readObjectsByKeys_(sheetName, keyHeader, keyValues, sparse) {
   const keys = {};
   (keyValues || []).forEach(function (value) {
     const key = cleanText_(value);
@@ -272,7 +273,7 @@ function readObjectsByKeys_(sheetName, keyHeader, keyValues) {
     if (rows) rows.forEach(function (rowNumber) { rowNumbers.push(rowNumber); });
   });
   if (!rowNumbers.length) return [];
-  const groups = groupSheetRowsForBulkIo_(rowNumbers);
+  const groups = sparse ? groupSheetRowsForSparseIo_(rowNumbers, 100, 1000, 200) : groupSheetRowsForBulkIo_(rowNumbers);
   const objects = [];
   groups.forEach(function (group) {
     const rowCount = Math.min(group.end, index.lastRow) - group.start + 1;
@@ -295,6 +296,27 @@ function existingSheetKeys_(sheetName, keyHeader, keyValues) {
   if (index.keyIndex === -1 || index.lastRow < 2 || index.lastColumn < 1) return present;
   keys.forEach(function (key) { if (index.rowsByKey[key]) present[key] = true; });
   return present;
+}
+
+// A few rows scattered across a large sheet: fixed 500-row windows read hundreds of times more rows
+// than they return (53 rows cost about 20,500). A call costs roughly the same for 1 row as for ~100,
+// so merge only rows that sit within maxGap unselected rows of each other (and keep each call under
+// maxRows). More than maxGroups calls means the lookup is not sparse; use the windows then.
+function groupSheetRowsForSparseIo_(rowNumbers, maxGap, maxRows, maxGroups) {
+  const rows = Array.from(new Set(rowNumbers || [])).sort(function (left, right) { return left - right; });
+  const groups = [];
+  rows.forEach(function (rowNumber) {
+    const current = groups.length ? groups[groups.length - 1] : null;
+    if (current && rowNumber - current.end - 1 <= maxGap && rowNumber - current.start < maxRows) {
+      current.end = rowNumber;
+      current.selectedRows[rowNumber] = true;
+    } else {
+      const selectedRows = {};
+      selectedRows[rowNumber] = true;
+      groups.push({ start: rowNumber, end: rowNumber, selectedRows: selectedRows });
+    }
+  });
+  return groups.length > maxGroups ? groupSheetRowsForBulkIo_(rows) : groups;
 }
 
 function repositoryBulkWindowSize_() {

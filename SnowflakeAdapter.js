@@ -2947,6 +2947,9 @@ function finalizeImport_(state, deferScheduling) {
     const lifecycleAssets = lifecycleEventAssetGroupsForRun_(state.runId);
     checkpoint.orphanQuarantineActions = queueImportOrphanQuarantineActions_(lifecycleAssets.ORPHAN_POLICY_ACCEPTED || [], state.runId);
     checkpoint.stage = 'RECONCILE';
+    checkpoint.reconcileMode = 'CANDIDATES';
+    checkpoint.reconcileScanDone = false;
+    checkpoint.reconcileScanRow = 2;
     checkpointImportFinalization_(state, 'RECONCILING_LIFECYCLE', 'Orphan handoffs checkpointed; reconciling retained lifecycle records', deferScheduling);
     return;
   }
@@ -2957,6 +2960,13 @@ function finalizeImport_(state, deferScheduling) {
     checkpoint.stage = 'APPLY_LIFECYCLE';
     checkpointImportFinalization_(state, 'APPLYING_LIFECYCLE_CHANGES',
       'Append-only import: skipped carry-forward reconciliation; applying lifecycle changes', deferScheduling);
+    return;
+  }
+
+  // Publishes that reached RECONCILE before candidate mode existed have no reconcileMode and finish
+  // on the cursor walk below.
+  if (checkpoint.stage === 'RECONCILE' && checkpoint.reconcileMode === 'CANDIDATES') {
+    reconcileCandidatesStep_(state, checkpoint, deferScheduling);
     return;
   }
 
@@ -4219,7 +4229,7 @@ function updateImportedCandidateAssetStates_(caseRecords, plan) {
 function carryForwardAndReconcileChunk_(state, cursorRow, batchSize) {
   const key = state.runId + '|' + cursorRow;
   const saved = readDurablePayload_('ReconciliationBatch', key);
-  if (saved) { applyDurableWrites_(saved.writes); return saved.result; }
+  if (saved) { applyReconcileBatchPayload_(key, saved); return saved.result; }
   const caseSheet = getSheet_(APP.sheets.cases);
   const lastRow = caseSheet.getLastRow();
   const lastColumn = caseSheet.getLastColumn();
@@ -4246,7 +4256,8 @@ function carryForwardAndReconcileChunk_(state, cursorRow, batchSize) {
   const purgeCandidateIds = missing.filter(function (caseRecord) {
     return [APP.lifecycle.quarantined, APP.lifecycle.purgeEligible].indexOf(canonicalLifecycleState_(caseRecord.STATE)) !== -1;
   }).map(function (caseRecord) { return cleanText_(caseRecord.ASSET_ID); });
-  const previous = indexObjectsBy_(readObjectsByKeys_(APP.sheets.assetsStaging, 'ASSET_ID', missingIds), 'ASSET_ID');
+  // The candidates are scattered through a large Assets_Staging: fetch them as tight row ranges.
+  const previous = indexObjectsBy_(readObjectsByKeys_(APP.sheets.assetsStaging, 'ASSET_ID', missingIds, true), 'ASSET_ID');
   const completedPurge = {};
   readObjectsByKeys_(APP.sheets.platformActions, 'ASSET_ID', purgeCandidateIds).forEach(function (action) {
     if (cleanText_(action.ACTION).toUpperCase() === 'PURGE' && cleanText_(action.STATUS).toUpperCase() === 'COMPLETED') {
@@ -4266,36 +4277,13 @@ function carryForwardAndReconcileChunk_(state, cursorRow, batchSize) {
     if ([APP.lifecycle.dismissed, APP.lifecycle.active, APP.lifecycle.restored].indexOf(stateName) !== -1) return;
     const oldAsset = previous[assetId];
     if (!oldAsset) return;
-    const purgeDue = caseRecord.PURGE_ELIGIBLE_DATE && new Date(caseRecord.PURGE_ELIGIBLE_DATE) <= now;
-    const verifiedPlatformPurge = [APP.lifecycle.quarantined, APP.lifecycle.purgeEligible].indexOf(stateName) !== -1 &&
-      purgeDue && completedPurge[assetId];
-    const verifiedSelfPurge = stateName === APP.lifecycle.selfPurgePending;
-    if (verifiedPlatformPurge || verifiedSelfPurge) {
-      const fromState = caseRecord.STATE;
-      caseRecord.STATE = APP.lifecycle.purged;
-      caseRecord.LAST_TRANSITION_AT = state.snapshotAt;
-      caseRecord.LAST_EVALUATION_RUN_ID = state.runId;
-      caseRecord.NOTES = verifiedSelfPurge
-        ? 'Verified absent from the complete Snowflake extract after owner self-purge intent.'
-        : 'Verified absent from the complete Snowflake extract after completed purge action.';
-      oldAsset.LIFECYCLE_STATE = APP.lifecycle.purged;
-      oldAsset.EVALUATION_STATUS = 'REMOVED';
-      oldAsset.SOURCE_ACTIVITY_STATUS = 'NOT_PRESENT_AFTER_PURGE';
-      oldAsset.ASSET_STATUS = APP.assetStatus.purged;
-      if (verifiedSelfPurge) selfPurgedAssets += 1;
+    const outcome = reconcileMissingCase_(state, caseRecord, oldAsset, completedPurge, now);
+    if (outcome.kind !== 'CARRY') {
+      if (outcome.kind === 'SELF_PURGE') selfPurgedAssets += 1;
       else purgedAssets += 1;
       caseUpdates.push(caseRecord);
-      events.push(lifecycleEventRow_(caseRecord.CASE_ID, assetId,
-        verifiedSelfPurge ? 'SELF_PURGE_VERIFIED' : 'PURGE_VERIFIED', fromState, APP.lifecycle.purged,
-        state.snapshotAt, 'SYSTEM', state.runId, {
-          sourcePresent: false, purgeActionCompleted: verifiedPlatformPurge, ownerSelfPurgeIntent: verifiedSelfPurge
-        }));
-    } else {
-      oldAsset.LIFECYCLE_STATE = stateName;
-      oldAsset.SOURCE_ACTIVITY_STATUS = 'NOT_PRESENT_IN_LATEST_SOURCE';
-      oldAsset.ASSET_STATUS = deriveAssetStatus_(oldAsset, stateName);
+      events.push(outcome.event);
     }
-    oldAsset.SNAPSHOT_AT = state.snapshotAt;
     carry.push(oldAsset);
   });
   const plan = newDurableWritePlan_();
@@ -4308,8 +4296,296 @@ function carryForwardAndReconcileChunk_(state, cursorRow, batchSize) {
     purgedAssets: purgedAssets, selfPurgedAssets: selfPurgedAssets
   } };
   saveDurablePayload_('ReconciliationBatch', key, payload);
-  applyDurableWrites_(payload.writes);
+  applyReconcileBatchPayload_(key, payload);
   return payload.result;
+}
+
+// The outcome for one missing asset: carry its staged row forward, or verify a purge and return
+// the Lifecycle_Events row for it. Shared by the cursor walk and the candidate apply so both paths
+// decide alike. Mutates oldAsset and, for a verified purge, caseRecord.
+function reconcileMissingCase_(state, caseRecord, oldAsset, completedPurge, now) {
+  const assetId = cleanText_(caseRecord.ASSET_ID);
+  const stateName = canonicalLifecycleState_(caseRecord.STATE);
+  const purgeDue = caseRecord.PURGE_ELIGIBLE_DATE && new Date(caseRecord.PURGE_ELIGIBLE_DATE) <= now;
+  const verifiedPlatformPurge = [APP.lifecycle.quarantined, APP.lifecycle.purgeEligible].indexOf(stateName) !== -1 &&
+    purgeDue && completedPurge[assetId];
+  const verifiedSelfPurge = stateName === APP.lifecycle.selfPurgePending;
+  if (!verifiedPlatformPurge && !verifiedSelfPurge) {
+    oldAsset.LIFECYCLE_STATE = stateName;
+    oldAsset.SOURCE_ACTIVITY_STATUS = 'NOT_PRESENT_IN_LATEST_SOURCE';
+    oldAsset.ASSET_STATUS = deriveAssetStatus_(oldAsset, stateName);
+    oldAsset.SNAPSHOT_AT = state.snapshotAt;
+    return { kind: 'CARRY', event: null };
+  }
+  const fromState = caseRecord.STATE;
+  caseRecord.STATE = APP.lifecycle.purged;
+  caseRecord.LAST_TRANSITION_AT = state.snapshotAt;
+  caseRecord.LAST_EVALUATION_RUN_ID = state.runId;
+  caseRecord.NOTES = verifiedSelfPurge
+    ? 'Verified absent from the complete Snowflake extract after owner self-purge intent.'
+    : 'Verified absent from the complete Snowflake extract after completed purge action.';
+  oldAsset.LIFECYCLE_STATE = APP.lifecycle.purged;
+  oldAsset.EVALUATION_STATUS = 'REMOVED';
+  oldAsset.SOURCE_ACTIVITY_STATUS = 'NOT_PRESENT_AFTER_PURGE';
+  oldAsset.ASSET_STATUS = APP.assetStatus.purged;
+  oldAsset.SNAPSHOT_AT = state.snapshotAt;
+  return {
+    kind: verifiedSelfPurge ? 'SELF_PURGE' : 'PURGE',
+    event: lifecycleEventRow_(caseRecord.CASE_ID, assetId,
+      verifiedSelfPurge ? 'SELF_PURGE_VERIFIED' : 'PURGE_VERIFIED', fromState, APP.lifecycle.purged,
+      state.snapshotAt, 'SYSTEM', state.runId, {
+        sourcePresent: false, purgeActionCompleted: verifiedPlatformPurge, ownerSelfPurgeIntent: verifiedSelfPurge
+      })
+  };
+}
+
+// Candidate-mode reconcile. The cursor walk above pays for full staging and Platform_Actions lookups
+// in every batch of Cases, although most Cases rows are still present. Candidate mode splits it:
+// a presence-only scan of Cases that records the few missing assets (with their row numbers), then
+// an apply pass over only those. Both steps re-check live data, so edits made between them are honoured.
+
+function reconcileScanBatchRows_() {
+  return Math.max(1, Math.min(5000, configNumber_('FINALIZATION_SCAN_BATCH_ROWS', 1000)));
+}
+
+// Scan step: reads one window of Cases and writes nothing. Keeps each asset that is missing from
+// Assets_Current, not dismissed/active/restored, and still staged. A second Cases row for the same
+// asset is counted and skipped, so an asset is carried at most once.
+function scanReconcileCandidatesChunk_(state, cursorRow, batchSize) {
+  const caseSheet = getSheet_(APP.sheets.cases);
+  const lastRow = caseSheet.getLastRow();
+  const lastColumn = caseSheet.getLastColumn();
+  const startRow = Math.max(2, Number(cursorRow || 2));
+  if (startRow > lastRow || lastColumn < 1) return { nextRow: startRow, done: true, candidates: [], duplicateCaseRows: 0 };
+  const count = Math.min(Math.max(1, Number(batchSize || 1000)), lastRow - startRow + 1);
+  const headers = caseSheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0];
+  const cases = caseSheet.getRange(startRow, 1, count, lastColumn).getDisplayValues().map(function (row, offset) {
+    return { row: startRow + offset, record: rowToObject_(headers, row) };
+  });
+  const assetIds = cases.map(function (entry) { return cleanText_(entry.record.ASSET_ID); }).filter(Boolean);
+  const current = existingSheetKeys_(APP.sheets.assetsCurrent, 'ASSET_ID', assetIds);
+  const skippedStates = [APP.lifecycle.dismissed, APP.lifecycle.active, APP.lifecycle.restored];
+  const missing = cases.filter(function (entry) {
+    const assetId = cleanText_(entry.record.ASSET_ID);
+    return assetId && !current[assetId] && skippedStates.indexOf(canonicalLifecycleState_(entry.record.STATE)) === -1;
+  });
+  const stagedRowsByAsset = missing.length
+    ? getSheetKeyIndex_(getSheet_(APP.sheets.assetsStaging), APP.sheets.assetsStaging, 'ASSET_ID').rowsByKey
+    : {};
+  const seen = {};
+  const candidates = [];
+  let duplicateCaseRows = 0;
+  missing.forEach(function (entry) {
+    const assetId = cleanText_(entry.record.ASSET_ID);
+    if (seen[assetId]) { duplicateCaseRows += 1; return; }
+    seen[assetId] = true;
+    const stagedRows = stagedRowsByAsset[assetId];
+    if (!stagedRows || !stagedRows.length) return;
+    // The last staged row wins, as in indexObjectsBy_.
+    candidates.push({ row: entry.row, caseId: cleanText_(entry.record.CASE_ID), assetId: assetId, stagingRow: stagedRows[stagedRows.length - 1] });
+  });
+  const nextRow = startRow + count;
+  return { nextRow: nextRow, done: nextRow > lastRow, candidates: candidates, duplicateCaseRows: duplicateCaseRows };
+}
+
+// The saved candidate list is the source of truth for scan progress (scannedThroughRow), so a lost
+// checkpoint resumes the scan where the list ends. An unreadable list returns null and is rebuilt.
+function readReconcileCandidatePayload_(state) {
+  try {
+    const saved = readDurablePayload_('ReconciliationCandidates', state.runId + '|scan');
+    return saved && Array.isArray(saved.candidates) ? saved : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+// Reads display rows at the given row numbers as tight ranges (see groupSheetRowsForSparseIo_).
+function readSheetRowsByNumber_(sheet, rowNumbers, width) {
+  const byRow = {};
+  const lastRow = sheet.getLastRow();
+  const rows = (rowNumbers || []).filter(function (rowNumber) { return rowNumber >= 2 && rowNumber <= lastRow; });
+  if (!rows.length || width < 1) return byRow;
+  groupSheetRowsForSparseIo_(rows, 100, 1000, 200).forEach(function (group) {
+    const count = Math.min(group.end, lastRow) - group.start + 1;
+    sheet.getRange(group.start, 1, count, width).getDisplayValues().forEach(function (row, offset) {
+      const rowNumber = group.start + offset;
+      if (group.selectedRows[rowNumber]) byRow[rowNumber] = row;
+    });
+  });
+  return byRow;
+}
+
+// Re-reads each { row, key } at its saved row number. A row whose key no longer matches (rows moved
+// or the sheet was edited since the scan) is looked up by key instead; null means the key is gone.
+function readCandidateRecords_(sheetName, keyHeader, refs, sparse) {
+  const sheet = getSheet_(sheetName);
+  const lastColumn = sheet.getLastColumn();
+  const headers = lastColumn ? sheet.getRange(1, 1, 1, lastColumn).getDisplayValues()[0] : [];
+  const keyIndex = headers.indexOf(keyHeader);
+  const byRow = readSheetRowsByNumber_(sheet, refs.map(function (ref) { return ref.row; }), lastColumn);
+  const records = [];
+  const unmatched = [];
+  refs.forEach(function (ref, position) {
+    const values = byRow[ref.row];
+    if (keyIndex !== -1 && values && cleanText_(values[keyIndex]) === ref.key) records[position] = rowToObject_(headers, values);
+    else unmatched.push(position);
+  });
+  if (unmatched.length) {
+    const byKey = indexObjectsBy_(readObjectsByKeys_(sheetName, keyHeader,
+      unmatched.map(function (position) { return refs[position].key; }), sparse), keyHeader);
+    unmatched.forEach(function (position) { records[position] = byKey[refs[position].key] || null; });
+  }
+  return records;
+}
+
+// Retries transient Sheets failures inside the execution. Replay is safe: the batch is saved before
+// it is applied, and applyDurableWrites_ accepts rows already written by the same plan. A real
+// conflict is not retried; it would fail the same way.
+function applyDurableWritesWithRetry_(writes) {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      applyDurableWrites_(writes);
+      return;
+    } catch (error) {
+      if (attempt >= 3 || /conflicting row/.test(String(error && error.message))) throw error;
+      Utilities.sleep(1000 * attempt);
+    }
+  }
+}
+
+// Applies a saved reconcile batch. If another writer took one of its reserved append rows, relocate
+// only this batch's appends to the sheet end and persist the rebased plan before applying, so a
+// replay never wedges on the same occupied row. A conflict that persists after the rebase surfaces.
+function applyReconcileBatchPayload_(key, payload) {
+  try {
+    applyDurableWritesWithRetry_(payload.writes);
+  } catch (conflictError) {
+    if (!/conflicting row/.test(String((conflictError && conflictError.message) || conflictError))) throw conflictError;
+    payload.writes = rebaseDurableAppendWrites_(payload.writes);
+    saveDurablePayload_('ReconciliationBatch', key, payload);
+    applyDurableWritesWithRetry_(payload.writes);
+  }
+}
+
+// Apply step: one batch of saved candidates. Live data wins over the scan: a case dismissed or
+// restored since, or an asset that reappeared in Assets_Current, is skipped.
+function applyReconcileCandidatesChunk_(state, startIndex, batchSize) {
+  const key = state.runId + '|apply|' + startIndex;
+  const saved = readDurablePayload_('ReconciliationBatch', key);
+  if (saved) { applyReconcileBatchPayload_(key, saved); return saved.result; }
+  const candidatePayload = readReconcileCandidatePayload_(state);
+  if (!candidatePayload) return { needsScan: true };
+  const candidates = candidatePayload.candidates;
+  const from = Math.max(0, Number(startIndex || 0));
+  if (from >= candidates.length) return { nextIndex: from, done: true, carriedForward: 0, purgedAssets: 0, selfPurgedAssets: 0 };
+  const batch = candidates.slice(from, from + Math.max(1, Number(batchSize || 200)));
+  const skippedStates = [APP.lifecycle.dismissed, APP.lifecycle.active, APP.lifecycle.restored];
+  const caseRecords = readCandidateRecords_(APP.sheets.cases, 'CASE_ID', batch.map(function (candidate) {
+    return { row: candidate.row, key: candidate.caseId };
+  }), false);
+  const live = batch.map(function (candidate, position) {
+    const record = caseRecords[position];
+    if (!record || cleanText_(record.ASSET_ID) !== candidate.assetId) return null;
+    return skippedStates.indexOf(canonicalLifecycleState_(record.STATE)) === -1 ? record : null;
+  });
+  const current = existingSheetKeys_(APP.sheets.assetsCurrent, 'ASSET_ID', batch.map(function (candidate) { return candidate.assetId; }));
+  const stillMissing = [];
+  batch.forEach(function (candidate, position) {
+    if (live[position] && !current[candidate.assetId]) stillMissing.push(position);
+  });
+  const stagedRecords = readCandidateRecords_(APP.sheets.assetsStaging, 'ASSET_ID', stillMissing.map(function (position) {
+    return { row: batch[position].stagingRow, key: batch[position].assetId };
+  }), true);
+  const oldAssets = {};
+  stillMissing.forEach(function (position, index) { if (stagedRecords[index]) oldAssets[position] = stagedRecords[index]; });
+  const purgeCandidateIds = stillMissing.filter(function (position) {
+    return oldAssets[position] &&
+      [APP.lifecycle.quarantined, APP.lifecycle.purgeEligible].indexOf(canonicalLifecycleState_(live[position].STATE)) !== -1;
+  }).map(function (position) { return batch[position].assetId; });
+  const completedPurge = {};
+  readObjectsByKeys_(APP.sheets.platformActions, 'ASSET_ID', purgeCandidateIds).forEach(function (action) {
+    if (cleanText_(action.ACTION).toUpperCase() === 'PURGE' && cleanText_(action.STATUS).toUpperCase() === 'COMPLETED') {
+      completedPurge[cleanText_(action.ASSET_ID)] = true;
+    }
+  });
+  const carry = [];
+  const caseUpdates = [];
+  const events = [];
+  let purgedAssets = 0;
+  let selfPurgedAssets = 0;
+  const now = new Date();
+  batch.forEach(function (candidate, position) {
+    const oldAsset = oldAssets[position];
+    if (!oldAsset) return;
+    const outcome = reconcileMissingCase_(state, live[position], oldAsset, completedPurge, now);
+    if (outcome.kind !== 'CARRY') {
+      if (outcome.kind === 'SELF_PURGE') selfPurgedAssets += 1;
+      else purgedAssets += 1;
+      caseUpdates.push(live[position]);
+      events.push(outcome.event);
+    }
+    carry.push(oldAsset);
+  });
+  const plan = newDurableWritePlan_();
+  planAppendObjects_(plan, APP.sheets.assetsCurrent, carry);
+  planUpdateObjects_(plan, APP.sheets.cases, 'CASE_ID', caseUpdates);
+  planAppendRows_(plan, APP.sheets.events, events);
+  const nextIndex = from + batch.length;
+  const payload = { writes: plan.writes, result: {
+    nextIndex: nextIndex, done: nextIndex >= candidates.length, carriedForward: carry.length,
+    purgedAssets: purgedAssets, selfPurgedAssets: selfPurgedAssets
+  } };
+  saveDurablePayload_('ReconciliationBatch', key, payload);
+  applyReconcileBatchPayload_(key, payload);
+  return payload.result;
+}
+
+// One candidate-mode batch per call. Each piece of progress is saved after the work it describes,
+// so a lost checkpoint replays a batch rather than repeating its effects.
+function reconcileCandidatesStep_(state, checkpoint, deferScheduling) {
+  if (!checkpoint.reconcileScanDone) {
+    setFinalizationProgress_(state, 'RECONCILING_LIFECYCLE', 'Scanning retained lifecycle cases for assets missing from the complete extract');
+    const prior = readReconcileCandidatePayload_(state) || { scannedThroughRow: 2, duplicateCaseRows: 0, candidates: [] };
+    const scan = scanReconcileCandidatesChunk_(state, prior.scannedThroughRow, reconcileScanBatchRows_());
+    // The scan dedupes within its window; this dedupes against earlier windows.
+    const listed = {};
+    prior.candidates.forEach(function (candidate) { listed[candidate.assetId] = true; });
+    const added = scan.candidates.filter(function (candidate) { return !listed[candidate.assetId]; });
+    const saved = {
+      scannedThroughRow: scan.nextRow,
+      duplicateCaseRows: Number(prior.duplicateCaseRows || 0) + scan.duplicateCaseRows + scan.candidates.length - added.length,
+      candidates: prior.candidates.concat(added)
+    };
+    saveDurablePayload_('ReconciliationCandidates', state.runId + '|scan', saved);
+    checkpoint.reconcileScanRow = saved.scannedThroughRow;
+    checkpoint.duplicateCaseRows = saved.duplicateCaseRows;
+    checkpoint.candidateCount = saved.candidates.length;
+    if (scan.done) {
+      checkpoint.reconcileScanDone = true;
+      checkpoint.reconcileApplyIndex = 0;
+    }
+    checkpointImportFinalization_(state, 'RECONCILING_LIFECYCLE', scan.done
+      ? 'Found ' + saved.candidates.length + ' assets missing from the complete extract; reconciling them'
+      : 'Scanned retained lifecycle cases through row ' + saved.scannedThroughRow, deferScheduling);
+    return;
+  }
+  setFinalizationProgress_(state, 'RECONCILING_LIFECYCLE', 'Reconciling assets missing from the complete extract');
+  const applied = applyReconcileCandidatesChunk_(state, Number(checkpoint.reconcileApplyIndex || 0),
+    Math.max(25, Math.min(200, configNumber_('FINALIZATION_BATCH_SIZE', 100))));
+  if (applied.needsScan) {
+    // The candidate list is gone or unreadable: rebuild it from Cases instead of failing the publish.
+    checkpoint.reconcileScanDone = false;
+    checkpointImportFinalization_(state, 'RECONCILING_LIFECYCLE', 'Candidate list was unreadable; rescanning retained lifecycle cases', deferScheduling);
+    return;
+  }
+  checkpoint.reconcileApplyIndex = applied.nextIndex;
+  checkpoint.carriedForward = Number(checkpoint.carriedForward || 0) + applied.carriedForward;
+  checkpoint.purgedAssets = Number(checkpoint.purgedAssets || 0) + applied.purgedAssets;
+  checkpoint.selfPurgedAssets = Number(checkpoint.selfPurgedAssets || 0) + applied.selfPurgedAssets;
+  if (applied.done) checkpoint.stage = 'APPLY_LIFECYCLE';
+  checkpointImportFinalization_(state, applied.done ? 'APPLYING_LIFECYCLE_CHANGES' : 'RECONCILING_LIFECYCLE',
+    applied.done ? 'Lifecycle reconciliation checkpointed; applying lifecycle changes' :
+      'Reconciled ' + applied.nextIndex + ' of ' + checkpoint.candidateCount + ' missing assets', deferScheduling);
 }
 
 function carryForwardAndReconcile_(state) {

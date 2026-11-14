@@ -140,6 +140,30 @@ for (const after of [false, true]) for (let boundary = 1; boundary <= 4; boundar
   assert.strictEqual(notifications.data[1][1], 'SENT');  // fixed-row update still applied
 }
 
+// A pending synchronous delivery whose reserved events row was taken after it was saved is
+// recovered by relocating only its own append, then marked complete. It must not throw on
+// every campaign run (which would leave the campaign in RETRYING with no batches delivered).
+{
+  const h = harness(), s = h.sandbox;
+  const events = h.makeSheet('events', [['ID', 'VALUE']]);
+  const plan = s.newDurableWritePlan_();
+  s.planAppendRows_(plan, 'events', [['sync-audit', 'NOTIFIED']]); // reserves events row 2
+  events.data.push(['someone-else', 'event']);                    // foreign writer takes row 2
+  const saved = { writes: plan.writes, result: { ok: true } };
+  const stored = {};
+  s.readDurablePayload_ = (name, key) => (key === 'sync-1' ? saved : null);
+  s.saveDurablePayload_ = (name, key, value) => { stored[name + '|' + key] = value; };
+  h.properties.set(s.reliabilityProperty_('SynchronousDelivery'), JSON.stringify({ key: 'sync-1' }));
+  assert.deepStrictEqual(s.recoverPendingSynchronousDelivery_(), { ok: true });
+  assert.strictEqual(events.data[1][0], 'someone-else');  // foreign row untouched
+  assert.strictEqual(events.data[2][0], 'sync-audit');    // our row relocated to the end
+  assert.strictEqual(events.getLastRow(), 3);             // written exactly once
+  assert.strictEqual(stored['SynchronousDelivery|sync-1'].writes[0].row, 3); // rebased plan persisted
+  assert.strictEqual(h.properties.get(s.reliabilityProperty_('SynchronousDeliveryCompleted')), 'sync-1');
+  assert.strictEqual(s.recoverPendingSynchronousDelivery_(), null);          // already completed
+  assert.strictEqual(events.getLastRow(), 3);
+}
+
 // Slack-free resume drains a delivered owner group's pending finalization writes
 // (rebasing an append the reserved row of which was taken) without ever sending, and
 // completes the campaign only when no owner groups still require a real Slack send.
